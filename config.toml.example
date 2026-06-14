@@ -40,7 +40,10 @@ user_accent = "cyan"           # left bar color for user messages
 
 # --- History / session storage ---
 [history]
-dir = "history/"
+dir = "history/"               # with ~/.config/mote/config.toml this resolves to ~/.config/mote/history/
+
+[logging]
+dir = "logs/"                  # with ~/.config/mote/config.toml this resolves to ~/.config/mote/logs/
 
 # --- Prompt files ---
 [prompts]

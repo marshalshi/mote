@@ -92,38 +92,35 @@ fn validate_path_in_workspace(
     resolved: &std::path::Path,
     workspace: &std::path::Path,
 ) -> Result<PathBuf> {
-    // For new files that don't exist yet, canonicalize the parent
-    let canonical = if resolved.exists() {
-        resolved.canonicalize().with_context(|| {
-            format!("Failed to canonicalize {}", resolved.display())
-        })?
-    } else {
-        // File doesn't exist yet — canonicalize the parent
-        let parent = resolved.parent().unwrap_or(resolved);
-        if !parent.exists() {
-            // Neither parent nor file exists — check for traversal in the raw path
-            let resolved_str = resolved.to_string_lossy();
-            if resolved_str.contains("..") {
-                anyhow::bail!(
-                    "Path '{}' is outside the workspace '{}'",
-                    resolved.display(),
-                    workspace.display(),
-                );
-            }
-            return Ok(resolved.to_path_buf());
-        }
-        let canon_parent = parent.canonicalize().with_context(|| {
-            format!("Failed to canonicalize {}", parent.display())
-        })?;
-        canon_parent.join(resolved.file_name().unwrap_or_default())
-    };
-
     let ws_canon = if workspace.exists() {
         workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf())
     } else {
         workspace.to_path_buf()
+    };
+
+    // For non-existent targets, canonicalize the nearest existing ancestor and
+    // re-append the non-existent suffix. This prevents escapes like
+    // /tmp/outside/new/file when parent doesn't exist yet.
+    let canonical = if resolved.exists() {
+        resolved.canonicalize().with_context(|| {
+            format!("Failed to canonicalize {}", resolved.display())
+        })?
+    } else {
+        let mut ancestor = resolved;
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().with_context(|| {
+                format!("Invalid path: {}", resolved.display())
+            })?;
+        }
+        let canon_ancestor = ancestor.canonicalize().with_context(|| {
+            format!("Failed to canonicalize {}", ancestor.display())
+        })?;
+        let suffix = resolved
+            .strip_prefix(ancestor)
+            .unwrap_or(std::path::Path::new(""));
+        canon_ancestor.join(suffix)
     };
 
     if !canonical.starts_with(&ws_canon) {
@@ -262,21 +259,28 @@ impl Tool for GlobTool {
             .get("pattern")
             .and_then(|v| v.as_str())
             .context("Missing pattern")?;
-        let pattern = if PathBuf::from(pattern).is_absolute() {
-            pattern.to_string()
+        let pattern_path = if PathBuf::from(pattern).is_absolute() {
+            PathBuf::from(pattern)
         } else {
-            self.ctx
-                .workspace
-                .join(pattern)
-                .to_string_lossy()
-                .to_string()
+            self.ctx.workspace.join(pattern)
         };
+        // Validate the non-glob static prefix to enforce workspace boundaries.
+        let static_prefix = static_glob_prefix(&pattern_path);
+        validate_path_in_workspace(&static_prefix, &self.ctx.workspace)?;
+        let pattern = pattern_path.to_string_lossy().to_string();
+        let ws_canon = self
+            .ctx
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| self.ctx.workspace.clone());
         // Glob traverses the filesystem — run in spawn_blocking to avoid blocking the async runtime
         let results = tokio::task::spawn_blocking(
             move || -> anyhow::Result<Vec<String>> {
                 let entries = glob::glob(&pattern)
                     .context("Invalid glob pattern")?
                     .filter_map(|e| e.ok())
+                    .filter_map(|p| p.canonicalize().ok())
+                    .filter(|p| p.starts_with(&ws_canon))
                     .map(|p| p.to_string_lossy().to_string())
                     .collect::<Vec<String>>();
                 Ok(entries)
@@ -364,6 +368,7 @@ impl Tool for GrepTool {
                 }
             })
             .unwrap_or_else(|| self.ctx.workspace.clone());
+        let dir = validate_path_in_workspace(&dir, &self.ctx.workspace)?;
 
         let include = args.get("include").and_then(|v| v.as_str());
 
@@ -397,6 +402,33 @@ impl Tool for GrepTool {
             return Ok(result_no_changes("No matches found.".into()));
         }
         Ok(result_no_changes(truncate_output(stdout)))
+    }
+}
+
+fn static_glob_prefix(path: &std::path::Path) -> PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => {
+                out.push(std::path::MAIN_SEPARATOR.to_string())
+            }
+            Component::CurDir => out.push("."),
+            Component::ParentDir => out.push(".."),
+            Component::Normal(seg) => {
+                let s = seg.to_string_lossy();
+                if s.contains('*') || s.contains('?') || s.contains('[') {
+                    break;
+                }
+                out.push(seg);
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 
@@ -977,6 +1009,7 @@ pub struct AgentSubagentRunner {
     pub config: crate::config::Config,
     pub merged_agents:
         std::collections::HashMap<String, crate::config::AgentConfig>,
+    pub repo_agents_md: Option<String>,
     /// Parent cancellation channel — subagent is cancelled when parent is.
     pub cancel_rx: tokio::sync::watch::Receiver<bool>,
     /// Current call depth (0 = top-level, 1 = subagent, 2 = sub-subagent, etc.)
@@ -995,7 +1028,7 @@ impl SubagentRunner for AgentSubagentRunner {
         &self,
         agent_name: &str,
         task: &str,
-        _workspace: &PathBuf,
+        workspace: &PathBuf,
     ) -> Result<String> {
         if self.depth >= self.max_depth {
             anyhow::bail!(
@@ -1032,7 +1065,11 @@ impl SubagentRunner for AgentSubagentRunner {
         // Build system prompt for the subagent (blocking filesystem I/O)
         let eff_model_id = self.config.effective_model_id(agent_model);
         let prompt =
-            crate::prompt::PromptAssembler::for_agent(&self.config, agent_cfg);
+            crate::prompt::PromptAssembler::for_agent(&self.config, agent_cfg)
+                .with_workspace_context(
+                    Some(workspace.clone()),
+                    self.repo_agents_md.clone(),
+                );
         let provider_for_prompt = eff_provider_name.clone();
         let model_for_prompt = eff_model_id.clone();
         let system_layers = tokio::task::spawn_blocking(move || {
@@ -1100,6 +1137,7 @@ impl SubagentRunner for AgentSubagentRunner {
         let history: Vec<crate::llm::ChatMessage> = Vec::new();
         let t2 = Arc::clone(&self.tools);
         let p2 = Arc::clone(&provider);
+        let workspace_display = workspace.display().to_string();
 
         tokio::spawn(async move {
             crate::agent::run_loop(
@@ -1114,6 +1152,7 @@ impl SubagentRunner for AgentSubagentRunner {
                 perm_rx,
                 perms,
                 crate::agent::DEFAULT_MAX_STEPS,
+                workspace_display,
             )
             .await;
         });
@@ -1329,6 +1368,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_rejects_outside_workspace_abs_missing_parent() {
+        let (_d, ws) = tmp_workspace();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_target = outside_dir.path().join("x/y/new.txt");
+        let tool = WriteTool::new(ws);
+        let args = serde_json::json!({
+            "file_path": outside_target.to_string_lossy().to_string(),
+            "content": "blocked"
+        });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_edit_file() {
         let (_d, ws) = tmp_workspace();
         let ws_path = ws.clone();
@@ -1382,6 +1435,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_glob_rejects_outside_workspace() {
+        let (_d, ws) = tmp_workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let pattern = outside.path().join("*.rs").to_string_lossy().to_string();
+        let tool = GlobTool::new(ws);
+        let result =
+            tool.execute(serde_json::json!({"pattern": pattern})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_grep_matches() {
         let (_d, ws) = tmp_workspace();
         std::fs::write(
@@ -1395,6 +1459,19 @@ mod tests {
         let result = tool.execute(args).await.unwrap();
         assert!(result.output.contains("hello world"));
         assert!(result.output.contains("hello again"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_rejects_outside_workspace_path() {
+        let (_d, ws) = tmp_workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let tool = GrepTool::new(ws);
+        let args = serde_json::json!({
+            "pattern": "hello",
+            "path": outside.path().to_string_lossy().to_string()
+        });
+        let result = tool.execute(args).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

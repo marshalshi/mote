@@ -73,20 +73,29 @@ impl MoteClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+    pub async fn list_sessions(
+        &self,
+        runtime_session_key: &str,
+    ) -> Result<Vec<SessionInfo>> {
         let resp = self
             .http
             .get(format!("{}/sessions", self.base_url))
+            .header("x-mote-session-key", runtime_session_key)
             .send()
             .await?;
         Ok(resp.json().await?)
     }
 
     /// Delete a saved session by ID.
-    pub async fn delete_session(&self, id: &str) -> Result<()> {
+    pub async fn delete_session(
+        &self,
+        runtime_session_key: &str,
+        id: &str,
+    ) -> Result<()> {
         let resp = self
             .http
             .delete(format!("{}/sessions/{id}", self.base_url))
+            .header("x-mote-session-key", runtime_session_key)
             .send()
             .await?;
         if resp.status().is_success() {
@@ -99,11 +108,13 @@ impl MoteClient {
     /// Load a saved session by ID.
     pub async fn load_session(
         &self,
+        runtime_session_key: &str,
         id: &str,
     ) -> Result<marshaling_protocol::SessionData> {
         let resp = self
             .http
             .get(format!("{}/sessions/{id}", self.base_url))
+            .header("x-mote-session-key", runtime_session_key)
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -113,10 +124,16 @@ impl MoteClient {
     }
 
     /// Roll back the most recent tracked file mutation set.
-    pub async fn rollback_last(&self) -> Result<RollbackResultPayload> {
+    pub async fn rollback_last(
+        &self,
+        runtime_session_key: &str,
+    ) -> Result<RollbackResultPayload> {
         let resp = self
             .http
             .post(format!("{}/rollback/last", self.base_url))
+            .json(&marshaling_protocol::RollbackLastRequest {
+                runtime_session_key: runtime_session_key.to_string(),
+            })
             .send()
             .await?;
         if !resp.status().is_success() {

@@ -47,9 +47,19 @@ cargo run -p mote-server
 
 # Terminal 2: TUI client
 cargo run -p mote-client
+
+# Optional: force a specific session key namespace
+cargo run -p mote-client -- --session-key team-a
 ```
 
 The server binds to `127.0.0.1:9847`. The client auto-detects it.
+
+### Runtime folders
+
+- Logs are written to `~/.config/mote/logs/mote.log` (server and client verbose mode).
+- History is stored under `~/.config/mote/history/` by default.
+- In multi-client mode, history is partitioned by client runtime session key:
+  - `~/.config/mote/history/<session-key>/*.md`
 
 ## Usage
 
@@ -61,16 +71,17 @@ Default keys (configurable via `keybindings.toml`):
 |--------|-------------|------------|
 | Send message | `enter` | `send_message` |
 | Newline | `alt+enter` | `insert_newline` |
-| Quit | `esc`, `ctrl+c` | `quit` |
+| Quit | `ctrl+c` | `quit` |
 | Cursor left/right | `left`/`right` | `cursor_left`/`cursor_right` |
-| Cursor home/end | `home`/`end` | `cursor_home`/`cursor_end` |
-| Delete before/after | `backspace`/`delete` | `delete_before`/`delete_after` |
+| Cursor home/end | `home`, `ctrl+a` / `end`, `ctrl+e` | `cursor_home`/`cursor_end` |
+| Delete before/after | `backspace` / `delete`, `ctrl+d` | `delete_before`/`delete_after` |
+| Clear line | `ctrl+k` | `kill_line` |
 | History up/down | `up`/`down` | `history_up`/`history_down` |
 | Scroll up | `pageup`, `ctrl+up` | `scroll_up` |
 | Scroll down | `pagedown`, `ctrl+down` | `scroll_down` |
 | Scroll to bottom | `ctrl+end` | `scroll_to_bottom` |
 | Slash command | `ctrl+p` | `agent_command` |
-| Complete / Tab | `tab` | `complete` |
+| Cycle agent / complete | `tab` | `complete` |
 | Switch agent view | `F5` | `switch_view` |
 | Cancel agent | `Esc` (during streaming) | `cancel_agent` |
 
@@ -78,7 +89,7 @@ Customize via `~/.config/mote/keybindings.toml`:
 
 ```toml
 send_message = "enter"
-quit = ["esc", "ctrl+q"]
+quit = ["ctrl+c", "ctrl+q"]
 agent_command = "ctrl+space"
 ```
 
@@ -91,6 +102,7 @@ agent_command = "ctrl+space"
 | `/model` | Show / switch model |
 | `/tokens` | Show token usage |
 | `/session list` | List saved sessions |
+| `/session key` | Show current runtime session key |
 | `/session delete <id>` | Delete a session |
 | `/session info` | Show current session info |
 | `/login github` | GitHub OAuth device flow |
@@ -176,6 +188,8 @@ Roll back the latest tracked change-set with:
 
 Rollback is conflict-safe: if files changed since the original mutation, rollback is blocked with an explanatory message.
 
+Rollback scope is session-local in multi-client mode: each client can only roll back its own tracked change journal.
+
 ### Subagents
 
 Agents can delegate to other agents via the `subagent` tool:
@@ -203,6 +217,15 @@ RUST_LOG=debug cargo run -p mote-server
 
 # Client: use -v or RUST_LOG=debug
 cargo run -p mote-client -- -v
+```
+
+Verbose logs are saved to `~/.config/mote/logs/mote.log`.
+
+You can override log directory in `config.toml`:
+
+```toml
+[logging]
+dir = "logs/"
 ```
 
 ## Architecture

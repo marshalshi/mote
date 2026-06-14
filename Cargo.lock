@@ -1286,6 +1286,7 @@ name = "mote-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "crossterm",
  "dirs",
@@ -1297,6 +1298,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syntect",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "toml",

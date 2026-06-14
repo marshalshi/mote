@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod llm;
 mod tui;
+mod workspace;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -29,11 +30,17 @@ struct Cli {
     /// Verbose logging.
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
+
+    /// Override runtime session key (used for history namespace).
+    #[arg(long)]
+    session_key: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let workspace_ctx =
+        workspace::resolve_workspace_context(cli.session_key.as_deref())?;
 
     // Logging setup: verbose/debug → file, otherwise → stderr
     let env_log = std::env::var("RUST_LOG").unwrap_or_default();
@@ -43,7 +50,7 @@ async fn main() -> Result<()> {
         || env_log.contains("mote=debug");
 
     if wants_debug {
-        let log_dir = std::path::PathBuf::from("logs");
+        let log_dir = resolve_log_dir_from_config();
         std::fs::create_dir_all(&log_dir).ok();
         let log_path = log_dir.join("mote.log");
         let log_file = std::fs::OpenOptions::new()
@@ -90,10 +97,7 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     if !client.health().await {
-        anyhow::bail!(
-            "Could not connect to mote-server at {}",
-            cli.server
-        );
+        anyhow::bail!("Could not connect to mote-server at {}", cli.server);
     }
 
     // Handle login first (no TUI needed)
@@ -124,15 +128,24 @@ async fn main() -> Result<()> {
 
     // Handle single message mode
     if let Some(msg) = &cli.message {
-        return single_message(&client, &ui_config, msg).await;
+        return single_message(&client, &ui_config, msg, &workspace_ctx).await;
     }
 
     // Start TUI, optionally resuming a session
-    let mut app = tui::state::App::new(&ui_config, model_info);
+    let mut app = tui::state::App::new_with_workspace(
+        &ui_config,
+        model_info,
+        workspace_ctx.root.to_string_lossy().to_string(),
+        workspace_ctx.repo_agents_md.clone(),
+        workspace_ctx.runtime_session_key.clone(),
+    );
 
     // Resume a saved session if requested
     if let Some(session_id) = &cli.resume {
-        match client.load_session(session_id).await {
+        match client
+            .load_session(&workspace_ctx.runtime_session_key, session_id)
+            .await
+        {
             Ok(session) => {
                 for hm in &session.messages {
                     let role = match hm.role.as_str() {
@@ -167,10 +180,49 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_log_dir_from_config() -> std::path::PathBuf {
+    let default_dir = dirs::home_dir()
+        .map(|h| h.join(".config").join("mote").join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+    let config_path = if let Some(home) = dirs::home_dir() {
+        let p = home.join(".config").join("mote").join("config.toml");
+        if p.exists() {
+            p
+        } else {
+            std::path::PathBuf::from("config.toml")
+        }
+    } else {
+        std::path::PathBuf::from("config.toml")
+    };
+    let Ok(raw) = std::fs::read_to_string(&config_path) else {
+        return default_dir;
+    };
+    let Ok(v) = toml::from_str::<toml::Value>(&raw) else {
+        return default_dir;
+    };
+    let Some(dir_str) = v
+        .get("logging")
+        .and_then(|l| l.get("dir"))
+        .and_then(|d| d.as_str())
+    else {
+        return default_dir;
+    };
+    let p = std::path::PathBuf::from(dir_str);
+    if p.is_relative() {
+        config_path
+            .parent()
+            .map(|base| base.join(p))
+            .unwrap_or(default_dir)
+    } else {
+        p
+    }
+}
+
 async fn single_message(
     client: &client::MoteClient,
     _ui: &marshaling_protocol::UiConfig,
     msg: &str,
+    workspace_ctx: &workspace::WorkspaceContext,
 ) -> Result<()> {
     let request = marshaling_protocol::ChatRequest {
         message: msg.to_string(),
@@ -179,6 +231,9 @@ async fn single_message(
         provider_override: None,
         history: vec![],
         session_id: None,
+        workspace_root: Some(workspace_ctx.root.to_string_lossy().to_string()),
+        repo_agents_md: workspace_ctx.repo_agents_md.clone(),
+        runtime_session_key: Some(workspace_ctx.runtime_session_key.clone()),
     };
     let mut stream = client
         .chat_stream(request)

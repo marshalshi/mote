@@ -48,6 +48,10 @@ pub struct Config {
     /// Server configuration (port, bind address).
     #[serde(default)]
     pub server: ServerConfig,
+
+    /// Logging configuration.
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,9 +123,10 @@ pub struct HistoryConfig {
     pub dir: PathBuf,
 }
 fn default_history_dir() -> HistoryConfig {
-    HistoryConfig {
-        dir: PathBuf::from("history"),
-    }
+    let dir = dirs::home_dir()
+        .map(|h| h.join(".config").join("mote").join("history"))
+        .unwrap_or_else(|| PathBuf::from("history"));
+    HistoryConfig { dir }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +196,27 @@ impl Default for ServerConfig {
         Self {
             port: default_server_port(),
             max_steps: default_max_steps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    /// Directory for log files.
+    #[serde(default = "default_log_dir")]
+    pub dir: PathBuf,
+}
+
+fn default_log_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".config").join("mote").join("logs"))
+        .unwrap_or_else(|| PathBuf::from("logs"))
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_log_dir(),
         }
     }
 }
@@ -990,5 +1016,37 @@ max_steps = 25
         )
         .unwrap();
         assert_eq!(config.server.max_steps, 25);
+    }
+
+    #[test]
+    fn test_logging_dir_default() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "x"
+[providers.ollama]
+base_url = "http://localhost:11434"
+"#,
+        )
+        .unwrap();
+        assert!(config.logging.dir.to_string_lossy().contains("mote/logs"));
+    }
+
+    #[test]
+    fn test_logging_dir_custom() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "x"
+[providers.ollama]
+base_url = "http://localhost:11434"
+[logging]
+dir = "/tmp/mote-logs"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.logging.dir, PathBuf::from("/tmp/mote-logs"));
     }
 }

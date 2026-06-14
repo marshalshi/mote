@@ -1,15 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Router,
     extract::{
         Path, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
 };
@@ -68,14 +68,12 @@ struct AppState {
     config: config::Config,
     /// Runtime-updatable auth (reloaded after credential save).
     auth: RwLock<auth::Auth>,
-    tools: Arc<Vec<Box<dyn llm::Tool>>>,
     /// Merged agents from config.toml + separate files (file agents lower priority).
     merged_agents: HashMap<String, config::AgentConfig>,
-    workspace: PathBuf,
     /// Active GitHub OAuth device flows (keyed by device_code).
     device_flows: tokio::sync::Mutex<HashMap<String, DeviceFlow>>,
-    /// Reversible file mutations for this server process (latest at end).
-    rollback_journal: tokio::sync::Mutex<Vec<RollbackChangeSet>>,
+    /// Runtime state partitioned by client-provided session key.
+    runtime_states: tokio::sync::Mutex<HashMap<String, RuntimeSessionState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +82,20 @@ struct RollbackChangeSet {
     tool_name: String,
     entries: Vec<llm::RollbackEntry>,
     display_changes: Vec<marshaling_protocol::FileChange>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeSessionState {
+    rollback_journal: Vec<RollbackChangeSet>,
+    remember_allow_tools: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RequestContext {
+    workspace: PathBuf,
+    workspace_display: String,
+    runtime_session_key: String,
+    repo_agents_md: Option<String>,
 }
 
 // ── HTTP routes ─────────────────────────────────────────
@@ -126,9 +138,17 @@ async fn get_config(
 
 /// GET /sessions
 async fn list_sessions(
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let hist_dir = state.config.history.dir.clone();
+    let Some(runtime_session_key) = runtime_session_key_from_headers(&headers)
+    else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let hist_dir = history_dir_for_session(
+        &state.config.history.dir,
+        &runtime_session_key,
+    );
     let items = tokio::task::spawn_blocking(
         move || -> Vec<marshaling_protocol::SessionInfo> {
             match history::list_sessions(&hist_dir) {
@@ -156,18 +176,25 @@ async fn list_sessions(
     )
     .await
     .unwrap_or_default();
-    Json(items)
+    Ok(Json(items))
 }
 
 /// GET /sessions/:id — load a specific session.
 async fn load_session(
     Path(id): Path<String>,
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<marshaling_protocol::SessionData>, StatusCode> {
     if !validate_session_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let path = state.config.history.dir.join(format!("{id}.md"));
+    let runtime_session_key = runtime_session_key_from_headers(&headers)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let path = history_dir_for_session(
+        &state.config.history.dir,
+        &runtime_session_key,
+    )
+    .join(format!("{id}.md"));
     let result =
         tokio::task::spawn_blocking(move || history::parse_file(&path))
             .await
@@ -199,12 +226,21 @@ async fn load_session(
 /// DELETE /sessions/:id — delete a saved session.
 async fn delete_session(
     Path(id): Path<String>,
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> StatusCode {
     if !validate_session_id(&id) {
         return StatusCode::BAD_REQUEST;
     }
-    let path = state.config.history.dir.join(format!("{id}.md"));
+    let Some(runtime_session_key) = runtime_session_key_from_headers(&headers)
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let path = history_dir_for_session(
+        &state.config.history.dir,
+        &runtime_session_key,
+    )
+    .join(format!("{id}.md"));
     let result = tokio::task::spawn_blocking(move || {
         if path.exists() {
             match std::fs::remove_file(&path) {
@@ -251,8 +287,9 @@ async fn list_models_handler(
 /// POST /rollback/last — rollback latest tracked file change-set.
 async fn rollback_last_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(payload): Json<marshaling_protocol::RollbackLastRequest>,
 ) -> impl IntoResponse {
-    Json(apply_rollback_last(&state).await)
+    Json(apply_rollback_last(&state, &payload.runtime_session_key).await)
 }
 
 // ── GitHub OAuth Device Flow routes ─────────────────────
@@ -615,6 +652,77 @@ fn validate_session_id(id: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
+fn validate_runtime_session_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':')
+}
+
+fn runtime_session_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("x-mote-session-key")?.to_str().ok()?;
+    let key = value.trim();
+    if validate_runtime_session_key(key) {
+        Some(key.to_string())
+    } else {
+        None
+    }
+}
+
+fn history_dir_for_session(
+    base_history_dir: &std::path::Path,
+    runtime_session_key: &str,
+) -> PathBuf {
+    base_history_dir.join(runtime_session_key)
+}
+
+fn resolve_request_context(
+    request: &marshaling_protocol::ChatRequest,
+) -> Result<RequestContext> {
+    let workspace_raw = request
+        .workspace_root
+        .as_ref()
+        .context("Missing workspace_root in chat request")?;
+    let workspace_path = PathBuf::from(workspace_raw);
+    if !workspace_path.is_absolute() {
+        anyhow::bail!("workspace_root must be an absolute path");
+    }
+    if !workspace_path.exists() {
+        anyhow::bail!(
+            "workspace_root does not exist: {}",
+            workspace_path.display()
+        );
+    }
+    let workspace = workspace_path.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to canonicalize workspace_root {}: {}",
+            workspace_path.display(),
+            e
+        )
+    })?;
+    if !workspace.is_dir() {
+        anyhow::bail!(
+            "workspace_root is not a directory: {}",
+            workspace.display()
+        );
+    }
+
+    let runtime_session_key = request
+        .runtime_session_key
+        .clone()
+        .context("Missing runtime_session_key in chat request")?;
+    if !validate_runtime_session_key(&runtime_session_key) {
+        anyhow::bail!("Invalid runtime_session_key");
+    }
+
+    Ok(RequestContext {
+        workspace_display: workspace.display().to_string(),
+        workspace,
+        runtime_session_key,
+        repo_agents_md: request.repo_agents_md.clone(),
+    })
+}
+
 // ── Extracted helpers for agent setup ───────────────────
 
 /// Resolved agent context: provider, model, system prompt, and options.
@@ -633,6 +741,7 @@ async fn resolve_agent_context(
     config: &config::Config,
     auth: &auth::Auth,
     merged_agents: &HashMap<String, config::AgentConfig>,
+    req_ctx: &RequestContext,
     agent_name: &str,
     model_override: Option<&str>,
     provider_override: Option<&str>,
@@ -673,6 +782,10 @@ async fn resolve_agent_context(
     let prompt = prompt::PromptAssembler::for_agent(
         config,
         merged_agents.get(agent_name),
+    )
+    .with_workspace_context(
+        Some(req_ctx.workspace.clone()),
+        req_ctx.repo_agents_md.clone(),
     );
     let eff_provider_clone = eff_provider.clone();
     let eff_model_id_clone = eff_model_id.clone();
@@ -737,6 +850,7 @@ pub fn build_permission_map(
 /// Build the augmented tool set (builtins + use_skill + subagent tool).
 fn build_augmented_tools(
     workspace: &std::path::Path,
+    repo_agents_md: Option<String>,
     provider: &Arc<dyn llm::LlmProvider>,
     config: &config::Config,
     merged_agents: &HashMap<String, config::AgentConfig>,
@@ -763,6 +877,7 @@ fn build_augmented_tools(
             tools: subagent_tools,
             config: config.clone(),
             merged_agents: merged_agents.clone(),
+            repo_agents_md,
             cancel_rx: cancel_rx.clone(),
             depth: 0,
             max_depth: 3,
@@ -802,6 +917,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         request.message.len()
     );
 
+    let req_ctx = match resolve_request_context(&request) {
+        Ok(v) => v,
+        Err(e) => {
+            send_error(&mut socket, format!("{:#}", e)).await;
+            return;
+        }
+    };
+
     // Resolve agent: empty agent → "default" for safety
     let agent_name = if request.agent.is_empty() {
         "default".to_string()
@@ -823,6 +946,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         &state.config,
         &*auth_guard,
         &state.merged_agents,
+        &req_ctx,
         &agent_name,
         request.model_override.as_deref(),
         request.provider_override.as_deref(),
@@ -839,13 +963,25 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     drop(auth_guard);
 
     // Build permission map
-    let tool_names: Vec<String> = state
-        .tools
+    let preview_tools = llm::builtin_tools(req_ctx.workspace.clone());
+    let tool_names: Vec<String> = preview_tools
         .iter()
         .map(|t| t.def().function.name.clone())
         .collect();
     let agent_cfg = state.merged_agents.get(&agent_name);
-    let perms = build_permission_map(&state.config, agent_cfg, &tool_names);
+    let mut perms = build_permission_map(&state.config, agent_cfg, &tool_names);
+    let remembered_allows = {
+        let sessions = state.runtime_states.lock().await;
+        sessions
+            .get(&req_ctx.runtime_session_key)
+            .map(|s| s.remember_allow_tools.clone())
+            .unwrap_or_default()
+    };
+    for tool in remembered_allows {
+        if perms.get(&tool) == Some(&config::Permission::Ask) {
+            perms.insert(tool, config::Permission::Allow);
+        }
+    }
 
     // Run the agent loop — pass channels for events and permission responses
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
@@ -853,10 +989,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let _cancel_guard = CancelGuard(cancel_tx.clone());
     let (permission_tx, permission_rx) =
         mpsc::unbounded_channel::<(String, bool)>();
+    let mut pending_permission_tools: HashMap<String, String> = HashMap::new();
 
     // Build augmented tools (builtins + use_skill + subagent)
     let augmented_tools = build_augmented_tools(
-        &state.workspace,
+        &req_ctx.workspace,
+        req_ctx.repo_agents_md.clone(),
         &ctx.provider,
         &state.config,
         &state.merged_agents,
@@ -886,6 +1024,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let max_steps = state.config.server.max_steps;
     let augmented_tools_spawn = augmented_tools.clone();
     let prov_spawn = ctx.provider;
+    let workspace_display = req_ctx.workspace_display.clone();
 
     let agent_handle = tokio::spawn(async move {
         agent::run_loop(
@@ -900,6 +1039,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             permission_rx,
             perms,
             max_steps,
+            workspace_display,
         )
         .await;
     });
@@ -919,7 +1059,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             tokens_output,
                             &history,
                         );
-                        let hist_dir = state.config.history.dir.clone();
+                        let hist_dir = history_dir_for_session(
+                            &state.config.history.dir,
+                            &req_ctx.runtime_session_key,
+                        );
                         tokio::task::spawn_blocking(move || {
                             if let Err(e) = history::save_session(&hist_dir, &session) {
                                 tracing::warn!("Failed to save session: {e}");
@@ -939,8 +1082,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     Some(Ok(event)) => {
                         if let agent::AgentEvent::ToolCompleted { id, name, result, changes, rollback_entries } = event {
                             if !rollback_entries.is_empty() {
-                                let mut journal = state.rollback_journal.lock().await;
-                                journal.push(RollbackChangeSet {
+                                let mut sessions = state.runtime_states.lock().await;
+                                let session_state = sessions.entry(req_ctx.runtime_session_key.clone()).or_default();
+                                session_state.rollback_journal.push(RollbackChangeSet {
                                     id: id.clone(),
                                     tool_name: name,
                                     entries: rollback_entries,
@@ -953,6 +1097,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 break;
                             }
                             continue;
+                        }
+
+                        if let agent::AgentEvent::PermissionRequest { id, tool_name, .. } = &event {
+                            pending_permission_tools.insert(id.clone(), tool_name.clone());
                         }
 
                         let server_event = agent_event_to_server_event(event);
@@ -982,15 +1130,23 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         // Check if this is a ClientEvent (e.g., permission response, cancel)
                         if let Ok(client_event) = serde_json::from_str::<marshaling_protocol::ClientEvent>(&text) {
                             match client_event {
-                                marshaling_protocol::ClientEvent::PermissionResponse { id, allowed } => {
+                                marshaling_protocol::ClientEvent::PermissionResponse { id, allowed, remember } => {
+                                    if remember && allowed {
+                                        if let Some(tool_name) = pending_permission_tools.get(&id).cloned() {
+                                            let mut sessions = state.runtime_states.lock().await;
+                                            let sess = sessions.entry(req_ctx.runtime_session_key.clone()).or_default();
+                                            sess.remember_allow_tools.insert(tool_name);
+                                        }
+                                    }
                                     let _ = permission_tx.send((id, allowed));
                                 }
                                 marshaling_protocol::ClientEvent::Cancel => {
                                     debug!("Client requested cancellation");
                                     let _ = cancel_tx.send(true);
                                 }
-                                marshaling_protocol::ClientEvent::RollbackLast => {
-                                    let payload = apply_rollback_last(&state).await;
+                                marshaling_protocol::ClientEvent::RollbackLast { runtime_session_key } => {
+                                    let key = runtime_session_key.unwrap_or_else(|| req_ctx.runtime_session_key.clone());
+                                    let payload = apply_rollback_last(&state, &key).await;
                                     let evt = marshaling_protocol::ServerEvent::RollbackResult {
                                         success: payload.success,
                                         message: payload.message,
@@ -1123,10 +1279,19 @@ fn hash64(content: &str) -> u64 {
 
 async fn apply_rollback_last(
     state: &Arc<AppState>,
+    runtime_session_key: &str,
 ) -> marshaling_protocol::RollbackResultPayload {
     let cs = {
-        let mut journal = state.rollback_journal.lock().await;
-        match journal.pop() {
+        let mut sessions = state.runtime_states.lock().await;
+        let Some(session) = sessions.get_mut(runtime_session_key) else {
+            return marshaling_protocol::RollbackResultPayload {
+                success: false,
+                message: "No reversible changes available in this session."
+                    .into(),
+                changes: Vec::new(),
+            };
+        };
+        match session.rollback_journal.pop() {
             Some(v) => v,
             None => {
                 return marshaling_protocol::RollbackResultPayload {
@@ -1288,8 +1453,7 @@ async fn apply_rollback_last(
 
 fn find_config() -> Result<PathBuf> {
     if let Some(home) = dirs::home_dir() {
-        let cfg_path =
-            home.join(".config").join("mote").join("config.toml");
+        let cfg_path = home.join(".config").join("mote").join("config.toml");
         if cfg_path.exists() {
             return Ok(cfg_path);
         }
@@ -1305,6 +1469,30 @@ fn find_config() -> Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load config early so logging path can come from config.
+    let config_path = find_config()?;
+    if !config_path.exists() {
+        anyhow::bail!(
+            "No config.toml found at {} or CWD.",
+            config_path.display()
+        );
+    }
+    let mut config = config::Config::load(&config_path)?;
+    if config.history.dir.is_relative() {
+        let base = config_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        config.history.dir = base.join(&config.history.dir);
+    }
+    if config.logging.dir.is_relative() {
+        let base = config_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        config.logging.dir = base.join(&config.logging.dir);
+    }
+
     // Logging setup: debug/trace → file, otherwise → stderr
     let env_log = std::env::var("RUST_LOG").unwrap_or_default();
     let wants_debug = env_log.eq_ignore_ascii_case("debug")
@@ -1312,7 +1500,7 @@ async fn main() -> Result<()> {
         || env_log.contains("mote=debug");
 
     if wants_debug {
-        let log_dir = std::path::PathBuf::from("logs");
+        let log_dir = config.logging.dir.clone();
         std::fs::create_dir_all(&log_dir).ok();
         let log_path = log_dir.join("mote.log");
         let log_file = std::fs::OpenOptions::new()
@@ -1347,35 +1535,20 @@ async fn main() -> Result<()> {
             )
             .init();
     }
-
-    // Load config
-    let config_path = find_config()?;
-    if !config_path.exists() {
-        anyhow::bail!(
-            "No config.toml found at {} or CWD.",
-            config_path.display()
-        );
-    }
-    let config = config::Config::load(&config_path)?;
     info!("Config loaded from {}", config_path.display());
 
     // Load auth secrets
     let auth = auth::Auth::load();
     info!("Auth loaded from {}", auth::auth_path().display());
 
-    // Build tools
-    let workspace = std::env::current_dir().unwrap_or_default();
-    let tools = Arc::new(llm::builtin_tools(workspace.clone()));
-    info!("Server started with workspace: {}", workspace.display());
+    info!("Server started (workspace is per-request)");
 
     let state = Arc::new(AppState {
         merged_agents: config::all_agents(&config.agents),
         auth: RwLock::new(auth),
         config,
-        tools,
-        workspace,
         device_flows: tokio::sync::Mutex::new(HashMap::new()),
-        rollback_journal: tokio::sync::Mutex::new(Vec::new()),
+        runtime_states: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let port = state.config.server.port;
@@ -1419,5 +1592,54 @@ mod tests {
         assert!(!validate_session_id("../etc/passwd"));
         assert!(!validate_session_id("a/b"));
         assert!(!validate_session_id("a\\b"));
+    }
+
+    #[test]
+    fn test_validate_runtime_session_key() {
+        assert!(validate_runtime_session_key("abc-123_def:1"));
+        assert!(!validate_runtime_session_key(""));
+        assert!(!validate_runtime_session_key("../../bad"));
+        assert!(!validate_runtime_session_key("bad key"));
+    }
+
+    #[test]
+    fn test_build_permission_map_basic() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+[model]
+provider = "ollama"
+model_id = "m"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+[permissions]
+default = "ask"
+read = "allow"
+"#,
+        )
+        .unwrap();
+        let tools = vec!["read".to_string(), "bash".to_string()];
+        let perms = build_permission_map(&cfg, None, &tools);
+        assert_eq!(perms.get("read"), Some(&config::Permission::Allow));
+        assert_eq!(perms.get("bash"), Some(&config::Permission::Ask));
+        assert_eq!(perms.get("use_skill"), Some(&config::Permission::Allow));
+    }
+
+    #[test]
+    fn test_runtime_session_key_from_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mote-session-key", "abc-123".parse().unwrap());
+        assert_eq!(
+            runtime_session_key_from_headers(&headers).as_deref(),
+            Some("abc-123")
+        );
+
+        let mut bad = HeaderMap::new();
+        bad.insert("x-mote-session-key", "bad key".parse().unwrap());
+        assert!(runtime_session_key_from_headers(&bad).is_none());
+
+        let empty = HeaderMap::new();
+        assert!(runtime_session_key_from_headers(&empty).is_none());
     }
 }

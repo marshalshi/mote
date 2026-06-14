@@ -14,6 +14,7 @@ pub enum Action {
     CursorRight,
     CursorHome,
     CursorEnd,
+    KillLine,
     DeleteBefore,
     DeleteAfter,
     HistoryUp,
@@ -120,6 +121,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "cursor_right" => Some(Action::CursorRight),
         "cursor_home" => Some(Action::CursorHome),
         "cursor_end" => Some(Action::CursorEnd),
+        "kill_line" => Some(Action::KillLine),
         "delete_before" => Some(Action::DeleteBefore),
         "delete_after" => Some(Action::DeleteAfter),
         "history_up" => Some(Action::HistoryUp),
@@ -139,13 +141,14 @@ fn default_bindings() -> Vec<(Action, Vec<String>)> {
     vec![
         (Action::SendMessage, vec!["enter".into()]),
         (Action::InsertNewline, vec!["alt+enter".into()]),
-        (Action::Quit, vec!["esc".into(), "ctrl+c".into()]),
+        (Action::Quit, vec!["ctrl+c".into()]),
         (Action::CursorLeft, vec!["left".into()]),
         (Action::CursorRight, vec!["right".into()]),
-        (Action::CursorHome, vec!["home".into()]),
-        (Action::CursorEnd, vec!["end".into()]),
+        (Action::CursorHome, vec!["home".into(), "ctrl+a".into()]),
+        (Action::CursorEnd, vec!["end".into(), "ctrl+e".into()]),
+        (Action::KillLine, vec!["ctrl+k".into()]),
         (Action::DeleteBefore, vec!["backspace".into()]),
-        (Action::DeleteAfter, vec!["delete".into()]),
+        (Action::DeleteAfter, vec!["delete".into(), "ctrl+d".into()]),
         (Action::HistoryUp, vec!["up".into()]),
         (Action::HistoryDown, vec!["down".into()]),
         (Action::ScrollUp, vec!["pageup".into(), "ctrl+up".into()]),
@@ -157,6 +160,7 @@ fn default_bindings() -> Vec<(Action, Vec<String>)> {
         (Action::AgentCommand, vec!["ctrl+p".into()]),
         (Action::Complete, vec!["tab".into()]),
         (Action::SwitchView, vec!["f5".into()]),
+        (Action::CancelAgent, vec!["esc".into()]),
     ]
 }
 
@@ -280,11 +284,27 @@ mod tests {
         );
         assert_eq!(
             kb.lookup(KeyCode::Esc, KeyModifiers::NONE),
-            Some(Action::Quit)
+            Some(Action::CancelAgent)
         );
         assert_eq!(
             kb.lookup(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Some(Action::Quit)
+        );
+        assert_eq!(
+            kb.lookup(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            Some(Action::CursorHome)
+        );
+        assert_eq!(
+            kb.lookup(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            Some(Action::CursorEnd)
+        );
+        assert_eq!(
+            kb.lookup(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Some(Action::DeleteAfter)
+        );
+        assert_eq!(
+            kb.lookup(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            Some(Action::KillLine)
         );
     }
 

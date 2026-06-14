@@ -32,13 +32,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let newline_count = app.input.matches('\n').count();
     let input_lines = {
         let base = (newline_count.saturating_add(1)).max(1).min(8) as u16 + 4; // +2 for top/bottom accent +2 for spacers
-        // Permission prompt needs at least 8 lines (spacer + top accent + 4 content + bottom accent + spacer)
+        // Permission prompt can be tall when args are large; reserve extra space.
         if app.pending_permission.is_some() {
             let confirm = app
                 .pending_permission
                 .as_ref()
                 .map_or(false, |p| p.confirming_always);
-            base.max(if confirm { 10 } else { 8 })
+            base.max(if confirm { 16 } else { 14 })
         } else {
             base
         }
@@ -941,7 +941,23 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
 
     if let Some(ref perm) = app.pending_permission {
         // ── Permission prompt replaces input box ──────────
-        let args_lines = json_to_yaml_lines(&perm.args, content_width);
+        let mut args_lines = json_to_yaml_lines(&perm.args, content_width);
+        let base_lines_no_args: u16 =
+            if perm.confirming_always { 9 } else { 7 };
+        let max_args_lines = area
+            .height
+            .saturating_sub(base_lines_no_args)
+            .saturating_sub(1) as usize;
+        if args_lines.len() > max_args_lines {
+            if max_args_lines == 0 {
+                args_lines.clear();
+            } else if max_args_lines == 1 {
+                args_lines = vec!["... (args truncated)".into()];
+            } else {
+                args_lines.truncate(max_args_lines - 1);
+                args_lines.push("... (args truncated)".into());
+            }
+        }
         lines.push(Line::from(vec![
             Span::styled(" ▌  ", a_style),
             Span::styled(
@@ -1073,12 +1089,12 @@ fn cursor_pos_after_wrap(
 // ── Status bar ──────────────────────────────────────────
 
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    // Agent name on the left, always green. Blinks when agent is running.
+    // Agent name on the left, follows current accent color. Blinks when agent is running.
     let is_running = matches!(
         app.state,
         AppState::AgentRunning | AppState::WaitingResponse
     );
-    let mut agent_style = Style::default().fg(Color::Green);
+    let mut agent_style = Style::default().fg(app.input_accent);
     if is_running {
         agent_style = agent_style.add_modifier(Modifier::SLOW_BLINK);
     }
@@ -1140,7 +1156,14 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     let style = Style::default().fg(Color::DarkGray);
     let total = area.width as usize;
-    let hints = " Ctrl+C: quit | /help: commands ";
+    let hints = if matches!(
+        app.state,
+        AppState::AgentRunning | AppState::WaitingResponse
+    ) {
+        " Esc, Esc: stop agent | Ctrl+C: quit | /help: commands "
+    } else {
+        " Ctrl+C: quit | /help: commands "
+    };
     let right = if total > left.len() + right_info.len() {
         right_info
     } else {

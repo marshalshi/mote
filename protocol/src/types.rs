@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when breaking changes are made to ServerEvent/ChatRequest.
-pub const PROTOCOL_VERSION: &str = "1";
+pub const PROTOCOL_VERSION: &str = "2";
 
 // ── Client → Server ─────────────────────────────────────
 
@@ -27,6 +27,15 @@ pub struct ChatRequest {
     /// Resume an existing session (loaded from server).
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Client workspace root (absolute path). Server uses this as the tool sandbox root.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    /// Repo-local AGENTS.md content collected by the client for this workspace.
+    #[serde(default)]
+    pub repo_agents_md: Option<String>,
+    /// Client session key for scoping mutable runtime state (rollback, permission remembers).
+    #[serde(default)]
+    pub runtime_session_key: Option<String>,
 }
 
 // ── Client ↔ Server (bi-directional events during a session) ──
@@ -36,13 +45,21 @@ pub struct ChatRequest {
 #[serde(tag = "type")]
 pub enum ClientEvent {
     #[serde(rename = "permission_response")]
-    PermissionResponse { id: String, allowed: bool },
+    PermissionResponse {
+        id: String,
+        allowed: bool,
+        #[serde(default)]
+        remember: bool,
+    },
     /// Cancel the currently running agent loop.
     #[serde(rename = "cancel")]
     Cancel,
     /// Request rollback of the most recent tracked change-set.
     #[serde(rename = "rollback_last")]
-    RollbackLast,
+    RollbackLast {
+        #[serde(default)]
+        runtime_session_key: Option<String>,
+    },
 }
 
 // ── Server → Client (streaming events) ──────────────────
@@ -223,6 +240,11 @@ pub struct RollbackResultPayload {
     pub changes: Vec<FileChange>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackLastRequest {
+    pub runtime_session_key: String,
+}
+
 /// Full session data returned by GET /sessions/:id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
@@ -300,5 +322,32 @@ mod tests {
         let json = r#"{"type":"future_event","some_field":42}"#;
         let evt: ServerEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(evt, ServerEvent::Unknown));
+    }
+
+    #[test]
+    fn test_chat_request_new_fields_serde_defaults() {
+        let json = r#"{"message":"hi","agent":"default","model_override":null,"provider_override":null,"history":[],"session_id":null}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.workspace_root.is_none());
+        assert!(req.repo_agents_md.is_none());
+        assert!(req.runtime_session_key.is_none());
+    }
+
+    #[test]
+    fn test_permission_response_remember_default_false() {
+        let json = r#"{"type":"permission_response","id":"p1","allowed":true}"#;
+        let evt: ClientEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            ClientEvent::PermissionResponse {
+                id,
+                allowed,
+                remember,
+            } => {
+                assert_eq!(id, "p1");
+                assert!(allowed);
+                assert!(!remember);
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 }

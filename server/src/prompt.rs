@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::llm::ToolDef;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Frontmatter parsed from each skill's SKILL.md.
 #[derive(Debug, Clone, Deserialize)]
@@ -15,6 +15,8 @@ struct SkillMeta {
 pub struct PromptAssembler {
     config: Config,
     agent_instructions: Option<String>,
+    workspace_root: Option<PathBuf>,
+    repo_agents_md: Option<String>,
 }
 
 impl PromptAssembler {
@@ -24,6 +26,8 @@ impl PromptAssembler {
         Self {
             config,
             agent_instructions: None,
+            workspace_root: None,
+            repo_agents_md: None,
         }
     }
 
@@ -45,7 +49,19 @@ impl PromptAssembler {
         Self {
             config: cfg,
             agent_instructions: instructions,
+            workspace_root: None,
+            repo_agents_md: None,
         }
+    }
+
+    pub fn with_workspace_context(
+        mut self,
+        workspace_root: Option<PathBuf>,
+        repo_agents_md: Option<String>,
+    ) -> Self {
+        self.workspace_root = workspace_root;
+        self.repo_agents_md = repo_agents_md;
+        self
     }
 
     /// Build the system layer list (each element is one layer).
@@ -53,9 +69,10 @@ impl PromptAssembler {
     /// Layers are assembled in order:
     /// 1. Environment block (model info, platform, working directory, date)
     /// 2. Provider-specific prompt (prompts/<provider>.txt) or default fallback
-    /// 3. Agent-specific instructions (from agent config `instructions` field, optional)
-    /// 4. User AGENTS.md — ~/.config/mote/AGENTS.md (optional)
-    /// 5. Skills — ~/.config/mote/skills/*.md (optional)
+    /// 3. User AGENTS.md — ~/.config/mote/AGENTS.md (optional)
+    /// 4. Workspace AGENTS.md passed by client (optional)
+    /// 5. Agent-specific instructions (from agent config `instructions` field, optional)
+    /// 6. Skills — ~/.config/mote/skills/*.md (optional)
     pub fn assemble(
         &self,
         model_provider: &str,
@@ -64,7 +81,9 @@ impl PromptAssembler {
         let mut layers: Vec<String> = Vec::new();
 
         // Layer 1: Environment
-        layers.push(self.build_env_block(model_id));
+        layers.push(
+            self.build_env_block(model_id, self.workspace_root.as_deref()),
+        );
 
         // Layer 2: Model-specific prompt
         //   - Config override (model_specific) takes precedence
@@ -109,7 +128,20 @@ impl PromptAssembler {
             }
         }
 
-        // Layer 4: Agent-specific instructions (if set for this agent)
+        // Layer 4: Workspace AGENTS.md passed by the client (if present)
+        if let Some(ref content) = self.repo_agents_md {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let src = self
+                    .workspace_root
+                    .as_ref()
+                    .map(|p| p.join("AGENTS.md").display().to_string())
+                    .unwrap_or_else(|| "<workspace>/AGENTS.md".to_string());
+                layers.push(format!("Instructions from: {}\n{}", src, trimmed));
+            }
+        }
+
+        // Layer 5: Agent-specific instructions (if set for this agent)
         if let Some(ref instructions) = self.agent_instructions {
             let trimmed = instructions.trim();
             if !trimmed.is_empty() {
@@ -117,11 +149,10 @@ impl PromptAssembler {
             }
         }
 
-        // Layer 5: Skills index — only name + description (not full content)
+        // Layer 6: Skills index — only name + description (not full content)
         // Full content is loaded on demand via the `use_skill` tool.
         if let Some(home) = dirs::home_dir() {
-            let skills_dir =
-                home.join(".config").join("mote").join("skills");
+            let skills_dir = home.join(".config").join("mote").join("skills");
             if skills_dir.is_dir() {
                 let mut skill_entries: Vec<(String, String)> = Vec::new(); // (name, description)
                 if let Ok(entries) = std::fs::read_dir(&skills_dir) {
@@ -195,11 +226,22 @@ impl PromptAssembler {
     }
 
     /// Build the environment info block (Layer 1).
-    fn build_env_block(&self, model_id: &str) -> String {
-        let cwd = std::env::current_dir()
+    fn build_env_block(
+        &self,
+        model_id: &str,
+        workspace_root: Option<&Path>,
+    ) -> String {
+        let cwd = workspace_root
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        let is_git = std::path::Path::new(".git").exists();
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let is_git = workspace_root
+            .map(|p| p.join(".git").exists())
+            .unwrap_or_else(|| std::path::Path::new(".git").exists());
 
         format!(
             r#"You are a CLI AI assistant powered by the model named {model_id}.
@@ -347,10 +389,54 @@ instructions = []
     #[test]
     fn test_environment_block_contains_model() {
         let a = test_assembler();
-        let block = a.build_env_block("gpt-4");
+        let block = a.build_env_block("gpt-4", None);
         assert!(block.contains("gpt-4"));
         assert!(block.contains("<env>"));
         assert!(block.contains("</env>"));
+    }
+
+    #[test]
+    fn test_workspace_agents_layer_is_included() {
+        let a = test_assembler().with_workspace_context(
+            Some(PathBuf::from("/tmp/repo")),
+            Some("# local rules".into()),
+        );
+        let layers = a.assemble("test", "test-model").unwrap();
+        assert!(
+            layers
+                .iter()
+                .any(|l| l.contains("Instructions from: /tmp/repo/AGENTS.md"))
+        );
+        assert!(layers.iter().any(|l| l.contains("# local rules")));
+    }
+
+    #[test]
+    fn test_global_agents_before_workspace_agents() {
+        let a = test_assembler().with_workspace_context(
+            Some(PathBuf::from("/tmp/repo")),
+            Some("# workspace rules".into()),
+        );
+        let layers = a.assemble("test", "test-model").unwrap();
+
+        let workspace_idx = layers
+            .iter()
+            .position(|l| l.contains("Instructions from: /tmp/repo/AGENTS.md"));
+        if let Some(home) = dirs::home_dir() {
+            let global_path =
+                home.join(".config").join("mote").join("AGENTS.md");
+            if global_path.exists() {
+                let global_marker =
+                    format!("Instructions from: {}", global_path.display());
+                let global_idx =
+                    layers.iter().position(|l| l.contains(&global_marker));
+                if let (Some(g), Some(w)) = (global_idx, workspace_idx) {
+                    assert!(
+                        g < w,
+                        "global AGENTS should appear before workspace AGENTS"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

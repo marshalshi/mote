@@ -115,6 +115,8 @@ pub async fn run_loop(
     permissions: std::collections::HashMap<String, crate::config::Permission>,
     // Configurable max steps (defaults to DEFAULT_MAX_STEPS if 0)
     max_steps: usize,
+    // Workspace context for dynamic reminder text.
+    working_directory: String,
 ) {
     let max_steps = if max_steps == 0 {
         DEFAULT_MAX_STEPS
@@ -186,9 +188,6 @@ pub async fn run_loop(
         messages.extend(system_layers.iter().map(|l| ChatMessage::system(l)));
 
         // Build and inject the dynamic system reminder (Layer 7)
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
         let last_user_msg = extract_last_user_message(&history);
         let last_turn_results = extract_last_turn_results(&history);
         let tool_defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
@@ -196,7 +195,7 @@ pub async fn run_loop(
         let reminder_ctx = crate::prompt::ReminderContext {
             step: _step + 1,
             max_steps,
-            working_directory: cwd,
+            working_directory: working_directory.clone(),
             tool_defs: &tool_defs,
             last_turn_results,
             last_user_message: last_user_msg,

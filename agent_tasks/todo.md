@@ -42,6 +42,95 @@
 
 ## Remaining Work by Priority Tier
 
+---
+
+## 2026-06-14 plan: decouple runtime workspace from server process cwd
+
+### Goal
+
+Allow:
+
+- the **server** to run from any folder on the machine
+- the **client/frontend** to run from any folder on the machine
+- each chat request to target a **separate user-selected workspace/repo root**
+- repo-local context such as **`AGENTS.md`** to be collected from the target workspace and sent to the backend for prompt assembly
+
+### Key findings from current code
+
+- Server workspace is currently fixed at startup from `std::env::current_dir()` in `server/src/main.rs` and stored as `AppState.workspace`.
+- Built-in tools are created once at startup via `llm::builtin_tools(workspace.clone())`, so all file tools are pinned to the server process cwd.
+- Prompt environment text and reminder text both use `std::env::current_dir()` (`server/src/prompt.rs`, `server/src/agent.rs`) rather than request-specific workspace context.
+- Prompt assembly currently reads only user-global `~/.config/mote/AGENTS.md`; it does **not** ingest repo-local `AGENTS.md` from the target workspace.
+- `ChatRequest` has no field for target workspace path or client-collected repo instructions.
+- Config discovery still falls back to server cwd (`find_config()`), which is fine for server config, but must stay separate from per-request workspace.
+
+### Recommended architecture
+
+Keep **server runtime/config root** separate from **request workspace root**.
+
+```text
+Server process cwd
+  └─ only for launching the binary
+
+Server config root (~/.config/mote or explicit config path)
+  └─ config.toml, auth.json, skills, global AGENTS.md
+
+Per-request workspace root (sent by client)
+  └─ repo files, .git, local AGENTS.md, prompt-local context, tool sandbox
+```
+
+### Proposed protocol shape
+
+- Extend `protocol::ChatRequest` with request-scoped workspace data:
+  - `workspace_root: Option<String>` — absolute path selected by the client
+  - `workspace_context: Option<WorkspaceContext>`
+- Add `WorkspaceContext` in `protocol/`:
+  - `repo_agents_md: Option<String>`
+  - optional future fields: `git_repo: Option<bool>`, `workspace_label: Option<String>`
+
+Recommendation: start with **both** `workspace_root` and `repo_agents_md`.
+
+- `workspace_root` is needed for tool sandboxing and bash `current_dir`
+- `repo_agents_md` is needed so frontend can explicitly pass repo-local instructions as you described
+
+### Proposed execution plan
+
+- [ ] **W1** Add request-scoped workspace types to `protocol/src/types.rs` and bump protocol version.
+- [ ] **W2** Update client request construction (`client/src/main.rs`, `client/src/tui/mod.rs`) to send:
+  - selected/current workspace absolute path
+  - repo-local `AGENTS.md` contents if present in that workspace
+- [ ] **W3** Introduce a client-side workspace resolver module:
+  - resolve target workspace root from launch cwd (initial version)
+  - read `<workspace>/AGENTS.md` safely
+  - keep failure non-fatal when file is absent
+- [ ] **W4** Refactor server request handling so tools are built per request using `request.workspace_root`, not `AppState.workspace`.
+- [ ] **W5** Replace prompt/agent cwd lookups with explicit request workspace context:
+  - env block working directory
+  - git repo detection
+  - dynamic reminder working directory
+- [ ] **W6** Extend prompt assembly to accept repo-local prompt layers from the request:
+  - prepend/append repo-local `AGENTS.md` at a defined layer
+  - keep global `~/.config/mote/AGENTS.md` behavior unchanged
+- [ ] **W7** Decide and enforce trust boundary for client-sent paths:
+  - require absolute path
+  - canonicalize on server
+  - reject nonexistent workspace roots
+  - ensure all file tools remain constrained under that canonical root
+- [ ] **W8** Update subagent tool construction so nested agents inherit the same request workspace.
+- [ ] **W9** Add tests:
+  - protocol serde round-trip for new fields
+  - prompt assembly includes repo-local AGENTS content
+  - tools reject paths outside request workspace
+  - bash runs inside request workspace
+  - client gracefully handles missing local AGENTS.md
+- [ ] **W10** Update docs/README with the new mental model: server config root vs per-chat workspace root.
+
+### Review / result for this planning slice
+
+- No product code changed yet.
+- Architectural change is required; current structure cannot support arbitrary frontend/server folders plus a separate target repo workspace correctly.
+- The safest design is **request-scoped workspace context**, not changing server global cwd.
+
 ### Tier 1: High Priority (highest impact per effort)
 
 These items offer substantial correctness or architecture improvements with moderate effort.

@@ -120,7 +120,10 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     });
                 }
                 SlashAction::ListSessions => {
-                    let result = match client.list_sessions().await {
+                    let result = match client
+                        .list_sessions(&app.runtime_session_key)
+                        .await
+                    {
                         Ok(sessions) => {
                             if sessions.is_empty() {
                                 "No sessions found.".into()
@@ -149,7 +152,10 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     });
                 }
                 SlashAction::DeleteSession(id) => {
-                    let result = match client.delete_session(&id).await {
+                    let result = match client
+                        .delete_session(&app.runtime_session_key, &id)
+                        .await
+                    {
                         Ok(_) => format!("Session {id} deleted."),
                         Err(e) => format!("Failed to delete session {id}: {e}"),
                     };
@@ -179,7 +185,10 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     });
                 }
                 SlashAction::RollbackLast => {
-                    let result = match client.rollback_last().await {
+                    let result = match client
+                        .rollback_last(&app.runtime_session_key)
+                        .await
+                    {
                         Ok(payload) => {
                             let mut lines = vec![payload.message];
                             for ch in payload.changes {
@@ -204,12 +213,15 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
         }
 
         // Send pending permission response if any
-        if let Some((id, allowed)) = app.pending_permission_response.take() {
+        if let Some((id, allowed, remember)) =
+            app.pending_permission_response.take()
+        {
             if let Some(ref mut stream) = chat_stream {
                 let resp =
                     marshaling_protocol::ClientEvent::PermissionResponse {
                         id,
                         allowed,
+                        remember,
                     };
                 // Send synchronously — quick operation, won't block
                 if let Err(e) = stream.send(resp).await {
@@ -286,6 +298,9 @@ async fn start_chat(
         provider_override: app.provider_override.clone(),
         session_id: None,
         history,
+        workspace_root: Some(app.workspace_root.clone()),
+        repo_agents_md: app.repo_agents_md.clone(),
+        runtime_session_key: Some(app.runtime_session_key.clone()),
     };
 
     match client.chat_stream(request.clone()).await {
@@ -352,7 +367,7 @@ fn handle_server_event(
         } => {
             // If user previously chose "Allow Always" for this tool, auto-allow
             if app.auto_allowed_tools.contains(&tool_name) {
-                app.pending_permission_response = Some((id, true));
+                app.pending_permission_response = Some((id, true, true));
             } else {
                 app.pending_permission = Some(self::state::PendingPermission {
                     id,
@@ -474,6 +489,7 @@ fn handle_server_event(
             tokens_output,
         } => {
             app.pending_permission = None;
+            app.clear_esc_cancel_arm();
             app.agent_done(&content);
             app.tokens_input += tokens_input;
             app.tokens_output += tokens_output;
@@ -522,6 +538,7 @@ fn handle_server_event(
         }
         ServerEvent::Error { message } => {
             app.pending_permission = None;
+            app.clear_esc_cancel_arm();
             app.set_error(&message);
             *chat_stream = None;
         }
@@ -590,7 +607,8 @@ fn handle_action(
             if should_confirm {
                 // User confirmed "Allow Always" — remember for the session
                 app.auto_allowed_tools.insert(perm.tool_name.clone());
-                app.pending_permission_response = Some((perm.id.clone(), true));
+                app.pending_permission_response =
+                    Some((perm.id.clone(), true, true));
             } else if should_cancel {
                 // Cancel confirmation — back to permission prompt
                 perm.confirming_always = false;
@@ -633,7 +651,7 @@ fn handle_action(
                 app.pending_permission = Some(perm);
             } else if should_allow || should_deny {
                 app.pending_permission_response =
-                    Some((perm.id.clone(), should_allow));
+                    Some((perm.id.clone(), should_allow, false));
             } else {
                 // Unhandled key — restore permission
                 app.pending_permission = Some(perm);
@@ -643,25 +661,36 @@ fn handle_action(
     }
 
     // Quit and scroll work in any state
-    // During agent running, Quit/Escape cancels the agent instead
+    // During agent running, Ctrl+C cancels immediately and Esc requires a double-tap
     match action {
         Some(Action::Quit)
             if app.state == AppState::AgentRunning
                 || app.state == AppState::WaitingResponse =>
         {
-            // Cancel the running agent instead of quitting
+            // Ctrl+C cancels immediately while running.
             app.pending_cancel = true;
+            app.clear_esc_cancel_arm();
             return;
         }
         Some(Action::CancelAgent) => {
             if app.state == AppState::AgentRunning
                 || app.state == AppState::WaitingResponse
             {
-                app.pending_cancel = true;
+                if app.esc_cancel_step() {
+                    app.pending_cancel = true;
+                    app.clear_esc_cancel_arm();
+                } else {
+                    app.messages.push(self::state::DisplayMessage::command(
+                        crate::llm::Role::Assistant,
+                        "Press Esc again within 2s to stop running agent."
+                            .into(),
+                    ));
+                }
             }
             return;
         }
         Some(Action::Quit) => {
+            app.clear_esc_cancel_arm();
             app.state = AppState::Quitting;
             return;
         }
@@ -711,6 +740,7 @@ fn handle_action(
             Some(Action::CursorRight) => app.cursor_right(),
             Some(Action::CursorHome) => app.cursor_home(),
             Some(Action::CursorEnd) => app.cursor_end(),
+            Some(Action::KillLine) => app.kill_line(),
             Some(Action::DeleteBefore) => app.delete_before(),
             Some(Action::DeleteAfter) => app.delete_after(),
             Some(Action::HistoryUp) => app.history_up(),
@@ -787,6 +817,7 @@ fn normal_action(
         Some(Action::CursorRight) => app.cursor_right(),
         Some(Action::CursorHome) => app.cursor_home(),
         Some(Action::CursorEnd) => app.cursor_end(),
+        Some(Action::KillLine) => app.kill_line(),
         Some(Action::DeleteBefore) => app.delete_before(),
         Some(Action::DeleteAfter) => app.delete_after(),
         Some(Action::HistoryUp) => app.history_up(),
@@ -796,6 +827,11 @@ fn normal_action(
                 app.input.push('/');
                 app.input_cursor = 1;
                 app.update_suggestions();
+            }
+        }
+        Some(Action::Complete) => {
+            if app.state == AppState::Idle {
+                app.cycle_agent();
             }
         }
         None => {

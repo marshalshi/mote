@@ -8,13 +8,14 @@
 
 # send_message = "enter"
 # insert_newline = "alt+enter"
-# quit = ["esc", "ctrl+c"]
+# quit = "ctrl+c"
 # cursor_left = "left"
 # cursor_right = "right"
-# cursor_home = "home"
-# cursor_end = "end"
+# cursor_home = ["home", "ctrl+a"]
+# cursor_end = ["end", "ctrl+e"]
+# kill_line = "ctrl+k"
 # delete_before = "backspace"
-# delete_after = "delete"
+# delete_after = ["delete", "ctrl+d"]
 # history_up = "up"
 # history_down = "down"
 # scroll_up = ["pageup", "ctrl+up"]
@@ -22,3 +23,4 @@
 # scroll_to_bottom = "ctrl+end"
 # agent_command = "ctrl+p"
 # complete = "tab"
+# cancel_agent = "esc"

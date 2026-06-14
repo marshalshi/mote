@@ -2,6 +2,7 @@ use crate::llm::Role;
 use marshaling_protocol::{ToolCallDisplay, ToolStatus};
 use ratatui::style::Color;
 use std::collections::{HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 /// Server connection health.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,7 +106,8 @@ pub struct App {
     pub pending_permission: Option<PendingPermission>,
 
     /// Queued permission response to send to the server (processed in event loop).
-    pub pending_permission_response: Option<(String, bool)>,
+    /// Tuple: (permission_id, allowed, remember_for_session_tool)
+    pub pending_permission_response: Option<(String, bool, bool)>,
 
     /// Tool names that have been "Allow Always"ed — auto-allowed for this session.
     pub auto_allowed_tools: HashSet<String>,
@@ -121,6 +123,18 @@ pub struct App {
 
     /// Whether the user has requested cancellation of the running agent.
     pub pending_cancel: bool,
+
+    /// Double-press Esc to cancel while agent is running.
+    esc_cancel_deadline: Option<Instant>,
+
+    /// Workspace root for this client session (client launch dir).
+    pub workspace_root: String,
+
+    /// Repo-local AGENTS.md content loaded by the client (if present).
+    pub repo_agents_md: Option<String>,
+
+    /// Session key used by server to scope runtime mutable state.
+    pub runtime_session_key: String,
 }
 
 /// Tracks a running subagent's output for the multi-agent TUI.
@@ -172,6 +186,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/agent", "List or switch agents"),
     ("/tokens", "Show token usage"),
     ("/session list", "List saved sessions"),
+    ("/session key", "Show runtime session key"),
     ("/session delete", "Delete a session"),
     ("/session info", "Show session info"),
     ("/model", "Show / switch model"),
@@ -183,6 +198,30 @@ impl App {
     pub fn new(
         ui_config: &marshaling_protocol::UiConfig,
         model_info: String,
+    ) -> Self {
+        let workspace_root = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".into());
+        let runtime_session_key = format!(
+            "legacy:{}:{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        Self::new_with_workspace(
+            ui_config,
+            model_info,
+            workspace_root,
+            None,
+            runtime_session_key,
+        )
+    }
+
+    pub fn new_with_workspace(
+        ui_config: &marshaling_protocol::UiConfig,
+        model_info: String,
+        workspace_root: String,
+        repo_agents_md: Option<String>,
+        runtime_session_key: String,
     ) -> Self {
         let mut agent_names: Vec<String> = ui_config.agent_names.clone();
         agent_names.sort();
@@ -225,7 +264,27 @@ impl App {
             subagent_views: Vec::new(),
             current_subagent_index: None,
             pending_cancel: false,
+            esc_cancel_deadline: None,
+            workspace_root,
+            repo_agents_md,
+            runtime_session_key,
         }
+    }
+
+    pub fn esc_cancel_step(&mut self) -> bool {
+        let now = Instant::now();
+        if let Some(deadline) = self.esc_cancel_deadline
+            && now <= deadline
+        {
+            self.esc_cancel_deadline = None;
+            return true;
+        }
+        self.esc_cancel_deadline = Some(now + Duration::from_secs(2));
+        false
+    }
+
+    pub fn clear_esc_cancel_arm(&mut self) {
+        self.esc_cancel_deadline = None;
     }
 
     // ── Input submission ──────────────────────────────────
@@ -347,6 +406,7 @@ impl App {
                         "  /help             — Show this help",
                         "  /tokens           — Show token usage",
                         "  /session          — Show session info",
+                        "  /session key      — Show runtime session key",
                         "  /model            — Show / switch model",
                         "  /subagents        — List active subagents",
                         "  /rollback last    — Rollback latest file changes",
@@ -356,7 +416,12 @@ impl App {
                         "Keybindings (configurable in keybindings.toml):",
                         "  Enter             — Send message",
                         "  Alt+Enter         — Newline",
-                        "  Esc / Ctrl+C      — Quit / Cancel agent",
+                        "  Ctrl+A / Ctrl+E   — Line start / end",
+                        "  Ctrl+D            — Delete current char",
+                        "  Ctrl+K            — Clear current line",
+                        "  Esc                — Press twice within 2s to stop running agent",
+                        "  Ctrl+C             — Quit / cancel immediately",
+                        "  Tab                — Cycle agent",
                         "  Up/Down           — Input history",
                         "  PgUp/PgDn, Ctrl+↑/↓ — Scroll",
                         "  Ctrl+P            — Agent command",
@@ -458,8 +523,17 @@ impl App {
                             ));
                         }
                     }
+                    "key" => {
+                        self.messages.push(DisplayMessage::command(
+                            Role::Assistant,
+                            format!(
+                                "Session key: {}\nWorkspace: {}",
+                                self.runtime_session_key, self.workspace_root
+                            ),
+                        ));
+                    }
                     _ => {
-                        self.messages.push(DisplayMessage::command(Role::Assistant, format!("Unknown subcommand: {sub}. Use: list, delete <id>, info").into()));
+                        self.messages.push(DisplayMessage::command(Role::Assistant, format!("Unknown subcommand: {sub}. Use: list, key, delete <id>, info").into()));
                     }
                 }
             }
@@ -775,6 +849,12 @@ impl App {
         }
     }
 
+    pub fn kill_line(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.update_suggestions();
+    }
+
     pub fn cursor_left(&mut self) {
         if self.input_cursor > 0 {
             let prev = self.input[..self.input_cursor]
@@ -832,6 +912,23 @@ impl App {
                 self.input_cursor = 0;
             }
         }
+    }
+
+    pub fn cycle_agent(&mut self) {
+        let names = all_agent_names(&self.agent_names);
+        if names.is_empty() {
+            return;
+        }
+        let idx = names
+            .iter()
+            .position(|n| n == &self.current_agent)
+            .unwrap_or(0);
+        let next = names[(idx + 1) % names.len()].clone();
+        self.current_agent = next.clone();
+
+        let accent = random_accent_color(self.input_accent);
+        self.input_accent = accent;
+        self.user_accent = accent;
     }
 
     /// Scroll up: increase offset from bottom to see OLDER content above.
@@ -936,6 +1033,27 @@ fn all_agent_names(configured: &[String]) -> Vec<String> {
     let mut names = vec!["default".to_string()];
     names.extend(configured.iter().cloned());
     names
+}
+
+fn random_accent_color(current: Color) -> Color {
+    let palette = [
+        Color::Cyan,
+        Color::Green,
+        Color::Blue,
+        Color::Yellow,
+        Color::Magenta,
+        Color::Red,
+        Color::White,
+    ];
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0);
+    let mut idx = nanos % palette.len();
+    if palette[idx] == current {
+        idx = (idx + 1) % palette.len();
+    }
+    palette[idx]
 }
 
 /// Parse a color name string into a ratatui Color.
@@ -1078,6 +1196,22 @@ mod tests {
     }
 
     #[test]
+    fn test_slash_session_key() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "sess-123".into(),
+        );
+        app.input = "/session key".into();
+        app.submit_input();
+        assert!(app.messages[0].content.contains("sess-123"));
+        assert!(app.messages[0].content.contains("/tmp/ws"));
+    }
+
+    #[test]
     fn test_slash_agent_list() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -1198,6 +1332,41 @@ mod tests {
         app.cursor_left();
         app.delete_before();
         assert_eq!(app.input, "ac");
+    }
+
+    #[test]
+    fn test_kill_line() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "hello world".into();
+        app.input_cursor = 5;
+        app.kill_line();
+        assert!(app.input.is_empty());
+        assert_eq!(app.input_cursor, 0);
+    }
+
+    #[test]
+    fn test_cycle_agent_updates_agent_without_echo_message() {
+        let cfg = marshaling_protocol::UiConfig {
+            input_accent: "cyan".into(),
+            user_accent: "cyan".into(),
+            agent_names: vec!["plan".into(), "review".into()],
+            subagent_names: vec![],
+            model_info: "test/test-model".into(),
+        };
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        assert_eq!(app.current_agent, "default");
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "plan");
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn test_esc_double_press_cancel_arm() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        assert!(!app.esc_cancel_step());
+        assert!(app.esc_cancel_step());
     }
 
     #[test]

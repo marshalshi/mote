@@ -1,0 +1,64 @@
+[model]
+provider = "deepseek"            # "deepseek" or "ollama"
+model_id = "deepseek-r4-flash"    # model to use by default
+temperature = 0.3              # 0.0 - 1.0
+max_tokens = 65536              # max response tokens (fallback)
+
+# --- Provider: DeepSeek (OpenAI-compatible) ---
+# API key / token for DeepSeek goes in ~/.config/mote/auth.json:
+#   { "deepseek": { "api_key": "sk-..." } }
+[providers.deepseek]
+base_url = "https://api.deepseek.com"     # or "https://api.deepseek.com/v1"
+default_model = "deepseek-v4-flash"       # fallback model for this provider
+default_max_tokens = 65536                 # fallback max_tokens for this provider
+
+# --- Provider: Ollama (local) ---
+[providers.ollama]
+base_url = "http://localhost:11434"
+default_model = "deepseek-r1:8b"
+default_max_tokens = 32000
+
+# --- Provider: GitHub Models ---
+# Token goes in ~/.config/mote/auth.json:
+#   { "github": { "token": "ghp_..." } }
+# Get token via: --login github  (requires MOTE_GITHUB_CLIENT_ID env var)
+[providers.github]
+base_url = "https://models.github.ai/inference"
+default_model = "gpt-4o"
+default_max_tokens = 65536
+
+# --- Server bind ---
+[server]
+port = 9847                    # port to listen on (default: 9847)
+
+# --- UI accent colors ---
+[ui]
+input_accent = "cyan"          # left bar color for the input area
+user_accent = "cyan"           # left bar color for user messages
+# Assistant messages use blank indentation — no accent bar needed.
+# Supported colors: cyan, green, blue, yellow, red, magenta, white
+
+# --- History / session storage ---
+[history]
+dir = "history/"
+
+# --- Prompt files ---
+[prompts]
+default = "prompts/default.txt"
+instructions = ["prompts/instructions/"]
+
+# --- Optional: named agents with custom models/prompts ---
+# [agents.plan]
+# model = "ollama/qwen3.5:9b"
+# model_specific = "prompts/plan.txt"
+# temperature = 0.1
+# max_tokens = 2048
+# permissions = { read = "allow", write = "ask", edit = "ask", delete = "ask", bash = "deny" }
+
+# --- Global permission defaults (applied to all agents unless overridden) ---
+# [permissions]
+# default = "allow"      # "allow" | "ask" | "deny"
+# bash = "ask"           # per-tool default
+# delete = "ask"         # recommended for safety
+
+# --- Keybindings: see keybindings.toml.example ---

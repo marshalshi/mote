@@ -1,0 +1,24 @@
+# Keybinding overrides — optional file.
+# If this file exists, the values here override the defaults.
+# If it doesn't exist, all defaults are used.
+#
+# Format: action_name = "key"  or  action_name = ["key1", "key2"]
+# Keys: enter, esc, tab, space, backspace, delete, left, right, up, down,
+#       home, end, pageup, pagedown, ctrl+c, alt+enter, etc.
+
+# send_message = "enter"
+# insert_newline = "alt+enter"
+# quit = ["esc", "ctrl+c"]
+# cursor_left = "left"
+# cursor_right = "right"
+# cursor_home = "home"
+# cursor_end = "end"
+# delete_before = "backspace"
+# delete_after = "delete"
+# history_up = "up"
+# history_down = "down"
+# scroll_up = ["pageup", "ctrl+up"]
+# scroll_down = ["pagedown", "ctrl+down"]
+# scroll_to_bottom = "ctrl+end"
+# agent_command = "ctrl+p"
+# complete = "tab"

@@ -1,0 +1,27 @@
+// ~/.config/mote/auth.json
+//
+// Store all API keys, tokens, and secrets here.
+// This file uses JSON5 format (supports comments like this).
+//
+// Create this file at: ~/.config/mote/auth.json
+//
+// If auth.json is missing or a provider's key is absent,
+// the server will fall back to config.toml (deprecated)
+// and print a warning about migration.
+
+{
+  // DeepSeek API key (required if using deepseek provider)
+  "deepseek": {
+    "api_key": "sk-..."
+  },
+
+  // GitHub Models / GitHub Copilot token (required if using github provider)
+  // Create a PAT at: GitHub → Settings → Developer settings → Personal access tokens
+  // Scope needed: models:read
+  "github": {
+    "token": "ghp_..."
+  },
+
+  // Ollama (local) — no auth needed, can be empty or omitted
+  "ollama": {}
+}

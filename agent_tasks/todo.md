@@ -24,6 +24,44 @@
 - ✅ Renamed `MarshalingClient` type to `MoteClient` for consistency.
 - ✅ Verified with tests: `cargo test -p mote-server` and `cargo test -p mote-client` (all passing).
 
+### 2026-06-14 execution notes (sessions popup + continuation slice)
+
+- ✅ Replaced legacy `/session ...` command intent in client with popup-first `/sessions` flow.
+- ✅ Added/finished session picker UI handling: open from `/sessions`, navigate with `↑/↓`, `Enter` to load, `Esc` to close.
+- ✅ Wired loaded session messages into chat state and tracked `active_session_id` for continuation.
+- ✅ Updated outgoing chat requests to include selected `session_id` so follow-up turns continue the chosen session.
+- ✅ Server now validates optional `session_id` and reuses it when persisting session history on `Done`.
+- ✅ Session summary generation now follows short word-based style (5–10 word target) instead of 80-char slicing.
+- ✅ Removed now-unused client `delete_session` method to keep warning-free build.
+- ✅ Updated README slash-command table to document `/sessions` picker UX.
+- ✅ Verified with tests:
+  - `cargo test -p mote-client` (77 passed)
+  - `cargo test -p mote-server` (116 passed)
+  - `cargo test -p mote-protocol` (8 passed)
+
+### 2026-06-14 execution notes (sessions review fixes slice)
+
+- ✅ Fixed race/regression risk: `/sessions` open/load is now blocked while a chat stream is active.
+- ✅ Added explicit command feedback when users try to open/load sessions during running state.
+- ✅ Added `App::reset_for_loaded_session()` and applied it during session load to clear transient per-turn UI/runtime state:
+  - stream/reasoning buffers
+  - tool/subagent views
+  - pending permission + cancel state
+  - queued input/suggestions/input cursor
+  - scroll + loading progress + picker state
+- ✅ Hardened server session loading role mapping:
+  - unsupported roles are now skipped (no fallback coercion to `user`).
+- ✅ Improved session picker UX for long lists with windowed rendering around current selection plus `... N more` indicator.
+- ✅ Added tests for new behavior:
+  - `/sessions` blocked while running
+  - loaded-session state reset helper
+  - chat request includes `active_session_id`
+  - server role mapping helper filters non-conversation roles
+  - picker windowing helper bounds/centering
+- ✅ Updated README notes to clarify `/sessions` is idle-only.
+- ✅ Verified with full workspace test run:
+  - `cargo test --workspace` (all passing)
+
 ---
 
 ## Current Baseline

@@ -64,7 +64,80 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     render_status_bar(frame, chunks[3], app);
 
+    if app.session_picker_open {
+        render_session_picker(frame, full_area, app);
+    }
+
     // Permission is handled inline inside render_input_area — no overlay needed
+}
+
+fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let w = area.width.min(90).max(40);
+    let h = area.height.min(20).max(8);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default().title(" Sessions ").borders(ratatui::widgets::Borders::ALL);
+    frame.render_widget(block, rect);
+
+    let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width.saturating_sub(2), rect.height.saturating_sub(2));
+    let mut lines: Vec<Line> = Vec::new();
+    if app.session_picker_items.is_empty() {
+        lines.push(Line::from("No sessions found."));
+    } else {
+        // Each session uses two lines, and we reserve two footer lines.
+        let available_rows = inner.height.saturating_sub(2) as usize;
+        let visible_items = (available_rows / 2).max(1);
+        let total_items = app.session_picker_items.len();
+        let (start, end) = session_picker_window(
+            total_items,
+            app.session_picker_index,
+            visible_items,
+        );
+
+        for (i, s) in app.session_picker_items[start..end].iter().enumerate() {
+            let i = start + i;
+            let marker = if i == app.session_picker_index { ">" } else { " " };
+            let name = s.summary.as_deref().unwrap_or("(no name)");
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} {}", marker, name), Style::default().fg(if i == app.session_picker_index { Color::Yellow } else { Color::White })),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("   {}  {}  {} msgs", s.id, s.model, s.message_count),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if end < total_items {
+            lines.push(Line::from(Span::styled(
+                format!("... {} more", total_items - end),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select • Enter load • Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn session_picker_window(
+    total_items: usize,
+    selected_index: usize,
+    visible_items: usize,
+) -> (usize, usize) {
+    if total_items == 0 {
+        return (0, 0);
+    }
+    let visible = visible_items.max(1).min(total_items);
+    let selected = selected_index.min(total_items - 1);
+    let mut start = selected.saturating_sub(visible / 2);
+    if start + visible > total_items {
+        start = total_items - visible;
+    }
+    (start, start + visible)
 }
 
 // ── Syntax highlighting ──────────────────────────────────
@@ -1350,6 +1423,15 @@ mod tests {
         let (col, row) = cursor_pos_after_wrap("", 0, 80);
         assert_eq!(col, 0);
         assert_eq!(row, 0);
+    }
+
+    #[test]
+    fn test_session_picker_window_centers_and_clamps() {
+        assert_eq!(session_picker_window(0, 0, 4), (0, 0));
+        assert_eq!(session_picker_window(10, 0, 3), (0, 3));
+        assert_eq!(session_picker_window(10, 5, 3), (4, 7));
+        assert_eq!(session_picker_window(10, 9, 3), (7, 10));
+        assert_eq!(session_picker_window(4, 100, 3), (1, 4));
     }
 
     // ── Markdown rendering tests ───────────────────────────

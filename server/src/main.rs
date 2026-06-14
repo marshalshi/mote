@@ -203,13 +203,12 @@ async fn load_session(
         Ok((meta, messages)) => {
             let msgs: Vec<marshaling_protocol::HistoryMessage> = messages
                 .into_iter()
-                .map(|m| marshaling_protocol::HistoryMessage {
-                    role: match m.role {
-                        llm::Role::User => "user".into(),
-                        llm::Role::Assistant => "assistant".into(),
-                        _ => "user".into(),
-                    },
-                    content: m.content,
+                .filter_map(|m| {
+                    let role = protocol_role_for_session(m.role)?;
+                    Some(marshaling_protocol::HistoryMessage {
+                        role: role.into(),
+                        content: m.content,
+                    })
                 })
                 .collect();
             Ok(Json(marshaling_protocol::SessionData {
@@ -669,6 +668,23 @@ fn runtime_session_key_from_headers(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+fn protocol_role_for_session(role: llm::Role) -> Option<&'static str> {
+    match role {
+        llm::Role::User => Some("user"),
+        llm::Role::Assistant => Some("assistant"),
+        _ => None,
+    }
+}
+
+fn apply_selected_session_id(
+    session: &mut session::Session,
+    selected_session_id: Option<&str>,
+) {
+    if let Some(sid) = selected_session_id {
+        session.id = sid.to_string();
+    }
+}
+
 fn history_dir_for_session(
     base_history_dir: &std::path::Path,
     runtime_session_key: &str,
@@ -925,6 +941,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
+    let selected_session_id = if let Some(sid) = request.session_id.clone() {
+        if !validate_session_id(&sid) {
+            send_error(&mut socket, "Invalid session_id").await;
+            return;
+        }
+        Some(sid)
+    } else {
+        None
+    };
+
     // Resolve agent: empty agent → "default" for safety
     let agent_name = if request.agent.is_empty() {
         "default".to_string()
@@ -1051,13 +1077,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 match agent_event {
                     Some(Ok(agent::AgentEvent::Done { content, tokens_input, tokens_output, history })) => {
                         // Save session to disk (in blocking thread)
-                        let session = session::Session::from_chat_history(
+                        let mut session = session::Session::from_chat_history(
                             &eff_model_id_save,
                             &eff_provider,
                             &agent_name,
                             tokens_input,
                             tokens_output,
                             &history,
+                        );
+                        apply_selected_session_id(
+                            &mut session,
+                            selected_session_id.as_deref(),
                         );
                         let hist_dir = history_dir_for_session(
                             &state.config.history.dir,
@@ -1641,5 +1671,28 @@ read = "allow"
 
         let empty = HeaderMap::new();
         assert!(runtime_session_key_from_headers(&empty).is_none());
+    }
+
+    #[test]
+    fn test_protocol_role_for_session_filters_non_conversation_roles() {
+        assert_eq!(protocol_role_for_session(llm::Role::User), Some("user"));
+        assert_eq!(
+            protocol_role_for_session(llm::Role::Assistant),
+            Some("assistant")
+        );
+        assert_eq!(protocol_role_for_session(llm::Role::System), None);
+        assert_eq!(protocol_role_for_session(llm::Role::Tool), None);
+    }
+
+    #[test]
+    fn test_apply_selected_session_id_overrides_when_present() {
+        let mut sess = session::Session::new("p".to_string(), "m".to_string());
+        let original = sess.id.clone();
+        apply_selected_session_id(&mut sess, Some("sess-picked"));
+        assert_eq!(sess.id, "sess-picked");
+
+        apply_selected_session_id(&mut sess, None);
+        assert_eq!(sess.id, "sess-picked");
+        assert_ne!(sess.id, original);
     }
 }

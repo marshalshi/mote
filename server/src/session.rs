@@ -159,18 +159,20 @@ impl Session {
                 }
             }
         }
-        // Generate summary from the first user message
+        // Generate summary from the first user message (5-10 words style)
         let summary = chat_history.iter().find_map(|msg| {
             if matches!(msg.role, crate::llm::Role::User) {
                 msg.content.as_ref().map(|c| {
                     let trimmed: String = c.trim().replace('\n', " ");
-                    if trimmed.chars().count() > 80 {
-                        format!(
-                            "{}...",
-                            trimmed.chars().take(77).collect::<String>()
-                        )
+                    let words: Vec<&str> = trimmed
+                        .split_whitespace()
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    let take_n = 8usize;
+                    if words.len() > take_n {
+                        format!("{}...", words[..take_n].join(" "))
                     } else {
-                        trimmed
+                        words.join(" ")
                     }
                 })
             } else {

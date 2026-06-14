@@ -135,6 +135,14 @@ pub struct App {
 
     /// Session key used by server to scope runtime mutable state.
     pub runtime_session_key: String,
+
+    /// Session picker popup state.
+    pub session_picker_open: bool,
+    pub session_picker_items: Vec<marshaling_protocol::SessionInfo>,
+    pub session_picker_index: usize,
+
+    /// Active session id to continue on next turns.
+    pub active_session_id: Option<String>,
 }
 
 /// Tracks a running subagent's output for the multi-agent TUI.
@@ -164,8 +172,8 @@ pub struct PendingPermission {
 #[derive(Debug, Clone)]
 pub enum SlashAction {
     FetchModels,
-    ListSessions,
-    DeleteSession(String),
+    OpenSessions,
+    LoadSession(String),
     SaveCredential(String, String, String), // provider, key, value
     RollbackLast,
 }
@@ -185,10 +193,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/login", "Login to a provider (github)"),
     ("/agent", "List or switch agents"),
     ("/tokens", "Show token usage"),
-    ("/session list", "List saved sessions"),
-    ("/session key", "Show runtime session key"),
-    ("/session delete", "Delete a session"),
-    ("/session info", "Show session info"),
+    ("/sessions", "Open session picker"),
     ("/model", "Show / switch model"),
     ("/subagents", "List active subagents"),
     ("/rollback", "Rollback last changes"),
@@ -268,6 +273,10 @@ impl App {
             workspace_root,
             repo_agents_md,
             runtime_session_key,
+            session_picker_open: false,
+            session_picker_items: Vec::new(),
+            session_picker_index: 0,
+            active_session_id: None,
         }
     }
 
@@ -405,8 +414,7 @@ impl App {
                         "  /agent <name>     — Switch agent",
                         "  /help             — Show this help",
                         "  /tokens           — Show token usage",
-                        "  /session          — Show session info",
-                        "  /session key      — Show runtime session key",
+                        "  /sessions         — Open session picker",
                         "  /model            — Show / switch model",
                         "  /subagents        — List active subagents",
                         "  /rollback last    — Rollback latest file changes",
@@ -486,55 +494,15 @@ impl App {
                     ));
                 }
             }
-            "/session" => {
-                let sub = parts.get(1).copied().unwrap_or("info");
-                match sub {
-                    "info" => {
-                        self.messages.push(DisplayMessage::command(
-                            Role::Assistant,
-                            format!(
-                                "Agent: {}\nTokens: {} in / {} out",
-                                self.current_agent,
-                                self.tokens_input,
-                                self.tokens_output
-                            ),
-                        ));
-                    }
-                    "list" | "ls" => {
-                        self.messages.push(DisplayMessage::command(
-                            Role::Assistant,
-                            "Fetching sessions...".into(),
-                        ));
-                        self.pending_slash = Some(SlashAction::ListSessions);
-                    }
-                    "delete" | "rm" => {
-                        if let Some(id) = parts.get(2) {
-                            self.messages.push(DisplayMessage::command(
-                                Role::Assistant,
-                                format!("Deleting session {id}..."),
-                            ));
-                            self.pending_slash = Some(
-                                SlashAction::DeleteSession(id.to_string()),
-                            );
-                        } else {
-                            self.messages.push(DisplayMessage::command(
-                                Role::Assistant,
-                                "Usage: /session delete <id>".into(),
-                            ));
-                        }
-                    }
-                    "key" => {
-                        self.messages.push(DisplayMessage::command(
-                            Role::Assistant,
-                            format!(
-                                "Session key: {}\nWorkspace: {}",
-                                self.runtime_session_key, self.workspace_root
-                            ),
-                        ));
-                    }
-                    _ => {
-                        self.messages.push(DisplayMessage::command(Role::Assistant, format!("Unknown subcommand: {sub}. Use: list, key, delete <id>, info").into()));
-                    }
+            "/sessions" => {
+                if self.state == AppState::Idle {
+                    self.pending_slash = Some(SlashAction::OpenSessions);
+                } else {
+                    self.messages.push(DisplayMessage::command(
+                        Role::Assistant,
+                        "Cannot open sessions while agent is running."
+                            .into(),
+                    ));
                 }
             }
             "/models" => {
@@ -931,6 +899,70 @@ impl App {
         self.user_accent = accent;
     }
 
+    pub fn open_session_picker(
+        &mut self,
+        mut items: Vec<marshaling_protocol::SessionInfo>,
+    ) {
+        // Newest sessions first in the popup (top = latest).
+        items.sort_by(|a, b| {
+            b.created
+                .cmp(&a.created)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        self.session_picker_open = true;
+        self.session_picker_items = items;
+        self.session_picker_index = 0;
+    }
+
+    pub fn close_session_picker(&mut self) {
+        self.session_picker_open = false;
+    }
+
+    pub fn session_picker_up(&mut self) {
+        if self.session_picker_items.is_empty() {
+            return;
+        }
+        if self.session_picker_index == 0 {
+            self.session_picker_index = self.session_picker_items.len() - 1;
+        } else {
+            self.session_picker_index -= 1;
+        }
+    }
+
+    pub fn session_picker_down(&mut self) {
+        if self.session_picker_items.is_empty() {
+            return;
+        }
+        self.session_picker_index =
+            (self.session_picker_index + 1) % self.session_picker_items.len();
+    }
+
+    pub fn reset_for_loaded_session(&mut self) {
+        self.state = AppState::Idle;
+        self.messages.clear();
+        self.stream_buffer.clear();
+        self.reasoning_buffer.clear();
+        self.tool_calls.clear();
+        self.loading_progress = None;
+        self.pending_permission = None;
+        self.pending_permission_response = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+        self.current_skill = None;
+        self.subagent_views.clear();
+        self.current_subagent_index = None;
+        self.input_queue.clear();
+        self.input.clear();
+        self.input_cursor = 0;
+        self.suggestions.clear();
+        self.suggestion_index = 0;
+        self.handled_slash_command = false;
+        self.close_session_picker();
+        self.scroll_to_bottom();
+        self.tokens_input = 0;
+        self.tokens_output = 0;
+    }
+
     /// Scroll up: increase offset from bottom to see OLDER content above.
     pub fn scroll_up(&mut self, amount: usize) {
         if self.auto_scroll {
@@ -1196,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_slash_session_key() {
+    fn test_slash_sessions_opens_action() {
         let cfg = test_ui_config();
         let mut app = App::new_with_workspace(
             &cfg,
@@ -1205,10 +1237,116 @@ mod tests {
             None,
             "sess-123".into(),
         );
-        app.input = "/session key".into();
+        app.input = "/sessions".into();
         app.submit_input();
-        assert!(app.messages[0].content.contains("sess-123"));
-        assert!(app.messages[0].content.contains("/tmp/ws"));
+        assert!(matches!(app.pending_slash, Some(SlashAction::OpenSessions)));
+    }
+
+    #[test]
+    fn test_slash_sessions_blocked_while_running() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.state = AppState::AgentRunning;
+        app.input = "/sessions".into();
+        app.submit_input();
+        assert!(app.pending_slash.is_none());
+        assert!(app
+            .messages
+            .last()
+            .is_some_and(|m| m.content.contains("Cannot open sessions")));
+    }
+
+    #[test]
+    fn test_reset_for_loaded_session_clears_transient_state() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.state = AppState::AgentRunning;
+        app.messages.push(DisplayMessage::command(
+            Role::Assistant,
+            "temp".into(),
+        ));
+        app.stream_buffer = "stream".into();
+        app.reasoning_buffer = "thinking".into();
+        app.tool_calls.push(ToolCallDisplay {
+            id: "1".into(),
+            name: "read".into(),
+            status: ToolStatus::Running,
+            changes: Vec::new(),
+        });
+        app.loading_progress = Some(0.5);
+        app.pending_permission = Some(PendingPermission {
+            id: "p1".into(),
+            tool_name: "read".into(),
+            args: "{}".into(),
+            confirming_always: false,
+        });
+        app.pending_permission_response = Some(("p1".into(), true, false));
+        app.pending_cancel = true;
+        app.subagent_views.push(SubagentView {
+            id: "sub1".into(),
+            name: "review".into(),
+            stream_buffer: String::new(),
+            reasoning_buffer: String::new(),
+            tool_calls: Vec::new(),
+            done: false,
+            content: String::new(),
+        });
+        app.current_subagent_index = Some(0);
+        app.input_queue.push_back("queued".into());
+        app.input = "abc".into();
+        app.input_cursor = 3;
+        app.suggestions = vec!["/sessions".into()];
+        app.suggestion_index = 1;
+        app.session_picker_open = true;
+        app.tokens_input = 12;
+        app.tokens_output = 34;
+
+        app.reset_for_loaded_session();
+
+        assert_eq!(app.state, AppState::Idle);
+        assert!(app.messages.is_empty());
+        assert!(app.stream_buffer.is_empty());
+        assert!(app.reasoning_buffer.is_empty());
+        assert!(app.tool_calls.is_empty());
+        assert!(app.loading_progress.is_none());
+        assert!(app.pending_permission.is_none());
+        assert!(app.pending_permission_response.is_none());
+        assert!(!app.pending_cancel);
+        assert!(app.subagent_views.is_empty());
+        assert!(app.current_subagent_index.is_none());
+        assert!(app.input_queue.is_empty());
+        assert!(app.input.is_empty());
+        assert_eq!(app.input_cursor, 0);
+        assert!(app.suggestions.is_empty());
+        assert_eq!(app.suggestion_index, 0);
+        assert!(!app.session_picker_open);
+        assert_eq!(app.tokens_input, 0);
+        assert_eq!(app.tokens_output, 0);
+    }
+
+    #[test]
+    fn test_open_session_picker_sorts_newest_first() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.open_session_picker(vec![
+            marshaling_protocol::SessionInfo {
+                id: "old".into(),
+                created: "2026-06-10T10:00:00Z".into(),
+                model: "p/m".into(),
+                message_count: 1,
+                summary: None,
+            },
+            marshaling_protocol::SessionInfo {
+                id: "new".into(),
+                created: "2026-06-11T10:00:00Z".into(),
+                model: "p/m".into(),
+                message_count: 2,
+                summary: None,
+            },
+        ]);
+
+        assert_eq!(app.session_picker_items[0].id, "new");
+        assert_eq!(app.session_picker_items[1].id, "old");
     }
 
     #[test]

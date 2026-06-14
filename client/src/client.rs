@@ -86,25 +86,6 @@ impl MoteClient {
         Ok(resp.json().await?)
     }
 
-    /// Delete a saved session by ID.
-    pub async fn delete_session(
-        &self,
-        runtime_session_key: &str,
-        id: &str,
-    ) -> Result<()> {
-        let resp = self
-            .http
-            .delete(format!("{}/sessions/{id}", self.base_url))
-            .header("x-mote-session-key", runtime_session_key)
-            .send()
-            .await?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            anyhow::bail!("Server returned {}", resp.status());
-        }
-    }
-
     /// Load a saved session by ID.
     pub async fn load_session(
         &self,

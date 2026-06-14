@@ -119,52 +119,68 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                         source: self::state::MessageSource::Command,
                     });
                 }
-                SlashAction::ListSessions => {
-                    let result = match client
-                        .list_sessions(&app.runtime_session_key)
-                        .await
-                    {
-                        Ok(sessions) => {
-                            if sessions.is_empty() {
-                                "No sessions found.".into()
-                            } else {
-                                let mut lines = vec!["Sessions:".to_string()];
-                                for s in &sessions {
-                                    let summary = s
-                                        .summary
-                                        .as_deref()
-                                        .unwrap_or("(no summary)");
-                                    lines.push(format!(
-                                        "  {}  {}  {}msgs  {}",
-                                        s.id, s.model, s.message_count, summary
-                                    ));
-                                }
-                                lines.join("\n")
+                SlashAction::OpenSessions => {
+                    if chat_stream.is_some() || app.state != AppState::Idle {
+                        app.messages.push(self::state::DisplayMessage::command(
+                            crate::llm::Role::Assistant,
+                            "Cannot open sessions while agent is running."
+                                .into(),
+                        ));
+                    } else {
+                        match client.list_sessions(&app.runtime_session_key).await {
+                            Ok(sessions) => app.open_session_picker(sessions),
+                            Err(e) => {
+                                app.messages.push(self::state::DisplayMessage {
+                                    role: crate::llm::Role::Assistant,
+                                    content: format!("Error: {e}"),
+                                    thinking: None,
+                                    source: self::state::MessageSource::Error,
+                                })
                             }
                         }
-                        Err(e) => format!("Error: {e}"),
-                    };
-                    app.messages.push(self::state::DisplayMessage {
-                        role: crate::llm::Role::Assistant,
-                        content: result,
-                        thinking: None,
-                        source: self::state::MessageSource::Command,
-                    });
+                    }
                 }
-                SlashAction::DeleteSession(id) => {
-                    let result = match client
-                        .delete_session(&app.runtime_session_key, &id)
-                        .await
-                    {
-                        Ok(_) => format!("Session {id} deleted."),
-                        Err(e) => format!("Failed to delete session {id}: {e}"),
-                    };
-                    app.messages.push(self::state::DisplayMessage {
-                        role: crate::llm::Role::Assistant,
-                        content: result,
-                        thinking: None,
-                        source: self::state::MessageSource::Command,
-                    });
+                SlashAction::LoadSession(id) => {
+                    if chat_stream.is_some() || app.state != AppState::Idle {
+                        app.messages.push(self::state::DisplayMessage::command(
+                            crate::llm::Role::Assistant,
+                            "Cannot load a session while agent is running."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    let result =
+                        client.load_session(&app.runtime_session_key, &id).await;
+                    match result {
+                        Ok(session) => {
+                            app.reset_for_loaded_session();
+                            for hm in &session.messages {
+                                let role = match hm.role.as_str() {
+                                    "user" => crate::llm::Role::User,
+                                    "assistant" => crate::llm::Role::Assistant,
+                                    _ => continue,
+                                };
+                                app.messages.push(self::state::DisplayMessage {
+                                    role,
+                                    content: hm.content.clone(),
+                                    thinking: None,
+                                    source: self::state::MessageSource::Conversation,
+                                });
+                            }
+                            app.active_session_id = Some(id.clone());
+                            app.scroll_to_bottom();
+                            app.messages.push(self::state::DisplayMessage::command(
+                                crate::llm::Role::Assistant,
+                                format!("Resumed session: {id}"),
+                            ));
+                        }
+                        Err(e) => app.messages.push(self::state::DisplayMessage {
+                            role: crate::llm::Role::Assistant,
+                            content: format!("Failed to load session {id}: {e}"),
+                            thinking: None,
+                            source: self::state::MessageSource::Error,
+                        }),
+                    }
                 }
                 SlashAction::SaveCredential(provider, key, value) => {
                     let result = match client
@@ -276,32 +292,7 @@ async fn start_chat(
 
     app.start_agent();
 
-    // Build conversation history from prior display messages (excluding the latest user message).
-    // Only include Conversation-sourced messages — skip command outputs and errors.
-    let history: Vec<marshaling_protocol::HistoryMessage> = app.messages
-        [..app.messages.len().saturating_sub(1)]
-        .iter()
-        .filter(|m| m.source == self::state::MessageSource::Conversation)
-        .map(|m| marshaling_protocol::HistoryMessage {
-            role: match m.role {
-                crate::llm::Role::User => "user".into(),
-                crate::llm::Role::Assistant => "assistant".into(),
-            },
-            content: m.content.clone(),
-        })
-        .collect();
-
-    let request = marshaling_protocol::ChatRequest {
-        message: user_msg,
-        agent: app.current_agent.clone(),
-        model_override: app.model_override.clone(),
-        provider_override: app.provider_override.clone(),
-        session_id: None,
-        history,
-        workspace_root: Some(app.workspace_root.clone()),
-        repo_agents_md: app.repo_agents_md.clone(),
-        runtime_session_key: Some(app.runtime_session_key.clone()),
-    };
+    let request = build_chat_request(app, user_msg.clone());
 
     match client.chat_stream(request.clone()).await {
         Ok(stream) => {
@@ -323,6 +314,38 @@ async fn start_chat(
                 }
             }
         }
+    }
+}
+
+fn build_chat_request(
+    app: &App,
+    user_msg: String,
+) -> marshaling_protocol::ChatRequest {
+    // Build conversation history from prior display messages (excluding the latest user message).
+    // Only include Conversation-sourced messages — skip command outputs and errors.
+    let history: Vec<marshaling_protocol::HistoryMessage> = app.messages
+        [..app.messages.len().saturating_sub(1)]
+        .iter()
+        .filter(|m| m.source == self::state::MessageSource::Conversation)
+        .map(|m| marshaling_protocol::HistoryMessage {
+            role: match m.role {
+                crate::llm::Role::User => "user".into(),
+                crate::llm::Role::Assistant => "assistant".into(),
+            },
+            content: m.content.clone(),
+        })
+        .collect();
+
+    marshaling_protocol::ChatRequest {
+        message: user_msg,
+        agent: app.current_agent.clone(),
+        model_override: app.model_override.clone(),
+        provider_override: app.provider_override.clone(),
+        session_id: app.active_session_id.clone(),
+        history,
+        workspace_root: Some(app.workspace_root.clone()),
+        repo_agents_md: app.repo_agents_md.clone(),
+        runtime_session_key: Some(app.runtime_session_key.clone()),
     }
 }
 
@@ -557,6 +580,30 @@ fn handle_key_event(
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if app.session_picker_open {
+                match key.code {
+                    crossterm::event::KeyCode::Up => app.session_picker_up(),
+                    crossterm::event::KeyCode::Down => {
+                        app.session_picker_down()
+                    }
+                    crossterm::event::KeyCode::Esc => {
+                        app.close_session_picker();
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        if let Some(s) = app
+                            .session_picker_items
+                            .get(app.session_picker_index)
+                            .cloned()
+                        {
+                            app.pending_slash =
+                                Some(SlashAction::LoadSession(s.id));
+                        }
+                        app.close_session_picker();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             let action = keys.lookup(key.code, key.modifiers);
             handle_action(app, action, key.code, key.modifiers);
         }
@@ -866,5 +913,43 @@ async fn fetch_and_display_models(client: &MoteClient) -> String {
             }
         }
         Err(e) => format!("Error fetching models: {}\n", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ui_config() -> marshaling_protocol::UiConfig {
+        marshaling_protocol::UiConfig {
+            input_accent: "cyan".into(),
+            user_accent: "cyan".into(),
+            model_info: "deepseek/deepseek-chat".into(),
+            agent_names: vec!["review".into()],
+            subagent_names: vec![],
+        }
+    }
+
+    #[test]
+    fn test_build_chat_request_includes_active_session_id() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "hello".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+        app.active_session_id = Some("sess-abc".into());
+
+        let req = build_chat_request(&app, "hello".into());
+        assert_eq!(req.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(req.runtime_session_key.as_deref(), Some("runtime-key"));
     }
 }

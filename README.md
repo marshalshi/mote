@@ -101,14 +101,14 @@ agent_command = "ctrl+space"
 | `/agent` | List / switch agents |
 | `/model` | Show / switch model |
 | `/tokens` | Show token usage |
-| `/session list` | List saved sessions |
-| `/session key` | Show current runtime session key |
-| `/session delete <id>` | Delete a session |
-| `/session info` | Show current session info |
+| `/sessions` | Open session picker (↑/↓, Enter, Esc) |
 | `/login github` | GitHub OAuth device flow |
 | `/login deepseek <key>` | Save DeepSeek API key |
 | `/subagents` | List active subagents |
 | `/rollback last` | Roll back latest tracked file changes |
+
+Notes:
+- `/sessions` is available only when the app is idle (not during an active streaming turn).
 
 ### Agents
 

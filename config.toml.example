@@ -60,8 +60,13 @@ instructions = ["prompts/instructions/"]
 
 # --- Global permission defaults (applied to all agents unless overridden) ---
 # [permissions]
-# default = "allow"      # "allow" | "ask" | "deny"
-# bash = "ask"           # per-tool default
-# delete = "ask"         # recommended for safety
+# default = "ask"        # "allow" | "ask" | "deny"; omitted config defaults to "ask"
+# read = "allow"         # recommended read-only tools
+# glob = "allow"
+# grep = "allow"
+# write = "ask"          # mutating tools should usually ask
+# edit = "ask"
+# delete = "ask"
+# bash = "ask"           # or "deny" for stricter workspaces
 
 # --- Keybindings: see keybindings.toml.example ---

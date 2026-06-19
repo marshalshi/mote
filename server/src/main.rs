@@ -1041,9 +1041,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Finalize options with augmented tool definitions
+    // Finalize options. `agent::run_loop` derives the advertised tool list from
+    // the effective permissions so denied tools stay invisible to the model.
     let mut opts = ctx.opts;
-    opts.tools = augmented_tools.iter().map(|t| t.def()).collect();
+    opts.tools = Vec::new();
 
     let eff_model_id_save = ctx.eff_model_id.clone();
     let eff_provider = ctx.eff_provider;
@@ -1321,8 +1322,8 @@ async fn apply_rollback_last(
                 changes: Vec::new(),
             };
         };
-        match session.rollback_journal.pop() {
-            Some(v) => v,
+        match session.rollback_journal.last() {
+            Some(v) => v.clone(),
             None => {
                 return marshaling_protocol::RollbackResultPayload {
                     success: false,
@@ -1472,6 +1473,13 @@ async fn apply_rollback_last(
         }
     }
 
+    {
+        let mut sessions = state.runtime_states.lock().await;
+        if let Some(session) = sessions.get_mut(runtime_session_key) {
+            session.rollback_journal.pop();
+        }
+    }
+
     marshaling_protocol::RollbackResultPayload {
         success: true,
         message: format!("Rolled back {} ({})", cs.id, cs.tool_name),
@@ -1610,6 +1618,22 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_config(history_dir: std::path::PathBuf) -> config::Config {
+        let mut cfg: config::Config = toml::from_str(
+            r#"
+[model]
+provider = "ollama"
+model_id = "m"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+"#,
+        )
+        .unwrap();
+        cfg.history.dir = history_dir;
+        cfg
+    }
+
     #[test]
     fn test_validate_session_id_allows_valid() {
         assert!(validate_session_id("chat-20260526-184530123456"));
@@ -1694,5 +1718,44 @@ read = "allow"
         apply_selected_session_id(&mut sess, None);
         assert_eq!(sess.id, "sess-picked");
         assert_ne!(sess.id, original);
+    }
+
+    #[tokio::test]
+    async fn test_rollback_conflict_preserves_journal_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("edited.txt");
+        tokio::fs::write(&file_path, "changed by user")
+            .await
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            config: test_config(dir.path().join("history")),
+            auth: RwLock::new(auth::Auth::default()),
+            merged_agents: HashMap::new(),
+            device_flows: tokio::sync::Mutex::new(HashMap::new()),
+            runtime_states: tokio::sync::Mutex::new(HashMap::from([(
+                "sess".to_string(),
+                RuntimeSessionState {
+                    rollback_journal: vec![RollbackChangeSet {
+                        id: "tool_1".into(),
+                        tool_name: "edit".into(),
+                        entries: vec![llm::RollbackEntry {
+                            path: file_path,
+                            kind: llm::RollbackKind::Modified,
+                            before_content: Some("before".into()),
+                            expected_after_hash: Some(hash64("after")),
+                        }],
+                        display_changes: Vec::new(),
+                    }],
+                    remember_allow_tools: HashSet::new(),
+                },
+            )])),
+        });
+
+        let result = apply_rollback_last(&state, "sess").await;
+
+        assert!(!result.success);
+        let sessions = state.runtime_states.lock().await;
+        assert_eq!(sessions["sess"].rollback_journal.len(), 1);
     }
 }

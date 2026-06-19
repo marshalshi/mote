@@ -123,8 +123,12 @@ instructions = "You are a planning agent."
 
 [permissions]
 read = "allow"
-write = "allow"
+glob = "allow"
+grep = "allow"
+write = "ask"
 edit = "ask"
+delete = "ask"
+bash = "deny"
 ```
 
 Agent modes control visibility:
@@ -156,17 +160,17 @@ Skills are injected into the system prompt. Use the `use_skill` tool to activate
 
 ### Permission system
 
-Each agent has per-tool permissions in its agent TOML:
+Global permissions live in `config.toml` and default to `ask` when omitted. Each agent can override per-tool permissions in its agent TOML:
 
 | Level | Behavior |
 |-------|----------|
 | `allow` | Tool runs automatically |
 | `ask` | TUI prompts for Y/N approval |
-| `deny` | Tool is blocked |
+| `deny` | Tool is blocked and hidden from the model |
 
-Tools: `read`, `glob`, `grep`, `write`, `edit`, `bash`, `subagent`. `use_skill` is always allowed.
+Tools: `read`, `glob`, `grep`, `write`, `edit`, `delete`, `bash`, `subagent`. `use_skill` is always allowed.
 
-`delete` is available as a built-in file tool (file-only in v1) and should usually be configured as `ask`.
+Recommended baseline: allow read-only tools (`read`, `glob`, `grep`), ask for file mutations (`write`, `edit`, `delete`), and keep `bash` as `ask` or `deny` unless you trust the workspace.
 
 Permission prompts support three choices:
 - `[Y] Allow Once`
@@ -186,7 +190,7 @@ Roll back the latest tracked change-set with:
 /rollback last
 ```
 
-Rollback is conflict-safe: if files changed since the original mutation, rollback is blocked with an explanatory message.
+Rollback is conflict-safe: if files changed since the original mutation, rollback is blocked with an explanatory message and the rollback entry is preserved so you can retry after resolving the conflict.
 
 Rollback scope is session-local in multi-client mode: each client can only roll back its own tracked change journal.
 

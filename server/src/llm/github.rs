@@ -49,6 +49,21 @@ impl GitHubModelsProvider {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_event_separator_supports_lf_and_crlf() {
+        assert_eq!(find_event_separator(b"data: one\n\nrest"), Some((9, 2)));
+        assert_eq!(
+            find_event_separator(b"data: one\r\n\r\nrest"),
+            Some((9, 4))
+        );
+        assert_eq!(find_event_separator(b"data: one"), None);
+    }
+}
+
 // ── Streaming chunk types (OpenAI-compatible) ───────────
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -143,6 +158,21 @@ struct PendingToolCall {
     arguments: String,
 }
 
+fn request_item_count(body: &serde_json::Value, key: &str) -> usize {
+    body.get(key).and_then(|v| v.as_array()).map_or(0, Vec::len)
+}
+
+fn find_event_separator(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n");
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(l), Some(c)) if c < l => Some((c, 4)),
+        (Some(l), _) => Some((l, 2)),
+        (None, Some(c)) => Some((c, 4)),
+        (None, None) => None,
+    }
+}
+
 // ── Trait impl ──────────────────────────────────────────
 
 #[async_trait]
@@ -154,12 +184,11 @@ impl LlmProvider for GitHubModelsProvider {
     ) -> Result<ChatResult> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = self.build_request(messages, options, false);
-        if let Ok(json) = serde_json::to_string_pretty(&body) {
-            tracing::debug!(
-                "─── GH REQUEST ──────────────────────────\n{}\n────────────────────────────────────",
-                json
-            );
-        }
+        tracing::debug!(
+            "GitHub Models request prepared: messages={}, tools={}, stream=false",
+            request_item_count(&body, "messages"),
+            request_item_count(&body, "tools")
+        );
 
         let response = self
             .client
@@ -183,12 +212,10 @@ impl LlmProvider for GitHubModelsProvider {
         }
 
         let completion: CompletionResponse = response.json().await?;
-        if let Ok(json) = serde_json::to_string_pretty(&completion) {
-            tracing::debug!(
-                "─── GH RESPONSE ─────────────────────────\n{}\n────────────────────────────────────",
-                json
-            );
-        }
+        tracing::debug!(
+            "GitHub Models response received: choices={}",
+            completion.choices.len()
+        );
         let choice = completion
             .choices
             .into_iter()
@@ -234,12 +261,11 @@ impl LlmProvider for GitHubModelsProvider {
     ) {
         let url = format!("{}/chat/completions", self.base_url);
         let body = self.build_request(messages, options, true);
-        if let Ok(json) = serde_json::to_string_pretty(&body) {
-            tracing::debug!(
-                "─── GH STREAM REQUEST ───────────────────\n{}\n────────────────────────────────────",
-                json
-            );
-        }
+        tracing::debug!(
+            "GitHub Models stream request prepared: messages={}, tools={}",
+            request_item_count(&body, "messages"),
+            request_item_count(&body, "tools")
+        );
 
         let response = match self
             .client
@@ -277,10 +303,6 @@ impl LlmProvider for GitHubModelsProvider {
         let mut tool_call_acc: HashMap<usize, PendingToolCall> = HashMap::new();
         let mut usage = Usage::default();
 
-        fn find_double_newline(buf: &[u8]) -> Option<usize> {
-            buf.windows(2).position(|w| w == b"\n\n")
-        }
-
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
@@ -292,9 +314,9 @@ impl LlmProvider for GitHubModelsProvider {
             };
             buf.extend_from_slice(&chunk);
 
-            while let Some(event_end) = find_double_newline(&buf) {
+            while let Some((event_end, sep_len)) = find_event_separator(&buf) {
                 let event_bytes: Vec<u8> = buf.drain(..event_end).collect();
-                buf.drain(..2);
+                buf.drain(..sep_len);
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
                     Err(_) => continue,

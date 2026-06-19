@@ -62,6 +62,26 @@
 - ✅ Verified with full workspace test run:
   - `cargo test --workspace` (all passing)
 
+### 2026-06-18 execution notes (post-review hardening slice)
+
+- 🚧 Implementing non-auth review fixes while explicitly deferring localhost/API authentication work per user request.
+- ✅ Changed omitted global tool permission default from `allow` to `ask`.
+- ✅ Hid denied tools from primary/subagent model tool advertisements at `run_loop` time.
+- ✅ Preserved final no-tool assistant responses in saved session history.
+- ✅ Skipped internal assistant tool-call placeholders and tool result messages when persisting user-visible sessions.
+- ✅ Made rollback journal entries pop only after rollback succeeds, preserving entries on conflict/failure.
+- ✅ Added CRLF-aware SSE event separator parsing for DeepSeek and GitHub model streams.
+- ✅ Reduced verbose LLM request/response logs to metadata summaries to avoid logging prompt/body content.
+- ✅ Updated README/config example to document safer permissions and rollback retry behavior.
+- ✅ Added targeted tests for final-answer persistence, denied tool advertisement, session placeholder filtering, rollback conflict preservation, safer default permissions, and SSE CRLF separators.
+- ✅ Verified:
+  - `cargo fmt -p mote-server --check`
+  - `cargo test -p mote-server` (125 passed)
+  - `cargo test --workspace` (215 passed)
+- ⚠️ `cargo fmt --check` for the whole workspace still reports pre-existing client formatting diffs unrelated to this slice; only the server crate was formatted to avoid unrelated churn.
+- ✅ Follow-up review result: no blocking regressions found in the non-auth changes.
+- ⚠️ Follow-up caveats: rollback is still not fully transactional on mid-apply failure; provider error bodies can still include upstream response text; additional future tests could cover successful rollback pop/apply-failure preservation/subagent integration/SSE split chunks.
+
 ---
 
 ## Current Baseline

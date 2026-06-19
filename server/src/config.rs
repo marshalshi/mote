@@ -263,7 +263,7 @@ impl AgentConfig {
 /// Global permission defaults (applied to all agents unless overridden).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalPermissionConfig {
-    /// Default permission for all tools: Allow (default), Ask, or Deny.
+    /// Default permission for all tools: Allow, Ask (default), or Deny.
     #[serde(default = "default_global_perm")]
     pub default: Permission,
     /// Per-tool defaults: tool_name → Permission
@@ -272,13 +272,13 @@ pub struct GlobalPermissionConfig {
 }
 
 fn default_global_perm() -> Permission {
-    Permission::Allow
+    Permission::Ask
 }
 
 impl Default for GlobalPermissionConfig {
     fn default() -> Self {
         Self {
-            default: Permission::Allow,
+            default: Permission::Ask,
             tools: HashMap::new(),
         }
     }
@@ -793,6 +793,26 @@ permissions = { bash = "allow" }
         assert_eq!(
             config.resolve_permission("nonexistent", "write"),
             Permission::Deny
+        );
+    }
+
+    #[test]
+    fn test_permissions_default_to_ask_when_omitted() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "ollama"
+model_id = "x"
+[providers.ollama]
+base_url = "http://localhost:11434"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.permissions.default, Permission::Ask);
+        assert_eq!(
+            config.resolve_permission("missing-agent", "bash"),
+            Permission::Ask
         );
     }
 

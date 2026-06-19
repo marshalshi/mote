@@ -138,22 +138,17 @@ impl Session {
                         Some(Role::User)
                     }
                 }
-                ChatRole::Assistant => Some(Role::Assistant),
-                _ => None, // skip System messages
+                ChatRole::Assistant => {
+                    if msg.content.is_some() {
+                        Some(Role::Assistant)
+                    } else {
+                        None
+                    }
+                }
+                _ => None, // skip System/tool messages and internal tool-call placeholders
             };
             if let Some(role) = role {
-                let content = if let Some(ref text) = msg.content {
-                    text.clone()
-                } else if let Some(ref calls) = msg.tool_calls {
-                    // Serialize tool calls as a placeholder so the conversation is not empty
-                    let names: Vec<&str> = calls
-                        .iter()
-                        .map(|c| c.function.name.as_str())
-                        .collect();
-                    format!("[Tool calls: {}]", names.join(", "))
-                } else {
-                    String::new()
-                };
+                let content = msg.content.clone().unwrap_or_default();
                 if !content.is_empty() {
                     messages.push(Message::new(role, content));
                 }
@@ -278,5 +273,31 @@ mod tests {
         assert_eq!(s.id, "chat-test");
         assert_eq!(s.tokens_input, 100);
         assert_eq!(s.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_from_chat_history_skips_internal_tool_calls_and_results() {
+        let tool_call = crate::llm::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let history = vec![
+            ChatMessage::user("please read"),
+            ChatMessage::assistant_tool_calls(vec![tool_call]),
+            ChatMessage::tool_result("call_1", "file contents"),
+            ChatMessage::assistant_text("done"),
+        ];
+
+        let session = Session::from_chat_history(
+            "model", "provider", "default", 1, 2, &history,
+        );
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "please read");
+        assert_eq!(session.messages[1].content, "done");
     }
 }

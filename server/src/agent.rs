@@ -25,6 +25,23 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn advertised_tool_defs(
+    tools: &[Box<dyn Tool>],
+    permissions: &std::collections::HashMap<String, crate::config::Permission>,
+) -> Vec<ToolDef> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let def = tool.def();
+            let perm = permissions
+                .get(&def.function.name)
+                .copied()
+                .unwrap_or(crate::config::Permission::Ask);
+            (perm != crate::config::Permission::Deny).then_some(def)
+        })
+        .collect()
+}
+
 /// Events emitted by the agent loop to the TUI.
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -190,7 +207,7 @@ pub async fn run_loop(
         // Build and inject the dynamic system reminder (Layer 7)
         let last_user_msg = extract_last_user_message(&history);
         let last_turn_results = extract_last_turn_results(&history);
-        let tool_defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
+        let tool_defs = advertised_tool_defs(&tools, &permissions);
 
         let reminder_ctx = crate::prompt::ReminderContext {
             step: _step + 1,
@@ -207,14 +224,14 @@ pub async fn run_loop(
 
         // Build tool definitions for the API
         let mut opts = options.clone();
-        opts.tools = tools.iter().map(|t| t.def()).collect();
+        opts.tools = tool_defs;
 
         // Create channel for stream events
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Clone the Arc for the spawned task
         let prov = Arc::clone(&provider);
-        tokio::spawn(async move {
+        let stream_handle = tokio::spawn(async move {
             prov.chat_stream(&messages, &opts, stream_tx).await;
         });
 
@@ -224,6 +241,7 @@ pub async fn run_loop(
 
         while let Some(event) = stream_rx.recv().await {
             if *cancel_rx.borrow() {
+                stream_handle.abort();
                 let _ = events_tx.send(Ok(AgentEvent::Done {
                     content: "(cancelled)".into(),
                     tokens_input: total_input,
@@ -272,8 +290,10 @@ pub async fn run_loop(
         // Check for tool calls
         if result.tool_calls.is_empty() {
             // No tools — agent is done
+            let content = result.content.unwrap_or_default();
+            history.push(ChatMessage::assistant_text(content.clone()));
             let _ = events_tx.send(Ok(AgentEvent::Done {
-                content: result.content.unwrap_or_default(),
+                content,
                 tokens_input: total_input,
                 tokens_output: total_output,
                 history,
@@ -388,7 +408,7 @@ pub async fn run_loop(
             let perm = permissions
                 .get(&tc.function.name)
                 .copied()
-                .unwrap_or(crate::config::Permission::Allow);
+                .unwrap_or(crate::config::Permission::Ask);
             match perm {
                 crate::config::Permission::Allow => {} // proceed to execute
                 crate::config::Permission::Deny => {
@@ -593,6 +613,8 @@ fn extract_last_user_message(history: &[ChatMessage]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
 
     fn make_user(text: &str) -> ChatMessage {
         ChatMessage::user(text)
@@ -619,6 +641,76 @@ mod tests {
 
     fn make_tool_result(tool_call_id: &str, content: &str) -> ChatMessage {
         ChatMessage::tool_result(tool_call_id, content)
+    }
+
+    struct MockProvider {
+        seen_tools: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+        ) -> Result<ChatResult> {
+            unreachable!("run_loop uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            options: &ChatOptions,
+            sender: tokio::sync::mpsc::UnboundedSender<Result<StreamEvent>>,
+        ) {
+            let names: Vec<String> = options
+                .tools
+                .iter()
+                .map(|t| t.function.name.clone())
+                .collect();
+            self.seen_tools.lock().unwrap().extend(names);
+            let _ = sender.send(Ok(StreamEvent::Done(ChatResult {
+                content: Some("final answer".into()),
+                tool_calls: Vec::new(),
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                    total_tokens: 3,
+                },
+                reasoning_content: None,
+            })));
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: self.0.into(),
+                    description: "test tool".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            Ok(ToolExecutionResult {
+                output: "ok".into(),
+                changes: Vec::new(),
+                rollback_entries: Vec::new(),
+            })
+        }
     }
 
     #[test]
@@ -649,6 +741,69 @@ mod tests {
     fn test_extract_last_turn_results_empty_when_no_tools() {
         let history = vec![make_user("hi"), make_assistant("hello")];
         assert!(extract_last_turn_results(&history).is_empty());
+    }
+
+    #[test]
+    fn test_advertised_tool_defs_excludes_denied_tools() {
+        let tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(NamedTool("read")), Box::new(NamedTool("bash"))];
+        let permissions = std::collections::HashMap::from([
+            ("read".to_string(), crate::config::Permission::Allow),
+            ("bash".to_string(), crate::config::Permission::Deny),
+        ]);
+
+        let advertised = advertised_tool_defs(&tools, &permissions);
+
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(advertised[0].function.name, "read");
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_persists_final_assistant_message() {
+        let seen_tools = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            seen_tools: Arc::clone(&seen_tools),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(NamedTool("read")),
+            Box::new(NamedTool("bash")),
+        ]);
+        let permissions = std::collections::HashMap::from([
+            ("read".to_string(), crate::config::Permission::Allow),
+            ("bash".to_string(), crate::config::Permission::Deny),
+        ]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "hello".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            1,
+            "/tmp".into(),
+        )
+        .await;
+
+        let mut done_history = None;
+        while let Some(event) = events_rx.recv().await {
+            if let AgentEvent::Done { history, .. } = event.unwrap() {
+                done_history = Some(history);
+                break;
+            }
+        }
+        let history = done_history.expect("Done event should be emitted");
+        assert!(matches!(history[0].role, Role::User));
+        assert!(matches!(history[1].role, Role::Assistant));
+        assert_eq!(history[1].content.as_deref(), Some("final answer"));
+        assert_eq!(seen_tools.lock().unwrap().as_slice(), ["read"]);
     }
 
     #[test]

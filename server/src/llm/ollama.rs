@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Global counter for generating unique Ollama tool call IDs.
 static OLLAMA_CALL_ID: AtomicU64 = AtomicU64::new(0);
 
+fn request_item_count(body: &serde_json::Value, key: &str) -> usize {
+    body.get(key).and_then(|v| v.as_array()).map_or(0, Vec::len)
+}
+
 #[derive(Clone)]
 pub struct OllamaProvider {
     base_url: String,
@@ -106,12 +110,11 @@ impl LlmProvider for OllamaProvider {
     ) -> Result<ChatResult> {
         let url = format!("{}/api/chat", self.base_url);
         let body = self.build_request(messages, options, false);
-        if let Ok(json) = serde_json::to_string_pretty(&body) {
-            tracing::debug!(
-                "─── OLLAMA REQUEST ────────────────────\n{}\n────────────────────────────────────",
-                json
-            );
-        }
+        tracing::debug!(
+            "Ollama request prepared: messages={}, tools={}, stream=false",
+            request_item_count(&body, "messages"),
+            request_item_count(&body, "tools")
+        );
 
         let response = self
             .client
@@ -133,12 +136,11 @@ impl LlmProvider for OllamaProvider {
         }
 
         let completion: OllamaChatResponse = response.json().await?;
-        if let Ok(json) = serde_json::to_string_pretty(&completion) {
-            tracing::debug!(
-                "─── OLLAMA RESPONSE ───────────────────\n{}\n────────────────────────────────────",
-                json
-            );
-        }
+        tracing::debug!(
+            "Ollama response received: has_content={}, tool_calls={}",
+            completion.message.content.is_some(),
+            completion.message.tool_calls.as_ref().map_or(0, Vec::len)
+        );
         tracing::debug!(
             "← complete ({} in / {} out)",
             completion.prompt_eval_count.unwrap_or(0),
@@ -186,12 +188,11 @@ impl LlmProvider for OllamaProvider {
     ) {
         let url = format!("{}/api/chat", self.base_url);
         let body = self.build_request(messages, options, true);
-        if let Ok(json) = serde_json::to_string_pretty(&body) {
-            tracing::debug!(
-                "─── OLLAMA STREAM REQUEST ─────────────\n{}\n────────────────────────────────────",
-                json
-            );
-        }
+        tracing::debug!(
+            "Ollama stream request prepared: messages={}, tools={}",
+            request_item_count(&body, "messages"),
+            request_item_count(&body, "tools")
+        );
 
         let response = match self
             .client
@@ -313,12 +314,11 @@ impl LlmProvider for OllamaProvider {
         }
 
         let result = finalize_ollama(&mut text_content, &mut tool_calls, usage);
-        if let Ok(json) = serde_json::to_string_pretty(&result) {
-            tracing::debug!(
-                "─── OLLAMA STREAM RESULT ──────────────\n{}\n────────────────────────────────────",
-                json
-            );
-        }
+        tracing::debug!(
+            "Ollama stream result finalized: content_len={}, tool_calls={}",
+            result.content.as_ref().map_or(0, String::len),
+            result.tool_calls.len()
+        );
         let _ = sender.send(Ok(StreamEvent::Done(result)));
     }
 

@@ -1,15 +1,23 @@
 # Mote
 
-A Rust AI coding assistant — split-server architecture with a TUI client.
+A Rust AI coding assistant with a local server and a terminal UI.
+
+## Highlights
+
+- Default `cargo run` starts the client and a local server together.
+- Works with local Ollama models or remote providers like DeepSeek and GitHub Models.
+- Supports agents, subagents, skills, session history, and rollback.
+- Each agent gets a stable, distinct terminal color within the current app session.
+- Keeps the terminal workflow lightweight and keyboard-driven.
 
 ## Quick start
 
-### Prerequisites
+### Requirements
 - Rust 1.75+
-- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) — used by the built-in `grep` tool
+- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) — preferred by the built-in `grep` tool when available; otherwise falls back to `grep`
 - [Ollama](https://ollama.com) with a model, or a DeepSeek API key
 
-### Configuration
+### First run
 
 Config files live in `~/.config/mote/`:
 
@@ -31,28 +39,31 @@ Or use the `--login` CLI flag to set them interactively:
 
 ```bash
 # DeepSeek — enter your API key
-cargo run -p mote-client -- --login deepseek
+cargo run -- --login deepseek
 
 # GitHub — enter a Personal Access Token with models:read scope
-cargo run -p mote-client -- --login github
+cargo run -- --login github
 ```
 
 ### Run
 
-Start the **server**, then the **client**:
+Start Mote with the TUI:
 
 ```bash
-# Terminal 1: server daemon
+# Starts a local server in the background, then shows the TUI
+cargo run
+
+# Standalone server package
 cargo run -p mote-server
 
-# Terminal 2: TUI client
-cargo run -p mote-client
+# TUI-only mode, connecting to an existing server
+cargo run -- --tui --server-url http://127.0.0.1:9847
 
 # Optional: force a specific session key namespace
-cargo run -p mote-client -- --session-key team-a
+cargo run -- --session-key team-a
 ```
 
-The server binds to `127.0.0.1:9847`. The client auto-detects it.
+From the repo root, `cargo run` targets `mote-client` by default. The client starts a local server on a free localhost port by default and only displays the frontend. Use `-p mote-client` or `-p mote-server` to target a specific workspace package explicitly, and `--tui --server-url http://127.0.0.1:<port>` to connect a frontend to an already-running server.
 
 ### Runtime folders
 
@@ -99,16 +110,21 @@ agent_command = "ctrl+space"
 |---------|-------------|
 | `/help` | Show help |
 | `/agent` | List / switch agents |
-| `/model` | Show / switch model |
+| `/model` | Open model picker popup (↑/↓, Enter, Esc) |
 | `/tokens` | Show token usage |
+| `/new` | Start a fresh chat session |
 | `/sessions` | Open session picker (↑/↓, Enter, Esc) |
 | `/login github` | GitHub OAuth device flow |
 | `/login deepseek <key>` | Save DeepSeek API key |
 | `/subagents` | List active subagents |
 | `/rollback last` | Roll back latest tracked file changes |
+| `! <command>` | Run a local shell command in the current workspace |
 
 Notes:
 - `/sessions` is available only when the app is idle (not during an active streaming turn).
+- `/new` clears the current transcript and active resumed session id, while keeping your selected agent/model/workspace.
+- `/model <provider/model>` and `/model default` still work, but `/model` opens the picker for easier selection.
+- `!` commands are local TUI commands; their output is shown in the transcript but is not sent to the LLM as conversation history.
 
 ### Agents
 
@@ -172,7 +188,7 @@ Tools: `read`, `glob`, `grep`, `write`, `edit`, `delete`, `bash`, `subagent`. `u
 
 Recommended baseline: allow read-only tools (`read`, `glob`, `grep`), ask for file mutations (`write`, `edit`, `delete`), and keep `bash` as `ask` or `deny` unless you trust the workspace.
 
-Permission prompts support three choices:
+Permission prompts are shown as a popup with three choices:
 - `[Y] Allow Once`
 - `[A] Allow Always` (session-scoped, with confirmation)
 - `[N] Deny`
@@ -193,6 +209,10 @@ Roll back the latest tracked change-set with:
 Rollback is conflict-safe: if files changed since the original mutation, rollback is blocked with an explanatory message and the rollback entry is preserved so you can retry after resolving the conflict.
 
 Rollback scope is session-local in multi-client mode: each client can only roll back its own tracked change journal.
+
+### Markdown rendering
+
+Assistant messages are rendered as markdown with extra spacing between blocks so paragraphs, headings, lists, tables, and code blocks are easier to scan. Soft line breaks are treated like spaces; fenced code blocks keep their formatting.
 
 ### Subagents
 

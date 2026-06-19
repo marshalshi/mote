@@ -1503,6 +1503,26 @@ fn find_config() -> Result<PathBuf> {
     Ok(cwd_config)
 }
 
+async fn bind_available_listener(
+    start_port: u16,
+) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    let mut port = start_port;
+    loop {
+        let addr = format!("127.0.0.1:{port}");
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => return Ok((listener, port)),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && port < u16::MAX =>
+            {
+                tracing::warn!("Port {port} is in use; trying {}", port + 1);
+                port += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 // ── Main ────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1516,6 +1536,9 @@ async fn main() -> Result<()> {
         );
     }
     let mut config = config::Config::load(&config_path)?;
+    if let Some(port) = server_port_override()? {
+        config.server.port = port;
+    }
     if config.history.dir.is_relative() {
         let base = config_path
             .parent()
@@ -1589,7 +1612,7 @@ async fn main() -> Result<()> {
         runtime_states: tokio::sync::Mutex::new(HashMap::new()),
     });
 
-    let port = state.config.server.port;
+    let configured_port = state.config.server.port;
 
     // Build router
     let app = Router::new()
@@ -1606,12 +1629,31 @@ async fn main() -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
+    let (listener, port) = bind_available_listener(configured_port).await?;
+    if port != configured_port {
+        info!(
+            "Configured port {} was unavailable; using {} instead",
+            configured_port, port
+        );
+    }
     let addr = format!("127.0.0.1:{port}");
     info!("Starting mote-server on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn server_port_override() -> Result<Option<u16>> {
+    let Some(raw) = std::env::var("MOTE_SERVER_PORT")
+        .ok()
+        .or_else(|| std::env::var("MOTE_PORT").ok())
+    else {
+        return Ok(None);
+    };
+    let port = raw
+        .parse::<u16>()
+        .with_context(|| format!("Invalid server port override: {raw}"))?;
+    Ok(Some(port))
 }
 
 #[cfg(test)]

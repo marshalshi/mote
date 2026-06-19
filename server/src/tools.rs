@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use marshaling_protocol::{DiffLine, DiffLineKind, FileChange, FileChangeKind};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::process::Command;
 use tokio::fs;
 
 use crate::llm::{
@@ -297,20 +298,39 @@ impl Tool for GlobTool {
 
 // ── GrepTool ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrepBackend {
+    Ripgrep,
+    Grep,
+}
+
 pub struct GrepTool {
     ctx: ToolContext,
 }
 
-/// Cache whether `rg` (ripgrep) is available on PATH.
-static HAS_RG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::process::Command::new("rg")
+fn command_available(name: &str) -> bool {
+    Command::new(name)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-});
+        .is_ok_and(|status| status.success())
+}
+
+fn preferred_grep_backend_with<F>(mut is_available: F) -> GrepBackend
+where
+    F: FnMut(&str) -> bool,
+{
+    if is_available("rg") {
+        GrepBackend::Ripgrep
+    } else {
+        GrepBackend::Grep
+    }
+}
+
+fn preferred_grep_backend() -> GrepBackend {
+    preferred_grep_backend_with(command_available)
+}
 
 impl GrepTool {
     pub fn new(workspace: PathBuf) -> Self {
@@ -372,29 +392,30 @@ impl Tool for GrepTool {
 
         let include = args.get("include").and_then(|v| v.as_str());
 
-        let output = if *HAS_RG {
-            // Use ripgrep (preferred)
-            let mut cmd = tokio::process::Command::new("rg");
-            cmd.arg("--line-number")
-                .arg("--with-filename")
-                .arg("-i")
-                .arg(pattern)
-                .arg(&dir);
-            if let Some(inc) = include {
-                cmd.arg("--glob").arg(inc);
+        let output = match preferred_grep_backend() {
+            GrepBackend::Ripgrep => {
+                // Use ripgrep (preferred)
+                let mut cmd = tokio::process::Command::new("rg");
+                cmd.arg("--line-number")
+                    .arg("--with-filename")
+                    .arg("-i")
+                    .arg(pattern)
+                    .arg(&dir);
+                if let Some(inc) = include {
+                    cmd.arg("--glob").arg(inc);
+                }
+                cmd.output().await.context("Failed to run ripgrep")?
             }
-            cmd.output().await.context("Failed to run ripgrep")?
-        } else {
-            // Fallback to grep -rn
-            let mut cmd = tokio::process::Command::new("grep");
-            cmd.arg("-rn").arg("-i").arg("-E").arg(pattern);
-            if let Some(inc) = include {
-                cmd.arg("--include").arg(inc);
+            GrepBackend::Grep => {
+                // Fallback to grep -rn
+                let mut cmd = tokio::process::Command::new("grep");
+                cmd.arg("-rn").arg("-i").arg("-E").arg(pattern);
+                if let Some(inc) = include {
+                    cmd.arg("--include").arg(inc);
+                }
+                cmd.arg(&dir);
+                cmd.output().await.context("Failed to run grep")?
             }
-            cmd.arg(&dir);
-            cmd.output()
-                .await
-                .context("Failed to run grep (ripgrep not available)")?
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1472,6 +1493,18 @@ mod tests {
         });
         let result = tool.execute(args).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_preferred_grep_backend_prefers_rg_when_available() {
+        let backend = preferred_grep_backend_with(|name| name == "rg");
+        assert_eq!(backend, GrepBackend::Ripgrep);
+    }
+
+    #[test]
+    fn test_preferred_grep_backend_falls_back_to_grep_when_rg_missing() {
+        let backend = preferred_grep_backend_with(|_| false);
+        assert_eq!(backend, GrepBackend::Grep);
     }
 
     #[tokio::test]

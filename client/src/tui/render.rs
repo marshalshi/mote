@@ -4,7 +4,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
     },
 };
 use std::sync::OnceLock;
@@ -30,19 +31,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     };
 
     let newline_count = app.input.matches('\n').count();
-    let input_lines = {
-        let base = (newline_count.saturating_add(1)).max(1).min(8) as u16 + 4; // +2 for top/bottom accent +2 for spacers
-        // Permission prompt can be tall when args are large; reserve extra space.
-        if app.pending_permission.is_some() {
-            let confirm = app
-                .pending_permission
-                .as_ref()
-                .map_or(false, |p| p.confirming_always);
-            base.max(if confirm { 16 } else { 14 })
-        } else {
-            base
-        }
-    };
+    let input_lines =
+        (newline_count.saturating_add(1)).max(1).min(8) as u16 + 4; // +2 for top/bottom accent +2 for spacers
     let show_loading = app.loading_progress.is_some();
     let loading_height: u16 = if show_loading { 1 } else { 0 };
 
@@ -67,27 +57,45 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.session_picker_open {
         render_session_picker(frame, full_area, app);
     }
+    if app.model_picker_open {
+        render_model_picker(frame, full_area, app);
+    }
 
-    // Permission is handled inline inside render_input_area — no overlay needed
+    if app.pending_permission.is_some() {
+        render_permission_popup(frame, full_area, app);
+    }
 }
 
 fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
-    let w = area.width.min(90).max(40);
-    let h = area.height.min(20).max(8);
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect::new(x, y, w, h);
+    let rect = centered_rect(
+        area,
+        area.width.min(92).max(44),
+        area.height.min(22).max(9),
+    );
+    frame.render_widget(Clear, rect);
 
-    let block = Block::default().title(" Sessions ").borders(ratatui::widgets::Borders::ALL);
+    let block = Block::default()
+        .title(" Sessions ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.input_accent));
     frame.render_widget(block, rect);
 
-    let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width.saturating_sub(2), rect.height.saturating_sub(2));
-    let mut lines: Vec<Line> = Vec::new();
+    let inner = inset(rect, 2, 1);
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Load a previous conversation",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
     if app.session_picker_items.is_empty() {
-        lines.push(Line::from("No sessions found."));
+        lines.push(Line::from(Span::styled(
+            "No sessions found.",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
         // Each session uses two lines, and we reserve two footer lines.
-        let available_rows = inner.height.saturating_sub(2) as usize;
+        let available_rows = inner.height.saturating_sub(4) as usize;
         let visible_items = (available_rows / 2).max(1);
         let total_items = app.session_picker_items.len();
         let (start, end) = session_picker_window(
@@ -98,13 +106,21 @@ fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
 
         for (i, s) in app.session_picker_items[start..end].iter().enumerate() {
             let i = start + i;
-            let marker = if i == app.session_picker_index { ">" } else { " " };
+            let selected = i == app.session_picker_index;
+            let marker = if selected { "›" } else { " " };
             let name = s.summary.as_deref().unwrap_or("(no name)");
-            lines.push(Line::from(vec![
-                Span::styled(format!("{} {}", marker, name), Style::default().fg(if i == app.session_picker_index { Color::Yellow } else { Color::White })),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} {}", marker, name),
+                if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            )]));
             lines.push(Line::from(Span::styled(
-                format!("   {}  {}  {} msgs", s.id, s.model, s.message_count),
+                format!("   {} · {} · {} msgs", s.id, s.model, s.message_count),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -121,6 +137,220 @@ fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let rect = centered_rect(
+        area,
+        area.width.min(92).max(44),
+        area.height.min(22).max(9),
+    );
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(" Model Picker ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.input_accent));
+    frame.render_widget(block, rect);
+    let inner = inset(rect, 2, 1);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("Current · {}", app.model_info),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    if app.model_picker_items.is_empty() {
+        lines.push(Line::from("No models available."));
+    } else {
+        let visible_items = inner.height.saturating_sub(4).max(1) as usize;
+        let (start, end) = session_picker_window(
+            app.model_picker_items.len(),
+            app.model_picker_index,
+            visible_items,
+        );
+        let mut last_provider: Option<&str> = None;
+        let mut wrote_provider_header = false;
+        for (i, item) in app.model_picker_items[start..end].iter().enumerate() {
+            let i = start + i;
+            let selected = i == app.model_picker_index;
+            if let super::state::ModelChoice::Model { provider, .. } = item {
+                if last_provider != Some(provider.as_str()) {
+                    if wrote_provider_header {
+                        lines.push(Line::from(""));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        provider.clone(),
+                        Style::default()
+                            .fg(app.input_accent)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    last_provider = Some(provider.as_str());
+                    wrote_provider_header = true;
+                }
+            }
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(model_choice_label(item), style),
+            ]));
+        }
+        if end < app.model_picker_items.len() {
+            lines.push(Line::from(Span::styled(
+                format!("... {} more", app.model_picker_items.len() - end),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select • Enter apply • Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn model_choice_label(choice: &super::state::ModelChoice) -> String {
+    match choice {
+        super::state::ModelChoice::Default => "Default model".into(),
+        super::state::ModelChoice::Model { model_id, .. } => model_id.clone(),
+    }
+}
+
+fn render_permission_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(perm) = app.pending_permission.as_ref() else {
+        return;
+    };
+    let rect = centered_rect(
+        area,
+        area.width.min(88).max(46),
+        area.height
+            .min(if perm.confirming_always { 18 } else { 20 })
+            .max(10),
+    );
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(if perm.confirming_always {
+            " Confirm Allow Always "
+        } else {
+            " Permission Required "
+        })
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(block, rect);
+
+    let inner = inset(rect, 3, 1);
+    let content_width = inner.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Review the requested tool call before continuing.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("tool ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                perm.tool_name.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let mut args_lines = json_to_yaml_lines(&perm.args, content_width);
+    let max_args =
+        inner
+            .height
+            .saturating_sub(if perm.confirming_always { 8 } else { 7 })
+            as usize;
+    if args_lines.len() > max_args {
+        args_lines.truncate(max_args.saturating_sub(1));
+        args_lines.push("... (args truncated)".into());
+    }
+    if !args_lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "arguments",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for arg in args_lines {
+            lines.push(Line::from(Span::styled(
+                format!("  {arg}"),
+                Style::default().fg(Color::White),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if perm.confirming_always {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Auto-allow all future `{}` calls this session?",
+                perm.tool_name
+            ),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Y ",
+                Style::default().fg(Color::Black).bg(Color::Green),
+            ),
+            Span::raw(" Confirm   "),
+            Span::styled(
+                " N ",
+                Style::default().fg(Color::Black).bg(Color::Red),
+            ),
+            Span::raw(" Cancel"),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Y ",
+                Style::default().fg(Color::Black).bg(Color::Green),
+            ),
+            Span::raw(" Allow once   "),
+            Span::styled(
+                " A ",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw(" Allow always   "),
+            Span::styled(
+                " N ",
+                Style::default().fg(Color::Black).bg(Color::Red),
+            ),
+            Span::raw(" Deny"),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
+}
+
+fn inset(rect: Rect, x: u16, y: u16) -> Rect {
+    Rect::new(
+        rect.x + x,
+        rect.y + y,
+        rect.width.saturating_sub(x.saturating_mul(2)),
+        rect.height.saturating_sub(y.saturating_mul(2)),
+    )
 }
 
 fn session_picker_window(
@@ -203,7 +433,7 @@ fn highlight_code(lang: &str, code: &str) -> Vec<Line<'static>> {
 
 /// Render markdown text into styled lines with accent bars.
 /// `accent_prefix` is shown at the start of each line (e.g. `" ▌"` or `"  "`).
-/// Handles: headers, bold, italic, code spans, lists, blockquotes, and fenced code blocks.
+/// Handles: headers, tables, bold, italic, code spans, lists, blockquotes, and fenced code blocks.
 fn render_markdown(
     lines: &mut Vec<Line<'static>>,
     text: &str,
@@ -214,7 +444,7 @@ fn render_markdown(
 ) {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-    let opts = Options::ENABLE_STRIKETHROUGH;
+    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(text, opts);
 
     // Style stack to handle nested formatting
@@ -227,9 +457,18 @@ fn render_markdown(
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_buf = String::new();
+    let mut in_table_head = false;
+    let mut table_state: Option<MarkdownTableState> = None;
 
     // Current line spans being built
     let mut current_spans: Vec<Span<'static>> = Vec::new();
+
+    let push_blank_line = |lines: &mut Vec<Line<'static>>, accent: Style| {
+        lines.push(Line::from(vec![Span::styled(
+            accent_prefix.to_string(),
+            accent,
+        )]));
+    };
 
     let flush_line = |lines: &mut Vec<Line<'static>>,
                       spans: &mut Vec<Span<'static>>,
@@ -273,6 +512,62 @@ fn render_markdown(
 
     for event in parser {
         match event {
+            Event::Start(Tag::Table(alignments)) => {
+                if !current_spans.is_empty() {
+                    flush_line(
+                        lines,
+                        &mut current_spans,
+                        accent_style,
+                        if in_blockquote { "  │ " } else { "" },
+                        max_width,
+                    );
+                }
+                table_state = Some(MarkdownTableState::new(alignments));
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(table) = table_state.take() {
+                    render_markdown_table(
+                        lines,
+                        table,
+                        accent_prefix,
+                        accent_style,
+                        max_width,
+                    );
+                    push_blank_line(lines, accent_style);
+                }
+            }
+            Event::Start(Tag::TableHead) => {
+                in_table_head = true;
+                if let Some(table) = table_state.as_mut() {
+                    table.start_row(true);
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(table) = table_state.as_mut() {
+                    table.finish_row();
+                }
+                in_table_head = false;
+            }
+            Event::Start(Tag::TableRow) => {
+                if !in_table_head && let Some(table) = table_state.as_mut() {
+                    table.start_row(false);
+                }
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !in_table_head && let Some(table) = table_state.as_mut() {
+                    table.finish_row();
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                if let Some(table) = table_state.as_mut() {
+                    table.start_cell();
+                }
+            }
+            Event::End(TagEnd::TableCell) => {
+                if let Some(table) = table_state.as_mut() {
+                    table.finish_cell();
+                }
+            }
             Event::Start(Tag::Heading { level, .. }) => {
                 in_heading = true;
                 let _ = level; // all headings get bold treatment
@@ -292,6 +587,7 @@ fn render_markdown(
                     ]));
                 }
                 current_spans.clear();
+                push_blank_line(lines, accent_style);
                 in_heading = false;
             }
             Event::Start(Tag::Strong) => bold = true,
@@ -308,6 +604,7 @@ fn render_markdown(
                 list_depth = list_depth.saturating_sub(1);
                 if list_depth == 0 {
                     ordered_index = None;
+                    push_blank_line(lines, accent_style);
                 }
             }
             Event::Start(Tag::Item) => {}
@@ -374,6 +671,7 @@ fn render_markdown(
                         lines.push(Line::from(spans));
                     }
                 }
+                push_blank_line(lines, accent_style);
                 in_code_block = false;
                 code_buf.clear();
             }
@@ -389,6 +687,7 @@ fn render_markdown(
                         max_width,
                     );
                 }
+                push_blank_line(lines, accent_style);
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 // Just show the link text in blue underlined
@@ -398,6 +697,8 @@ fn render_markdown(
             Event::Text(text) => {
                 if in_code_block {
                     code_buf.push_str(&text);
+                } else if let Some(table) = table_state.as_mut() {
+                    table.push_text(&text);
                 } else if in_heading {
                     current_spans.push(Span::styled(
                         text.to_string(),
@@ -418,14 +719,27 @@ fn render_markdown(
                 }
             }
             Event::Code(code) => {
-                // Inline code: dim background style
-                current_spans.push(Span::styled(
-                    format!("`{}`", code),
-                    Style::default().fg(Color::Yellow),
-                ));
+                if let Some(table) = table_state.as_mut() {
+                    table.push_text(&code);
+                } else {
+                    // Inline code: dim background style
+                    current_spans.push(Span::styled(
+                        format!("`{}`", code),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
             }
-            Event::SoftBreak | Event::HardBreak => {
-                if !current_spans.is_empty() {
+            Event::SoftBreak => {
+                if let Some(table) = table_state.as_mut() {
+                    table.push_text(" ");
+                } else {
+                    current_spans.push(Span::raw(" "));
+                }
+            }
+            Event::HardBreak => {
+                if let Some(table) = table_state.as_mut() {
+                    table.push_text(" ");
+                } else if !current_spans.is_empty() {
                     let prefix = if in_blockquote { "  │ " } else { "" };
                     flush_line(
                         lines,
@@ -437,11 +751,13 @@ fn render_markdown(
                 }
             }
             Event::Rule => {
+                push_blank_line(lines, accent_style);
                 let rule = "─".repeat(max_width.min(40));
                 lines.push(Line::from(vec![
                     Span::styled(accent_prefix.to_string(), accent_style),
                     Span::styled(rule, Style::default().fg(Color::DarkGray)),
                 ]));
+                push_blank_line(lines, accent_style);
             }
             _ => {}
         }
@@ -451,6 +767,232 @@ fn render_markdown(
     if !current_spans.is_empty() {
         let prefix = if in_blockquote { "  │ " } else { "" };
         flush_line(lines, &mut current_spans, accent_style, prefix, max_width);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MarkdownTableRow {
+    cells: Vec<String>,
+    is_header: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MarkdownTableState {
+    alignments: Vec<pulldown_cmark::Alignment>,
+    rows: Vec<MarkdownTableRow>,
+    current_row: Vec<String>,
+    current_cell: String,
+    current_row_is_header: bool,
+    in_cell: bool,
+}
+
+impl MarkdownTableState {
+    fn new(alignments: Vec<pulldown_cmark::Alignment>) -> Self {
+        Self {
+            alignments,
+            rows: Vec::new(),
+            current_row: Vec::new(),
+            current_cell: String::new(),
+            current_row_is_header: false,
+            in_cell: false,
+        }
+    }
+
+    fn start_row(&mut self, is_header: bool) {
+        self.current_row.clear();
+        self.current_cell.clear();
+        self.current_row_is_header = is_header;
+    }
+
+    fn finish_row(&mut self) {
+        if !self.current_row.is_empty() {
+            self.rows.push(MarkdownTableRow {
+                cells: std::mem::take(&mut self.current_row),
+                is_header: self.current_row_is_header,
+            });
+        }
+    }
+
+    fn start_cell(&mut self) {
+        self.current_cell.clear();
+        self.in_cell = true;
+    }
+
+    fn finish_cell(&mut self) {
+        let cell = self.current_cell.trim().replace('\n', " ");
+        self.current_row.push(cell);
+        self.current_cell.clear();
+        self.in_cell = false;
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if self.in_cell {
+            self.current_cell.push_str(text);
+        }
+    }
+}
+
+fn render_markdown_table(
+    lines: &mut Vec<Line<'static>>,
+    table: MarkdownTableState,
+    accent_prefix: &str,
+    accent_style: Style,
+    max_width: usize,
+) {
+    use pulldown_cmark::Alignment;
+    use unicode_width::UnicodeWidthStr;
+
+    let col_count = table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .chain(std::iter::once(table.alignments.len()))
+        .max()
+        .unwrap_or(0);
+    if col_count == 0 {
+        return;
+    }
+
+    let mut widths = vec![0usize; col_count];
+    for row in &table.rows {
+        for (idx, cell) in row.cells.iter().enumerate() {
+            let cell_width =
+                cell.lines().map(UnicodeWidthStr::width).max().unwrap_or(0);
+            widths[idx] = widths[idx].max(cell_width);
+        }
+    }
+
+    let min_width = 3usize;
+    let max_table_width = max_width.saturating_sub(3 * col_count + 1);
+    let target_total = max_table_width.max(col_count * min_width);
+    for width in &mut widths {
+        *width = (*width).max(min_width);
+    }
+    let mut total: usize = widths.iter().sum();
+    while total > target_total {
+        if let Some((idx, width)) = widths
+            .iter_mut()
+            .enumerate()
+            .max_by_key(|(_, width)| **width)
+        {
+            if *width > min_width {
+                *width -= 1;
+                total -= 1;
+            } else {
+                let _ = idx;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    let table_alignment = |idx: usize| {
+        table
+            .alignments
+            .get(idx)
+            .copied()
+            .unwrap_or(Alignment::Left)
+    };
+
+    let border_line = |left: char, fill: char, junction: char, right: char| {
+        let mut spans =
+            vec![Span::styled(accent_prefix.to_string(), accent_style)];
+        spans.push(Span::styled(left.to_string(), accent_style));
+        for (idx, width) in widths.iter().enumerate() {
+            spans.push(Span::styled(
+                fill.to_string().repeat(width + 2),
+                accent_style,
+            ));
+            spans.push(Span::styled(
+                if idx + 1 == widths.len() {
+                    right
+                } else {
+                    junction
+                }
+                .to_string(),
+                accent_style,
+            ));
+        }
+        Line::from(spans)
+    };
+
+    lines.push(border_line('┌', '─', '┬', '┐'));
+
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        let cell_lines: Vec<Vec<String>> = row
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(idx, cell)| word_wrap_line(cell, widths[idx]))
+            .collect();
+        let row_height =
+            cell_lines.iter().map(Vec::len).max().unwrap_or(1).max(1);
+
+        for line_idx in 0..row_height {
+            let mut spans =
+                vec![Span::styled(accent_prefix.to_string(), accent_style)];
+            spans.push(Span::styled("│".to_string(), accent_style));
+            let row_style = if row.is_header {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            for col_idx in 0..col_count {
+                let width = widths[col_idx];
+                let alignment = table_alignment(col_idx);
+                let cell_text = cell_lines
+                    .get(col_idx)
+                    .and_then(|cell| cell.get(line_idx))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                spans.push(Span::styled(" ".to_string(), accent_style));
+                spans.push(Span::styled(
+                    pad_table_cell(cell_text, width, alignment),
+                    row_style,
+                ));
+                spans.push(Span::styled(" ".to_string(), accent_style));
+                spans.push(Span::styled("│".to_string(), accent_style));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        if row.is_header {
+            lines.push(border_line('├', '─', '┼', '┤'));
+        } else if row_idx + 1 == table.rows.len() {
+            lines.push(border_line('└', '─', '┴', '┘'));
+        }
+    }
+
+    if !table.rows.iter().any(|row| !row.is_header) {
+        lines.push(border_line('└', '─', '┴', '┘'));
+    }
+}
+
+fn pad_table_cell(
+    text: &str,
+    width: usize,
+    alignment: pulldown_cmark::Alignment,
+) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let text_width = UnicodeWidthStr::width(text);
+    let padding = width.saturating_sub(text_width);
+    match alignment {
+        pulldown_cmark::Alignment::Left => {
+            format!("{}{}", text, " ".repeat(padding))
+        }
+        pulldown_cmark::Alignment::Right => {
+            format!("{}{}", " ".repeat(padding), text)
+        }
+        pulldown_cmark::Alignment::Center => {
+            let left = padding / 2;
+            let right = padding - left;
+            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+        }
+        pulldown_cmark::Alignment::None => {
+            format!("{}{}", text, " ".repeat(padding))
+        }
     }
 }
 
@@ -615,18 +1157,22 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Welcome to Mote",
+            "  Mote",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Type a message to get started.",
+            "  Type a message to start, or use one of the shortcuts below.",
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
-            "  /help for commands, Ctrl+C to quit.",
+            "  /model  choose model    /sessions  resume chat    !ls  run shell",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  /help   all commands    Ctrl+C     quit",
             Style::default().fg(Color::DarkGray),
         )));
         return lines;
@@ -694,6 +1240,10 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
                 accent_prefix.to_string(),
                 accent_style,
             )));
+            lines.push(Line::from(Span::styled(
+                accent_prefix.to_string(),
+                accent_style,
+            )));
         }
 
         // Render the regular message content with markdown formatting
@@ -720,6 +1270,10 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
             Style::default(),
             grey_content,
         );
+        if !app.stream_buffer.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
     }
 
     // Streaming content (assistant — blank side bar)
@@ -858,6 +1412,10 @@ fn build_subagent_lines(
             Style::default(),
             grey_content,
         );
+        if !sv.stream_buffer.is_empty() || (sv.done && !sv.content.is_empty()) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
     }
 
     // Stream buffer (in-progress text) — blank side bar for assistant
@@ -1012,106 +1570,41 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     // Top accent padding
     lines.push(Line::from(Span::styled(" ▌  ", a_style)));
 
-    if let Some(ref perm) = app.pending_permission {
-        // ── Permission prompt replaces input box ──────────
-        let mut args_lines = json_to_yaml_lines(&perm.args, content_width);
-        let base_lines_no_args: u16 =
-            if perm.confirming_always { 9 } else { 7 };
-        let max_args_lines = area
-            .height
-            .saturating_sub(base_lines_no_args)
-            .saturating_sub(1) as usize;
-        if args_lines.len() > max_args_lines {
-            if max_args_lines == 0 {
-                args_lines.clear();
-            } else if max_args_lines == 1 {
-                args_lines = vec!["... (args truncated)".into()];
-            } else {
-                args_lines.truncate(max_args_lines - 1);
-                args_lines.push("... (args truncated)".into());
-            }
-        }
+    // Input content lines — word-wrapped with accent bar and prompt symbol
+    let shell_mode = app.input.starts_with('!');
+    let (prompt, display_input, display_cursor) =
+        shell_input_display(&app.input, app.input_cursor);
+    let is_placeholder =
+        display_input.is_empty() && app.state == AppState::Idle;
+    let display_text = if is_placeholder {
+        "message · /command · !shell".to_string()
+    } else {
+        display_input.clone()
+    };
+    let wrapped =
+        word_wrap_line(&display_text, content_width.saturating_sub(2));
+    for (i, text_line) in wrapped.iter().enumerate() {
+        let prompt_text = if i == 0 { prompt } else { "  " };
+        let prompt_style = if shell_mode {
+            Style::default().fg(Color::Green)
+        } else {
+            a_style
+        };
         lines.push(Line::from(vec![
             Span::styled(" ▌  ", a_style),
+            Span::styled(prompt_text.to_string(), prompt_style),
             Span::styled(
-                " 🔒 Permission Required ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                text_line.clone(),
+                if is_placeholder {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    input_style
+                },
             ),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled(" ▌  ", a_style),
-            Span::styled(format!("tool: {}", perm.tool_name), input_style),
-        ]));
-        if !args_lines.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(" ▌  ", a_style),
-                Span::styled("args:", Style::default().fg(Color::DarkGray)),
-            ]));
-            for arg_line in &args_lines {
-                lines.push(Line::from(vec![
-                    Span::styled(" ▌  ", a_style),
-                    Span::styled(
-                        format!("  {}", arg_line),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
-            }
-        }
-        if perm.confirming_always {
-            // ── Confirmation popup ──────────
-            lines.push(Line::from(vec![
-                Span::styled(" ▌  ", a_style),
-                Span::styled(
-                    " ⚠️ Confirm Allow Always ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled(" ▌  ", a_style),
-                Span::styled(
-                    format!(
-                        "  Auto-allow all future `{}` calls?",
-                        perm.tool_name
-                    ),
-                    input_style,
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled(" ▌  ", a_style),
-                Span::styled(
-                    "  [Y] Confirm  [N] Cancel",
-                    Style::default().fg(accent),
-                ),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(" ▌  ", a_style),
-                Span::styled(
-                    " [Y] Allow Once  [A] Allow Always  [N] Deny",
-                    Style::default().fg(accent),
-                ),
-            ]));
-        }
-        lines.push(Line::from(Span::styled(" ▌  ", a_style)));
-    } else {
-        // Input content lines — word-wrapped with accent bar and prompt symbol
-        let wrapped =
-            word_wrap_line(&app.input, content_width.saturating_sub(2)); // -2 for prompt "❯ "
-        for (i, text_line) in wrapped.iter().enumerate() {
-            let prompt = if i == 0 { "❯ " } else { "  " };
-            lines.push(Line::from(vec![
-                Span::styled(" ▌  ", a_style),
-                Span::styled(prompt.to_string(), a_style),
-                Span::styled(text_line.clone(), input_style),
-            ]));
-        }
-        // Bottom accent padding
-        lines.push(Line::from(Span::styled(" ▌  ", a_style)));
     }
+    // Bottom accent padding
+    lines.push(Line::from(Span::styled(" ▌  ", a_style)));
 
     // Empty spacer line below the accent padding
     lines.push(Line::from(Span::styled("    ", a_style)));
@@ -1122,10 +1615,10 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
 
     // Cursor — only when idle and no pending permission
     if app.pending_permission.is_none() && app.state == AppState::Idle {
-        let prompt_width = 2; // "❯ "
+        let prompt_width = 2; // "❯ " or "$ "
         let (col, visual_row) = cursor_pos_after_wrap(
-            &app.input,
-            app.input_cursor,
+            &display_input,
+            display_cursor,
             content_width.saturating_sub(prompt_width),
         );
         let content_x = 4 + prompt_width + col; // 4 for accent bar " ▌  " + prompt
@@ -1133,6 +1626,20 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
             + content_x.min(area.width.saturating_sub(6) as usize) as u16;
         let cy = area.y + 2 + visual_row as u16; // +1 for spacer +1 for top accent padding
         frame.set_cursor_position(ratatui::prelude::Position::new(cx, cy));
+    }
+}
+
+fn shell_input_display(
+    input: &str,
+    cursor: usize,
+) -> (&'static str, String, usize) {
+    if let Some(rest) = input.strip_prefix('!') {
+        let trimmed = rest.strip_prefix(' ').unwrap_or(rest);
+        let skipped = input.len() - trimmed.len();
+        let display_cursor = cursor.saturating_sub(skipped).min(trimmed.len());
+        ("$ ", trimmed.to_string(), display_cursor)
+    } else {
+        ("❯ ", input.to_string(), cursor.min(input.len()))
     }
 }
 
@@ -1233,9 +1740,9 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         app.state,
         AppState::AgentRunning | AppState::WaitingResponse
     ) {
-        " Esc, Esc: stop agent | Ctrl+C: quit | /help: commands "
+        " Esc Esc stop · Ctrl+C quit · /help "
     } else {
-        " Ctrl+C: quit | /help: commands "
+        " Ctrl+C quit · /help "
     };
     let right = if total > left.len() + right_info.len() {
         right_info
@@ -1287,13 +1794,13 @@ fn render_loading_bar(frame: &mut Frame, area: Rect, app: &App) {
         .find(|tc| {
             matches!(tc.status, marshaling_protocol::ToolStatus::Running)
         })
-        .map(|tc| format!("Running: {}", tc.name))
-        .unwrap_or_else(|| "Thinking...".into());
+        .map(|tc| format!("running {}", tc.name))
+        .unwrap_or_else(|| "thinking".into());
 
-    let style = Style::default().fg(Color::Cyan);
+    let style = Style::default().fg(Color::DarkGray);
     frame.render_widget(
         Paragraph::new(Text::from(Line::from(Span::styled(
-            format!(" {} {} ", spinner, context),
+            format!(" {} {}", spinner, context),
             style,
         )))),
         area,
@@ -1462,6 +1969,13 @@ mod tests {
     }
 
     #[test]
+    fn test_markdown_soft_break_keeps_paragraph_together() {
+        let result = md_text("hello\nworld");
+        let joined: String = result.join(" ");
+        assert!(joined.contains("hello world"));
+    }
+
+    #[test]
     fn test_markdown_heading() {
         let result = md_text("# My Heading");
         assert!(result.iter().any(|l| l.contains("My Heading")));
@@ -1537,5 +2051,27 @@ mod tests {
         assert!(joined.contains("bold"));
         assert!(joined.contains("code here"));
         assert!(joined.contains("list item"));
+        assert!(result.iter().any(|l| l.is_empty()));
+    }
+
+    #[test]
+    fn test_markdown_table_renders_grid() {
+        let input =
+            "| Name | Score |\n| ---- | ----: |\n| Ada | 10 |\n| Grace | 42 |";
+        let result = md_text(input);
+        let joined: String = result.join("\n");
+        assert!(joined.contains("┌"), "table output:\n{joined}");
+        assert!(joined.contains("┬"), "table output:\n{joined}");
+        assert!(joined.contains("└"), "table output:\n{joined}");
+        assert!(joined.contains("Name"), "table output:\n{joined}");
+        assert!(joined.contains("Ada"), "table output:\n{joined}");
+        assert!(joined.contains("Grace"), "table output:\n{joined}");
+    }
+
+    #[test]
+    fn test_markdown_paragraph_spacing() {
+        let result = md_text("first paragraph\n\nsecond paragraph");
+        let blank_count = result.iter().filter(|l| l.is_empty()).count();
+        assert!(blank_count >= 1);
     }
 }

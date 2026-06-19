@@ -4,13 +4,14 @@ pub mod state;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     Event, EventStream, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tokio::time::MissedTickBehavior;
 
 use self::keybinding::{Action, Keybindings};
 use self::state::{App, AppState, ServerHealth, SlashAction};
@@ -43,6 +44,10 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
     let mut health_interval = tokio::time::interval(Duration::from_secs(5));
     health_interval.reset();
 
+    let mut animation_interval =
+        tokio::time::interval(Duration::from_millis(120));
+    animation_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         let result = terminal.draw(|f| render::render(f, &mut app));
         if result.is_err() {
@@ -53,6 +58,9 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
         }
 
         // Process events
+        let animate_loading =
+            should_animate_loading(&app, chat_stream.is_some());
+
         if let Some(ref mut stream) = chat_stream {
             tokio::select! {
                 event = reader.next() => {
@@ -62,6 +70,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
+                _ = animation_interval.tick(), if animate_loading => {}
                 server_event = stream.rx.recv() => {
                     match server_event {
                         Some(event) => handle_server_event(&mut app, event, &mut chat_stream),
@@ -92,6 +101,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
+                _ = animation_interval.tick(), if animate_loading => {}
                 _ = health_interval.tick() => {
                     let healthy = client.health().await;
                     app.server_health = if healthy {
@@ -110,24 +120,40 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
         // Handle pending async slash actions
         if let Some(action) = app.pending_slash.take() {
             match action {
-                SlashAction::FetchModels => {
-                    let result = fetch_and_display_models(client).await;
-                    app.messages.push(self::state::DisplayMessage {
+                SlashAction::FetchModels => match client.list_models().await {
+                    Ok(models) => {
+                        if models.is_empty() {
+                            app.messages.push(
+                                self::state::DisplayMessage::command(
+                                    crate::llm::Role::Assistant,
+                                    "No models available.".into(),
+                                ),
+                            );
+                        } else {
+                            app.open_model_picker(models);
+                        }
+                    }
+                    Err(e) => app.messages.push(self::state::DisplayMessage {
                         role: crate::llm::Role::Assistant,
-                        content: result,
+                        content: format!("Error fetching models: {e}"),
                         thinking: None,
-                        source: self::state::MessageSource::Command,
-                    });
-                }
+                        source: self::state::MessageSource::Error,
+                    }),
+                },
                 SlashAction::OpenSessions => {
                     if chat_stream.is_some() || app.state != AppState::Idle {
-                        app.messages.push(self::state::DisplayMessage::command(
-                            crate::llm::Role::Assistant,
-                            "Cannot open sessions while agent is running."
-                                .into(),
-                        ));
+                        app.messages.push(
+                            self::state::DisplayMessage::command(
+                                crate::llm::Role::Assistant,
+                                "Cannot open sessions while agent is running."
+                                    .into(),
+                            ),
+                        );
                     } else {
-                        match client.list_sessions(&app.runtime_session_key).await {
+                        match client
+                            .list_sessions(&app.runtime_session_key)
+                            .await
+                        {
                             Ok(sessions) => app.open_session_picker(sessions),
                             Err(e) => {
                                 app.messages.push(self::state::DisplayMessage {
@@ -142,15 +168,18 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                 }
                 SlashAction::LoadSession(id) => {
                     if chat_stream.is_some() || app.state != AppState::Idle {
-                        app.messages.push(self::state::DisplayMessage::command(
-                            crate::llm::Role::Assistant,
-                            "Cannot load a session while agent is running."
-                                .into(),
-                        ));
+                        app.messages.push(
+                            self::state::DisplayMessage::command(
+                                crate::llm::Role::Assistant,
+                                "Cannot load a session while agent is running."
+                                    .into(),
+                            ),
+                        );
                         continue;
                     }
-                    let result =
-                        client.load_session(&app.runtime_session_key, &id).await;
+                    let result = client
+                        .load_session(&app.runtime_session_key, &id)
+                        .await;
                     match result {
                         Ok(session) => {
                             app.reset_for_loaded_session();
@@ -169,17 +198,23 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                             }
                             app.active_session_id = Some(id.clone());
                             app.scroll_to_bottom();
-                            app.messages.push(self::state::DisplayMessage::command(
-                                crate::llm::Role::Assistant,
-                                format!("Resumed session: {id}"),
-                            ));
+                            app.messages.push(
+                                self::state::DisplayMessage::command(
+                                    crate::llm::Role::Assistant,
+                                    format!("Resumed session: {id}"),
+                                ),
+                            );
                         }
-                        Err(e) => app.messages.push(self::state::DisplayMessage {
-                            role: crate::llm::Role::Assistant,
-                            content: format!("Failed to load session {id}: {e}"),
-                            thinking: None,
-                            source: self::state::MessageSource::Error,
-                        }),
+                        Err(e) => {
+                            app.messages.push(self::state::DisplayMessage {
+                                role: crate::llm::Role::Assistant,
+                                content: format!(
+                                    "Failed to load session {id}: {e}"
+                                ),
+                                thinking: None,
+                                source: self::state::MessageSource::Error,
+                            })
+                        }
                     }
                 }
                 SlashAction::SaveCredential(provider, key, value) => {
@@ -225,6 +260,26 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                         source: self::state::MessageSource::Command,
                     });
                 }
+                SlashAction::RunShell(command) => {
+                    let result =
+                        run_shell_command(&command, &app.workspace_root).await;
+                    let (content, source) = match result {
+                        Ok(output) => {
+                            (output, self::state::MessageSource::Command)
+                        }
+                        Err(e) => (
+                            format!("Shell command failed to start: {e:#}"),
+                            self::state::MessageSource::Error,
+                        ),
+                    };
+                    app.messages.push(self::state::DisplayMessage {
+                        role: crate::llm::Role::Assistant,
+                        content,
+                        thinking: None,
+                        source,
+                    });
+                    app.scroll_to_bottom();
+                }
             }
         }
 
@@ -260,7 +315,9 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
         // After idle + no active chat: check if user sent a message → start chat
         if chat_stream.is_none() && app.state == AppState::Idle {
             if let Some(last) = app.messages.last() {
-                if last.role == crate::llm::Role::User {
+                if last.role == crate::llm::Role::User
+                    && last.source == self::state::MessageSource::Conversation
+                {
                     start_chat(client, &mut app, &mut chat_stream).await;
                 }
             }
@@ -315,6 +372,10 @@ async fn start_chat(
             }
         }
     }
+}
+
+fn should_animate_loading(app: &App, chat_stream_active: bool) -> bool {
+    app.loading_progress.is_some() || chat_stream_active
 }
 
 fn build_chat_request(
@@ -599,6 +660,21 @@ fn handle_key_event(
                                 Some(SlashAction::LoadSession(s.id));
                         }
                         app.close_session_picker();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            if app.model_picker_open {
+                match key.code {
+                    crossterm::event::KeyCode::Up => app.model_picker_up(),
+                    crossterm::event::KeyCode::Down => app.model_picker_down(),
+                    crossterm::event::KeyCode::Esc => app.close_model_picker(),
+                    crossterm::event::KeyCode::Enter => {
+                        if let Some(choice) = app.selected_model_choice() {
+                            app.apply_model_choice(choice);
+                        }
+                        app.close_model_picker();
                     }
                     _ => {}
                 }
@@ -894,26 +970,51 @@ fn normal_action(
     }
 }
 
-/// Fetch models from the server and format for display.
-async fn fetch_and_display_models(client: &MoteClient) -> String {
-    match client.list_models().await {
-        Ok(models) => {
-            if models.is_empty() {
-                "No models available.\nType /model <name> to switch.\n".into()
-            } else {
-                let mut result = String::from("Available models:\n");
-                for m in &models {
-                    result.push_str(&format!(
-                        "  {}/{}\n",
-                        m.provider, m.model_id
-                    ));
-                }
-                result.push_str("Type /model <name> to switch.\n");
-                result
-            }
-        }
-        Err(e) => format!("Error fetching models: {}\n", e),
+async fn run_shell_command(
+    command: &str,
+    workspace_root: &str,
+) -> Result<String> {
+    const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+    let output = tokio::process::Command::new("/bin/bash")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(workspace_root)
+        .output()
+        .await
+        .with_context(|| format!("failed to run `{command}`"))?;
+
+    let mut sections = Vec::new();
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .trim_end()
+        .to_string();
+    if !stdout.is_empty() {
+        sections.push(stdout);
     }
+    if !stderr.is_empty() {
+        sections.push(format!("stderr:\n{stderr}"));
+    }
+    if sections.is_empty() {
+        sections.push("(no output)".into());
+    }
+    if !output.status.success() {
+        sections.push(format!(
+            "exit status: {}",
+            output.status.code().map_or_else(
+                || "terminated by signal".into(),
+                |c| c.to_string()
+            )
+        ));
+    }
+
+    let mut text = sections.join("\n\n");
+    if text.len() > MAX_OUTPUT_BYTES {
+        text.truncate(MAX_OUTPUT_BYTES);
+        text.push_str("\n... (output truncated)");
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -951,5 +1052,61 @@ mod tests {
         let req = build_chat_request(&app, "hello".into());
         assert_eq!(req.session_id.as_deref(), Some("sess-abc"));
         assert_eq!(req.runtime_session_key.as_deref(), Some("runtime-key"));
+    }
+
+    #[test]
+    fn test_build_chat_request_excludes_command_messages() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.messages.push(super::state::DisplayMessage::command(
+            crate::llm::Role::User,
+            "$ ls".into(),
+        ));
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "hello".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+
+        let req = build_chat_request(&app, "hello".into());
+
+        assert!(req.history.is_empty());
+    }
+
+    #[test]
+    fn test_should_animate_loading_when_progress_present() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+
+        assert!(!should_animate_loading(&app, false));
+        app.loading_progress = Some(0.2);
+        assert!(should_animate_loading(&app, false));
+    }
+
+    #[test]
+    fn test_should_animate_loading_when_chat_stream_active() {
+        let cfg = test_ui_config();
+        let app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+
+        assert!(should_animate_loading(&app, true));
     }
 }

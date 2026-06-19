@@ -6,14 +6,26 @@ mod workspace;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::process::Stdio;
+use tokio::process::{Child, Command};
 
-/// Mote client — connects to a mote-server.
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:9847";
+
+/// Mote — starts a local server and opens the TUI by default.
 #[derive(Parser, Debug)]
 #[command(name = "mote", version, about)]
 struct Cli {
-    /// Server address (default: http://127.0.0.1:9847).
-    #[arg(short, long, default_value = "http://127.0.0.1:9847")]
-    server: String,
+    /// Run only the server daemon.
+    #[arg(long, conflicts_with = "tui")]
+    server: bool,
+
+    /// Run only the TUI frontend, connecting to an existing server.
+    #[arg(long, conflicts_with = "server")]
+    tui: bool,
+
+    /// Server address for TUI-only mode.
+    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    server_url: String,
 
     /// Single message mode.
     #[arg(short = 'M', long)]
@@ -39,6 +51,10 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.server {
+        return run_server_only().await;
+    }
+
     let workspace_ctx =
         workspace::resolve_workspace_context(cli.session_key.as_deref())?;
 
@@ -86,8 +102,16 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    let (_server_child, server_url) = if cli.tui {
+        (None, cli.server_url.clone())
+    } else {
+        let port = reserve_local_port()?;
+        let url = format!("http://127.0.0.1:{port}");
+        (Some(spawn_local_server(port, cli.verbose)?), url)
+    };
+
     // Create client
-    let client = client::MoteClient::new(&cli.server);
+    let client = client::MoteClient::new(&server_url);
 
     // Wait for server to be ready
     for _ in 0..30 {
@@ -97,7 +121,7 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     if !client.health().await {
-        anyhow::bail!("Could not connect to mote-server at {}", cli.server);
+        anyhow::bail!("Could not connect to mote-server at {}", server_url);
     }
 
     // Handle login first (no TUI needed)
@@ -216,6 +240,96 @@ fn resolve_log_dir_from_config() -> std::path::PathBuf {
     } else {
         p
     }
+}
+
+struct ManagedServer {
+    child: Child,
+}
+
+impl Drop for ManagedServer {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+fn reserve_local_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("Failed to reserve a local server port")?;
+    let port = listener
+        .local_addr()
+        .context("Failed to read reserved local server address")?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn spawn_local_server(port: u16, verbose: bool) -> Result<ManagedServer> {
+    let mut cmd = server_command()?;
+    cmd.env("MOTE_SERVER_PORT", port.to_string());
+    if verbose {
+        cmd.stderr(Stdio::inherit()).stdout(Stdio::inherit());
+    } else {
+        cmd.stderr(Stdio::null()).stdout(Stdio::null());
+    }
+    let child = cmd.spawn().context("Failed to start local mote-server")?;
+    Ok(ManagedServer { child })
+}
+
+async fn run_server_only() -> Result<()> {
+    let mut cmd = server_command()?;
+    let status = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("Failed to run mote-server")?;
+    if !status.success() {
+        anyhow::bail!("mote-server exited with {status}");
+    }
+    Ok(())
+}
+
+fn server_command() -> Result<Command> {
+    if let Some(path) = sibling_server_binary()? {
+        return Ok(Command::new(path));
+    }
+
+    if command_exists("mote-server") {
+        return Ok(Command::new("mote-server"));
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .context("Failed to resolve workspace root")?;
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run")
+        .arg("-p")
+        .arg("mote-server")
+        .arg("--quiet")
+        .current_dir(workspace);
+    Ok(cmd)
+}
+
+fn sibling_server_binary() -> Result<Option<std::path::PathBuf>> {
+    let current = std::env::current_exe()
+        .context("Failed to resolve current executable")?;
+    let Some(dir) = current.parent() else {
+        return Ok(None);
+    };
+    let candidate = dir.join(if cfg!(windows) {
+        "mote-server.exe"
+    } else {
+        "mote-server"
+    });
+    Ok(candidate.is_file().then_some(candidate))
+}
+
+fn command_exists(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+    })
 }
 
 async fn single_message(

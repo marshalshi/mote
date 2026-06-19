@@ -82,6 +82,68 @@
 - ✅ Follow-up review result: no blocking regressions found in the non-auth changes.
 - ⚠️ Follow-up caveats: rollback is still not fully transactional on mid-apply failure; provider error bodies can still include upstream response text; additional future tests could cover successful rollback pop/apply-failure preservation/subagent integration/SSE split chunks.
 
+### 2026-06-19 plan: TUI command and popup UX improvements
+
+- Goal: add local `! <command>` shell input, improve thinking/answer spacing, replace typed model selection with a popup picker, and restore permission approval as an elegant popup.
+- Planned approach:
+  - Treat `!` input as a local command action, not LLM conversation history.
+  - Fetch `/models` into a model picker popup with Default + provider/model rows and ↑/↓/Enter/Esc handling.
+  - Render permission requests as centered overlays with margins and compact args preview.
+  - Add extra blank spacing between reasoning/thinking and answer text for stored/live/subagent output.
+  - Update tests/docs and verify with client/workspace test runs.
+- ✅ Implemented:
+  - local `! <command>` execution via `/bin/bash -lc` in the client workspace root;
+  - shell command outputs as command messages excluded from LLM history;
+  - model picker popup with Default + provider/model choices and ↑/↓/Enter/Esc handling;
+  - centered permission popup with margins, args preview, and styled Y/A/N controls;
+  - extra spacing between thinking/reasoning and answer output;
+  - README/help text updates;
+  - tests for shell input, model picker behavior, and command-history exclusion.
+- ✅ Verified:
+  - `cargo fmt --check`
+  - `cargo test -p mote-client` (87 passed)
+  - `cargo test --workspace` (220 passed)
+
+### 2026-06-19 execution notes (TUI elegance polish)
+
+- ✅ Applied a visual-only polish pass focused on simple, clear, elegant presentation.
+- ✅ Planned changes:
+  - calmer welcome screen with concise shortcut hints;
+  - consistent popup chrome for sessions/models/permissions;
+  - softer loading line and status-bar hints;
+  - empty-input placeholder hint;
+  - cleaner session picker row metadata.
+- ✅ Verified:
+  - `cargo fmt --check`
+  - `cargo test -p mote-client` (87 passed)
+  - `cargo test --workspace` (220 passed)
+
+### 2026-06-19 plan: session/model/server startup polish
+
+- 🚧 Implementing requested updates:
+  - `/new` command to start a fresh chat session while keeping agent/model/workspace selections;
+  - model picker grouped into provider sections;
+  - server startup auto-increments to the next available localhost port if configured port is occupied.
+- ✅ Implemented and documented in README.
+- ✅ Added/updated tests for new-session reset and provider-sorted model picker behavior.
+- ✅ Verified:
+  - `cargo fmt --check`
+  - `cargo test --workspace` (221 passed)
+
+### 2026-06-19 plan: unified client launcher modes
+
+- 🚧 Implementing final launch UX update for this round:
+  - default `mote-client` starts a background local server and displays only the TUI;
+  - `--server` runs server-only mode;
+  - `--tui` runs frontend-only mode against `--server-url`;
+  - old server URL option is renamed to `--server-url` because `--server` is now a mode flag.
+- ✅ Implemented and documented in README.
+- ✅ Added `MOTE_SERVER_PORT` / `MOTE_PORT` server port override for the launcher path.
+- ✅ Verified:
+  - `cargo fmt --check`
+  - `cargo test -p mote-client` (88 passed)
+  - `cargo test --workspace` (221 passed)
+
 ---
 
 ## Current Baseline

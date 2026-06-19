@@ -1,7 +1,8 @@
 use crate::llm::Role;
-use marshaling_protocol::{ToolCallDisplay, ToolStatus};
+use marshaling_protocol::{ModelInfo, ToolCallDisplay, ToolStatus};
 use ratatui::style::Color;
 use std::collections::{HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 /// Server connection health.
@@ -141,6 +142,11 @@ pub struct App {
     pub session_picker_items: Vec<marshaling_protocol::SessionInfo>,
     pub session_picker_index: usize,
 
+    /// Model picker popup state.
+    pub model_picker_open: bool,
+    pub model_picker_items: Vec<ModelChoice>,
+    pub model_picker_index: usize,
+
     /// Active session id to continue on next turns.
     pub active_session_id: Option<String>,
 }
@@ -167,6 +173,12 @@ pub struct PendingPermission {
     pub confirming_always: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelChoice {
+    Default,
+    Model { provider: String, model_id: String },
+}
+
 /// An async action triggered by a slash command that the TUI event loop
 /// should process asynchronously.
 #[derive(Debug, Clone)]
@@ -176,6 +188,7 @@ pub enum SlashAction {
     LoadSession(String),
     SaveCredential(String, String, String), // provider, key, value
     RollbackLast,
+    RunShell(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +206,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/login", "Login to a provider (github)"),
     ("/agent", "List or switch agents"),
     ("/tokens", "Show token usage"),
+    ("/new", "Start a new session"),
     ("/sessions", "Open session picker"),
     ("/model", "Show / switch model"),
     ("/subagents", "List active subagents"),
@@ -200,6 +214,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 ];
 
 impl App {
+    #[allow(dead_code)]
     pub fn new(
         ui_config: &marshaling_protocol::UiConfig,
         model_info: String,
@@ -256,7 +271,7 @@ impl App {
             model_override: None,
             provider_override: None,
             models_cache: Vec::new(),
-            input_accent: parse_ui_color(&ui_config.input_accent),
+            input_accent: agent_accent_color("default"),
             user_accent: parse_ui_color(&ui_config.user_accent),
             pending_slash: None,
             input_queue: VecDeque::new(),
@@ -276,6 +291,9 @@ impl App {
             session_picker_open: false,
             session_picker_items: Vec::new(),
             session_picker_index: 0,
+            model_picker_open: false,
+            model_picker_items: Vec::new(),
+            model_picker_index: 0,
             active_session_id: None,
         }
     }
@@ -310,6 +328,25 @@ impl App {
             self.input_history.push(text.clone());
         }
         self.input_history_idx = None;
+
+        if let Some(command) = shell_command_from_input(&text) {
+            self.suggestions.clear();
+            self.suggestion_index = 0;
+            self.handled_slash_command = true;
+            if command.is_empty() {
+                self.messages.push(DisplayMessage::command(
+                    Role::Assistant,
+                    "Usage: ! <shell command>".into(),
+                ));
+            } else {
+                self.messages.push(DisplayMessage::command(
+                    Role::User,
+                    format!("$ {command}"),
+                ));
+                self.pending_slash = Some(SlashAction::RunShell(command));
+            }
+            return String::new();
+        }
 
         if text.starts_with('/') {
             self.suggestions.clear();
@@ -390,6 +427,8 @@ impl App {
                         || self.agent_names.contains(&name.to_string())
                     {
                         self.current_agent = name.to_string();
+                        self.input_accent =
+                            agent_accent_color(&self.current_agent);
                         self.messages.push(DisplayMessage::command(
                             Role::Assistant,
                             format!("Switched to agent: {}", name),
@@ -414,12 +453,14 @@ impl App {
                         "  /agent <name>     — Switch agent",
                         "  /help             — Show this help",
                         "  /tokens           — Show token usage",
+                        "  /new              — Start a new session",
                         "  /sessions         — Open session picker",
                         "  /model            — Show / switch model",
                         "  /subagents        — List active subagents",
                         "  /rollback last    — Rollback latest file changes",
                         "  /login github <token>  — Save GitHub token",
                         "  /login deepseek <key>  — Save DeepSeek API key",
+                        "  ! <command>       — Run local shell command",
                         "",
                         "Keybindings (configurable in keybindings.toml):",
                         "  Enter             — Send message",
@@ -448,6 +489,17 @@ impl App {
                         self.tokens_input, self.tokens_output
                     ),
                 ));
+            }
+            "/new" => {
+                if self.state == AppState::Idle {
+                    self.start_new_session();
+                } else {
+                    self.messages.push(DisplayMessage::command(
+                        Role::Assistant,
+                        "Cannot start a new session while agent is running."
+                            .into(),
+                    ));
+                }
             }
             "/login" => {
                 if parts.len() < 2 {
@@ -500,8 +552,7 @@ impl App {
                 } else {
                     self.messages.push(DisplayMessage::command(
                         Role::Assistant,
-                        "Cannot open sessions while agent is running."
-                            .into(),
+                        "Cannot open sessions while agent is running.".into(),
                     ));
                 }
             }
@@ -513,22 +564,13 @@ impl App {
             }
             "/model" => {
                 if parts.len() < 2 {
-                    if let Some(override_model) = &self.model_override {
-                        self.messages.push(DisplayMessage {
-                            role: Role::Assistant,
-                            content: format!("Current model: {}\nType /model <name> to switch, or /model default to reset.", override_model),
-                            thinking: None,
-                            source: MessageSource::Command,
-                        });
-                    } else {
-                        self.messages.push(DisplayMessage {
-                            role: Role::Assistant,
-                            content: "Fetching available models...".into(),
-                            thinking: None,
-                            source: MessageSource::Command,
-                        });
-                        self.pending_slash = Some(SlashAction::FetchModels);
-                    }
+                    self.messages.push(DisplayMessage {
+                        role: Role::Assistant,
+                        content: "Fetching available models...".into(),
+                        thinking: None,
+                        source: MessageSource::Command,
+                    });
+                    self.pending_slash = Some(SlashAction::FetchModels);
                 } else {
                     let name = parts[1];
                     if name == "default" {
@@ -893,10 +935,7 @@ impl App {
             .unwrap_or(0);
         let next = names[(idx + 1) % names.len()].clone();
         self.current_agent = next.clone();
-
-        let accent = random_accent_color(self.input_accent);
-        self.input_accent = accent;
-        self.user_accent = accent;
+        self.input_accent = agent_accent_color(&self.current_agent);
     }
 
     pub fn open_session_picker(
@@ -905,9 +944,7 @@ impl App {
     ) {
         // Newest sessions first in the popup (top = latest).
         items.sort_by(|a, b| {
-            b.created
-                .cmp(&a.created)
-                .then_with(|| b.id.cmp(&a.id))
+            b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id))
         });
         self.session_picker_open = true;
         self.session_picker_items = items;
@@ -916,6 +953,79 @@ impl App {
 
     pub fn close_session_picker(&mut self) {
         self.session_picker_open = false;
+    }
+
+    pub fn open_model_picker(&mut self, mut models: Vec<ModelInfo>) {
+        models.sort_by(|a, b| {
+            a.provider
+                .cmp(&b.provider)
+                .then_with(|| a.model_id.cmp(&b.model_id))
+        });
+        self.models_cache = models
+            .iter()
+            .map(|m| (m.provider.clone(), m.model_id.clone()))
+            .collect();
+        let mut items = Vec::with_capacity(models.len() + 1);
+        items.push(ModelChoice::Default);
+        items.extend(models.into_iter().map(|m| ModelChoice::Model {
+            provider: m.provider,
+            model_id: m.model_id,
+        }));
+        self.model_picker_open = true;
+        self.model_picker_items = items;
+        self.model_picker_index = 0;
+    }
+
+    pub fn close_model_picker(&mut self) {
+        self.model_picker_open = false;
+    }
+
+    pub fn model_picker_up(&mut self) {
+        if self.model_picker_items.is_empty() {
+            return;
+        }
+        if self.model_picker_index == 0 {
+            self.model_picker_index = self.model_picker_items.len() - 1;
+        } else {
+            self.model_picker_index -= 1;
+        }
+    }
+
+    pub fn model_picker_down(&mut self) {
+        if self.model_picker_items.is_empty() {
+            return;
+        }
+        self.model_picker_index =
+            (self.model_picker_index + 1) % self.model_picker_items.len();
+    }
+
+    pub fn selected_model_choice(&self) -> Option<ModelChoice> {
+        self.model_picker_items
+            .get(self.model_picker_index)
+            .cloned()
+    }
+
+    pub fn apply_model_choice(&mut self, choice: ModelChoice) {
+        match choice {
+            ModelChoice::Default => {
+                self.model_override = None;
+                self.provider_override = None;
+                self.messages.push(DisplayMessage::command(
+                    Role::Assistant,
+                    "Reset to default model. Start a new message to apply."
+                        .into(),
+                ));
+            }
+            ModelChoice::Model { provider, model_id } => {
+                self.model_override = Some(model_id.clone());
+                self.provider_override = Some(provider.clone());
+                self.model_info = format!("{provider}/{model_id}");
+                self.messages.push(DisplayMessage::command(
+                    Role::Assistant,
+                    format!("Switched to model: {provider}/{model_id}"),
+                ));
+            }
+        }
     }
 
     pub fn session_picker_up(&mut self) {
@@ -958,9 +1068,42 @@ impl App {
         self.suggestion_index = 0;
         self.handled_slash_command = false;
         self.close_session_picker();
+        self.close_model_picker();
         self.scroll_to_bottom();
         self.tokens_input = 0;
         self.tokens_output = 0;
+    }
+
+    pub fn start_new_session(&mut self) {
+        self.state = AppState::Idle;
+        self.messages.clear();
+        self.stream_buffer.clear();
+        self.reasoning_buffer.clear();
+        self.tool_calls.clear();
+        self.loading_progress = None;
+        self.pending_permission = None;
+        self.pending_permission_response = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+        self.current_skill = None;
+        self.subagent_views.clear();
+        self.current_subagent_index = None;
+        self.input_queue.clear();
+        self.input.clear();
+        self.input_cursor = 0;
+        self.suggestions.clear();
+        self.suggestion_index = 0;
+        self.handled_slash_command = false;
+        self.close_session_picker();
+        self.close_model_picker();
+        self.active_session_id = None;
+        self.tokens_input = 0;
+        self.tokens_output = 0;
+        self.scroll_to_bottom();
+        self.messages.push(DisplayMessage::command(
+            Role::Assistant,
+            "Started a new session.".into(),
+        ));
     }
 
     /// Scroll up: increase offset from bottom to see OLDER content above.
@@ -1060,6 +1203,11 @@ impl App {
     }
 }
 
+fn shell_command_from_input(text: &str) -> Option<String> {
+    text.strip_prefix('!')
+        .map(|cmd| cmd.trim_start().to_string())
+}
+
 /// Returns all agent names including the built-in "default".
 fn all_agent_names(configured: &[String]) -> Vec<String> {
     let mut names = vec!["default".to_string()];
@@ -1067,25 +1215,29 @@ fn all_agent_names(configured: &[String]) -> Vec<String> {
     names
 }
 
-fn random_accent_color(current: Color) -> Color {
-    let palette = [
-        Color::Cyan,
-        Color::Green,
-        Color::Blue,
-        Color::Yellow,
-        Color::Magenta,
-        Color::Red,
-        Color::White,
-    ];
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as usize)
-        .unwrap_or(0);
-    let mut idx = nanos % palette.len();
-    if palette[idx] == current {
-        idx = (idx + 1) % palette.len();
-    }
-    palette[idx]
+fn agent_accent_color(name: &str) -> Color {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    let hue = (hasher.finish() % 360) as f32;
+    let (r, g, b) = hsl_to_rgb(hue, 0.65, 0.55);
+    Color::Rgb(r, g, b)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - ((hp % 2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as u8 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to_u8 = |v: f32| ((v + m).clamp(0.0, 1.0) * 255.0).round() as u8;
+    (to_u8(r1), to_u8(g1), to_u8(b1))
 }
 
 /// Parse a color name string into a ratatui Color.
@@ -1192,6 +1344,38 @@ mod tests {
     }
 
     #[test]
+    fn test_submit_shell_command_creates_pending_action() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "! ls -la".into();
+        app.input_cursor = app.input.len();
+
+        let text = app.submit_input();
+
+        assert!(text.is_empty());
+        assert!(app.handled_slash_command);
+        assert!(matches!(
+            app.pending_slash,
+            Some(SlashAction::RunShell(ref cmd)) if cmd == "ls -la"
+        ));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].source, MessageSource::Command);
+        assert_eq!(app.messages[0].content, "$ ls -la");
+    }
+
+    #[test]
+    fn test_submit_bare_shell_prefix_shows_usage() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "!".into();
+
+        app.submit_input();
+
+        assert!(app.pending_slash.is_none());
+        assert!(app.messages[0].content.contains("Usage: !"));
+    }
+
+    #[test]
     fn test_submit_empty_quits() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -1243,6 +1427,75 @@ mod tests {
     }
 
     #[test]
+    fn test_slash_model_fetches_picker_action() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "/model".into();
+
+        app.submit_input();
+
+        assert!(matches!(app.pending_slash, Some(SlashAction::FetchModels)));
+    }
+
+    #[test]
+    fn test_model_picker_apply_model_and_default() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.open_model_picker(vec![
+            marshaling_protocol::ModelInfo {
+                provider: "github".into(),
+                model_id: "gpt-4o".into(),
+            },
+            marshaling_protocol::ModelInfo {
+                provider: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+            },
+        ]);
+        assert!(app.model_picker_open);
+        assert_eq!(app.model_picker_items.len(), 3);
+
+        app.model_picker_down();
+        let choice = app.selected_model_choice().unwrap();
+        app.apply_model_choice(choice);
+        assert_eq!(app.provider_override.as_deref(), Some("deepseek"));
+        assert_eq!(app.model_override.as_deref(), Some("deepseek-chat"));
+        assert_eq!(app.model_info, "deepseek/deepseek-chat");
+
+        app.apply_model_choice(ModelChoice::Default);
+        assert!(app.provider_override.is_none());
+        assert!(app.model_override.is_none());
+    }
+
+    #[test]
+    fn test_start_new_session_clears_active_session_and_runtime_state() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.messages.push(DisplayMessage {
+            role: Role::User,
+            content: "old".into(),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        app.active_session_id = Some("chat-old".into());
+        app.tokens_input = 10;
+        app.tokens_output = 20;
+        app.stream_buffer = "stream".into();
+        app.reasoning_buffer = "thinking".into();
+        app.input = "draft".into();
+
+        app.start_new_session();
+
+        assert!(app.active_session_id.is_none());
+        assert_eq!(app.tokens_input, 0);
+        assert_eq!(app.tokens_output, 0);
+        assert!(app.stream_buffer.is_empty());
+        assert!(app.reasoning_buffer.is_empty());
+        assert!(app.input.is_empty());
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0].content.contains("new session"));
+    }
+
+    #[test]
     fn test_slash_sessions_blocked_while_running() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -1250,10 +1503,11 @@ mod tests {
         app.input = "/sessions".into();
         app.submit_input();
         assert!(app.pending_slash.is_none());
-        assert!(app
-            .messages
-            .last()
-            .is_some_and(|m| m.content.contains("Cannot open sessions")));
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Cannot open sessions"))
+        );
     }
 
     #[test]
@@ -1261,10 +1515,8 @@ mod tests {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.state = AppState::AgentRunning;
-        app.messages.push(DisplayMessage::command(
-            Role::Assistant,
-            "temp".into(),
-        ));
+        app.messages
+            .push(DisplayMessage::command(Role::Assistant, "temp".into()));
         app.stream_buffer = "stream".into();
         app.reasoning_buffer = "thinking".into();
         app.tool_calls.push(ToolCallDisplay {
@@ -1365,6 +1617,34 @@ mod tests {
         app.input = "/agent default".into();
         app.submit_input();
         assert_eq!(app.current_agent, "default");
+        assert_eq!(app.input_accent, agent_accent_color("default"));
+    }
+
+    #[test]
+    fn test_cycle_agent_keeps_stable_colors() {
+        let cfg = marshaling_protocol::UiConfig {
+            input_accent: "cyan".into(),
+            user_accent: "cyan".into(),
+            agent_names: vec!["plan".into(), "review".into()],
+            subagent_names: vec![],
+            model_info: "test/test-model".into(),
+        };
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        assert_eq!(app.input_accent, agent_accent_color("default"));
+
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "plan");
+        assert_eq!(app.input_accent, agent_accent_color("plan"));
+
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "review");
+        assert_eq!(app.input_accent, agent_accent_color("review"));
+
+        app.input = "/agent plan".into();
+        app.submit_input();
+        assert_eq!(app.current_agent, "plan");
+        assert_eq!(app.input_accent, agent_accent_color("plan"));
     }
 
     #[test]

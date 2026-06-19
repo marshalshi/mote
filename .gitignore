@@ -1,6 +1,7 @@
 target/
 logs/
 history/
+agent_tasks/
 # Config files — canonical location is ~/.config/marshaling/.
 # These entries catch accidental copies left in the project root.
 config.toml

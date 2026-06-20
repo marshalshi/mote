@@ -1193,36 +1193,137 @@ fn render_diff_code_block(
     }
 }
 
+fn centered_text(content: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let text_width = UnicodeWidthStr::width(content);
+    let padding = width.saturating_sub(text_width) / 2;
+    format!("{}{}", " ".repeat(padding), content)
+}
+
+fn is_welcome_empty_state(app: &App) -> bool {
+    app.messages.is_empty()
+        && app.stream_buffer.is_empty()
+        && app.tool_calls.is_empty()
+}
+
+fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
+    let mix = |x: u8, y: u8| -> u8 {
+        (x as f32 + (y as f32 - x as f32) * t.clamp(0.0, 1.0)).round() as u8
+    };
+    Color::Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+fn welcome_logo_lines() -> Vec<String> {
+    vec![
+        "".to_string(),
+        ".S~S*S~S.    %SP~YS%    YSSS~S%SSP   d%SRs  ".to_string(),
+        "SS `Y' SS  dS'     `Sb      SS       dS'    ".to_string(),
+        "SS  Y  SS  SS       SS      SS       SS_Ss  ".to_string(),
+        "SS     SS  SS       SS      SS       SS~SP  ".to_string(),
+        "SS     SS  SS.     .SS      SS       SS.    ".to_string(),
+        "SS     SS    Sbs_sdS        SS       SSbRs  ".to_string(),
+        "       SP                   SP                ".to_string(),
+        "       Y                    Y                 ".to_string(),
+        "".to_string(),
+        "    --         ---          -          .".to_string(), 
+    ]
+}
+
+fn render_welcome_screen(frame: &mut Frame, area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
+    let default_logo = (0xcc, 0xff, 0x00);
+    let hover_logo = (0xb4, 0x5c, 0xff);
+    let logo = welcome_logo_lines();
+    let logo_width = logo
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()))
+        .max()
+        .unwrap_or(0);
+    let start_y = area.y.saturating_add(2);
+    let start_x = area.x + area.width.saturating_sub(logo_width as u16) / 2;
+    let pulse = ((std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as f32
+        / 260.0)
+        .sin()
+        + 1.0)
+        / 2.0;
+
+    for (row_idx, row) in logo.iter().enumerate() {
+        let mut spans = Vec::new();
+        for (col_idx, ch) in row.chars().enumerate() {
+            let style = if ch == ' ' {
+                Style::default()
+            } else if let Some((mx, my)) = app.mouse_position {
+                let x = start_x + col_idx as u16;
+                let y = start_y + row_idx as u16;
+                let dx = mx as i32 - x as i32;
+                let dy = my as i32 - y as i32;
+                let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                if dist <= 4.5 {
+                    let influence = (1.0 - dist / 4.5).clamp(0.0, 1.0);
+                    let mix = (0.35 + pulse * 0.65) * influence;
+                    Style::default()
+                        .fg(blend_rgb(default_logo, hover_logo, mix))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Rgb(default_logo.0, default_logo.1, default_logo.2))
+                        .add_modifier(Modifier::BOLD)
+                }
+            } else {
+                Style::default()
+                    .fg(Color::Rgb(default_logo.0, default_logo.1, default_logo.2))
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(Line::from(spans))),
+            Rect::new(start_x, start_y + row_idx as u16, logo_width as u16, 1),
+        );
+    }
+
+    let subtitle_y = start_y + logo.len() as u16 + 1;
+    let body_style = Style::default().fg(Color::DarkGray);
+    let subtitle_style = Style::default().fg(Color::White);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(Span::styled(
+                centered_text(
+                    "Type a message to start, or use one of the shortcuts below.",
+                    area.width as usize,
+                ),
+                body_style,
+            )),
+            Line::from(Span::styled(
+                centered_text(
+                    "/model  choose model    /sessions  resume chat    !ls  run shell",
+                    area.width as usize,
+                ),
+                body_style,
+            )),
+            Line::from(Span::styled(
+                centered_text(
+                    "/help   all commands    Ctrl+C     quit",
+                    area.width as usize,
+                ),
+                body_style,
+            )),
+        ])),
+        Rect::new(area.x, subtitle_y, area.width, 5),
+    );
+}
+
 fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let grey_content = Style::default().fg(Color::DarkGray);
 
-    // Welcome screen when no messages and not streaming
-    if app.messages.is_empty()
-        && app.stream_buffer.is_empty()
-        && app.tool_calls.is_empty()
-    {
-        lines.push(Line::from(""));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Mote",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Type a message to start, or use one of the shortcuts below.",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  /model  choose model    /sessions  resume chat    !ls  run shell",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  /help   all commands    Ctrl+C     quit",
-            Style::default().fg(Color::DarkGray),
-        )));
+    // Welcome screen is rendered separately so it can respond to mouse hover.
+    if is_welcome_empty_state(app) {
         return lines;
     }
 
@@ -1380,6 +1481,10 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
 // ── Response area ───────────────────────────────────────
 
 fn render_response_area(frame: &mut Frame, area: Rect, app: &App) {
+    if is_welcome_empty_state(app) {
+        render_welcome_screen(frame, area, app);
+        return;
+    }
     let content_width = area.width.saturating_sub(7) as usize; // 4 for accent bar + 2 right padding + 1 scrollbar
     let lines = if let Some(idx) = app.current_subagent_index {
         if let Some(sv) = app.subagent_views.get(idx) {

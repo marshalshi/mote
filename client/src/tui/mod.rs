@@ -6,13 +6,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    Event, EventStream, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEventKind,
+    Event, EventStream, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
-use ratatui::layout::Rect;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use tokio::time::MissedTickBehavior;
 
 use self::keybinding::{Action, Keybindings};
@@ -77,6 +76,19 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     match server_event {
                         Some(event) => handle_server_event(&mut app, event, &mut chat_stream),
                         None => {
+                            if let Some(run_id) = app.active_run_id.clone() {
+                                match client.chat_stream(build_attach_request(&app, run_id)).await {
+                                    Ok(new_stream) => {
+                                        *stream = new_stream;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        app.server_health = ServerHealth::Disconnected(format!(
+                                            "stream reconnect failed: {e}"
+                                        ));
+                                    }
+                                }
+                            }
                             app.pending_permission = None;
                             // Flush any buffered content before going idle
                             if !app.stream_buffer.is_empty() {
@@ -384,7 +396,8 @@ fn build_chat_request(
     app: &App,
     user_msg: String,
 ) -> marshaling_protocol::ChatRequest {
-    let (model_override, provider_override) = app.current_model_override_parts();
+    let (model_override, provider_override) =
+        app.current_model_override_parts();
     // Build conversation history from prior display messages (excluding the latest user message).
     // Only include Conversation-sourced messages — skip command outputs and errors.
     let history: Vec<marshaling_protocol::HistoryMessage> = app.messages
@@ -410,6 +423,27 @@ fn build_chat_request(
         workspace_root: Some(app.workspace_root.clone()),
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
+        run_id: None,
+    }
+}
+
+fn build_attach_request(
+    app: &App,
+    run_id: String,
+) -> marshaling_protocol::ChatRequest {
+    let (model_override, provider_override) =
+        app.current_model_override_parts();
+    marshaling_protocol::ChatRequest {
+        message: String::new(),
+        agent: app.current_agent.clone(),
+        model_override,
+        provider_override,
+        session_id: app.active_session_id.clone(),
+        history: Vec::new(),
+        workspace_root: Some(app.workspace_root.clone()),
+        repo_agents_md: app.repo_agents_md.clone(),
+        runtime_session_key: Some(app.runtime_session_key.clone()),
+        run_id: Some(run_id),
     }
 }
 
@@ -421,6 +455,11 @@ fn handle_server_event(
 ) {
     use marshaling_protocol::ServerEvent;
     match event {
+        ServerEvent::RunStarted { run_id }
+        | ServerEvent::RunAttached { run_id } => {
+            app.active_run_id = Some(run_id);
+        }
+        ServerEvent::RunDetached { .. } => {}
         ServerEvent::TextDelta { data } => {
             app.agent_text_delta(&data);
             app.loading_progress = Some(0.5);
@@ -574,10 +613,21 @@ fn handle_server_event(
             content,
             tokens_input,
             tokens_output,
+        }
+        | ServerEvent::Cancelled {
+            content,
+            tokens_input,
+            tokens_output,
+        }
+        | ServerEvent::NeedsContinuation {
+            content,
+            tokens_input,
+            tokens_output,
         } => {
             app.pending_permission = None;
             app.clear_esc_cancel_arm();
             app.agent_done(&content);
+            app.active_run_id = None;
             app.tokens_input += tokens_input;
             app.tokens_output += tokens_output;
             app.loading_progress = None;
@@ -1000,7 +1050,8 @@ fn handle_permission_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
     match (perm.confirming_always, action) {
         (true, PermissionMouseAction::ConfirmAlways) => {
             app.auto_allowed_tools.insert(perm.tool_name.clone());
-            app.pending_permission_response = Some((perm.id.clone(), true, true));
+            app.pending_permission_response =
+                Some((perm.id.clone(), true, true));
         }
         (true, PermissionMouseAction::CancelAlways) => {
             perm.confirming_always = false;
@@ -1011,10 +1062,12 @@ fn handle_permission_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
             app.pending_permission = Some(perm);
         }
         (false, PermissionMouseAction::AllowOnce) => {
-            app.pending_permission_response = Some((perm.id.clone(), true, false));
+            app.pending_permission_response =
+                Some((perm.id.clone(), true, false));
         }
         (false, PermissionMouseAction::Deny) => {
-            app.pending_permission_response = Some((perm.id.clone(), false, false));
+            app.pending_permission_response =
+                Some((perm.id.clone(), false, false));
         }
         _ => {
             app.pending_permission = Some(perm);
@@ -1041,8 +1094,13 @@ fn permission_popup_action_at(
     let content_width = inner.width.saturating_sub(2) as usize;
 
     let mut button_row_index: usize = 4;
-    let mut args_lines = render::json_to_yaml_lines_for_popup(&perm.args, content_width);
-    let max_args = inner.height.saturating_sub(if perm.confirming_always { 8 } else { 7 }) as usize;
+    let mut args_lines =
+        render::json_to_yaml_lines_for_popup(&perm.args, content_width);
+    let max_args =
+        inner
+            .height
+            .saturating_sub(if perm.confirming_always { 8 } else { 7 })
+            as usize;
     if args_lines.len() > max_args {
         args_lines.truncate(max_args.saturating_sub(1));
         args_lines.push("... (args truncated)".into());
@@ -1060,9 +1118,29 @@ fn permission_popup_action_at(
     }
 
     if perm.confirming_always {
-        button_hit(column, inner.x, &[(" Y ", PermissionMouseAction::ConfirmAlways), (" Confirm   ", PermissionMouseAction::ConfirmAlways), (" N ", PermissionMouseAction::CancelAlways), (" Cancel", PermissionMouseAction::CancelAlways)])
+        button_hit(
+            column,
+            inner.x,
+            &[
+                (" Y ", PermissionMouseAction::ConfirmAlways),
+                (" Confirm   ", PermissionMouseAction::ConfirmAlways),
+                (" N ", PermissionMouseAction::CancelAlways),
+                (" Cancel", PermissionMouseAction::CancelAlways),
+            ],
+        )
     } else {
-        button_hit(column, inner.x, &[(" Y ", PermissionMouseAction::AllowOnce), (" Allow once   ", PermissionMouseAction::AllowOnce), (" A ", PermissionMouseAction::AllowAlways), (" Allow always   ", PermissionMouseAction::AllowAlways), (" N ", PermissionMouseAction::Deny), (" Deny", PermissionMouseAction::Deny)])
+        button_hit(
+            column,
+            inner.x,
+            &[
+                (" Y ", PermissionMouseAction::AllowOnce),
+                (" Allow once   ", PermissionMouseAction::AllowOnce),
+                (" A ", PermissionMouseAction::AllowAlways),
+                (" Allow always   ", PermissionMouseAction::AllowAlways),
+                (" N ", PermissionMouseAction::Deny),
+                (" Deny", PermissionMouseAction::Deny),
+            ],
+        )
     }
 }
 
@@ -1284,14 +1362,22 @@ mod tests {
         let action = button_hit(
             5,
             0,
-            &[(" Y ", PermissionMouseAction::AllowOnce), (" Allow once   ", PermissionMouseAction::AllowOnce), (" A ", PermissionMouseAction::AllowAlways)],
+            &[
+                (" Y ", PermissionMouseAction::AllowOnce),
+                (" Allow once   ", PermissionMouseAction::AllowOnce),
+                (" A ", PermissionMouseAction::AllowAlways),
+            ],
         );
         assert_eq!(action, Some(PermissionMouseAction::AllowOnce));
 
         let action = button_hit(
             17,
             0,
-            &[(" Y ", PermissionMouseAction::AllowOnce), (" Allow once   ", PermissionMouseAction::AllowOnce), (" A ", PermissionMouseAction::AllowAlways)],
+            &[
+                (" Y ", PermissionMouseAction::AllowOnce),
+                (" Allow once   ", PermissionMouseAction::AllowOnce),
+                (" A ", PermissionMouseAction::AllowAlways),
+            ],
         );
         assert_eq!(action, Some(PermissionMouseAction::AllowAlways));
     }

@@ -338,16 +338,16 @@ pub fn build_system_reminder(ctx: &ReminderContext) -> String {
     };
 
     let guidance = if ctx.step == 1 {
-        "You are at the start of a task. Use the tools above to accomplish the user's request."
+        "You are at the start of a task. Use the tools above to accomplish the user's request. When the request is fully complete, call finish_task with the final answer. Do not stop with plain text unless you are blocked."
     } else {
-        "Continue the task based on these results. Do not repeat tool calls that already succeeded."
+        "Continue the task based on these results. Do not repeat tool calls that already succeeded. When the request is fully complete, call finish_task with the final answer."
     };
 
     format!(
         "<system-reminder>\n\
          Current time: {}\n\
          Working directory: {}\n\
-         Step: Turn {} of {}\n\n\
+         Step: Turn {} (soft budget: {})\n\n\
          {}\
          {}\
          {}\
@@ -633,7 +633,7 @@ Skill content here."#;
         let reminder = build_system_reminder(&ctx);
         assert!(reminder.contains("<system-reminder>"));
         assert!(reminder.contains("</system-reminder>"));
-        assert!(reminder.contains("Turn 1 of 10"));
+        assert!(reminder.contains("Turn 1 (soft budget: 10)"));
         assert!(reminder.contains("/tmp/test"));
         assert!(reminder.contains("<reminder>"));
         // First turn should NOT have <last_turn_results>
@@ -662,7 +662,7 @@ Skill content here."#;
             last_user_message: Some("find the config file".into()),
         };
         let reminder = build_system_reminder(&ctx);
-        assert!(reminder.contains("Turn 2 of 10"));
+        assert!(reminder.contains("Turn 2 (soft budget: 10)"));
         assert!(reminder.contains("<last_turn_results>"));
         assert!(reminder.contains("read(\"file contents...\") → Success"));
         assert!(reminder.contains("bash(\"command not found\") → Failed"));

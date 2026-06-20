@@ -23,7 +23,6 @@ impl OllamaProvider {
         Ok(Self {
             base_url: config.ollama_base_url()?,
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .context("Failed to create HTTP client")?,
         })
@@ -230,6 +229,7 @@ impl LlmProvider for OllamaProvider {
         let mut text_content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut usage = Usage::default();
+        let mut saw_done = false;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -292,6 +292,7 @@ impl LlmProvider for OllamaProvider {
                                     }
                                 }
                                 if chunk.done {
+                                    saw_done = true;
                                     usage = Usage {
                                         prompt_tokens: chunk
                                             .prompt_eval_count
@@ -311,6 +312,13 @@ impl LlmProvider for OllamaProvider {
                     None => break,
                 }
             }
+        }
+
+        if !saw_done {
+            let _ = sender.send(Err(anyhow::anyhow!(
+                "Ollama stream ended before done=true"
+            )));
+            return;
         }
 
         let result = finalize_ollama(&mut text_content, &mut tool_calls, usage);

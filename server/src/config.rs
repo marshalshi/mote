@@ -179,7 +179,8 @@ pub struct ServerConfig {
     /// Port to listen on (default: 9847).
     #[serde(default = "default_server_port")]
     pub port: u16,
-    /// Maximum agent loop steps per request (default: 10).
+    /// Soft reminder budget shown to the agent loop (default: 10). The loop
+    /// keeps running until explicit finish_task or user cancellation.
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
 }

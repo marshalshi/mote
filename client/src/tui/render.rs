@@ -150,20 +150,19 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
         for (i, item) in app.model_picker_items[start..end].iter().enumerate() {
             let i = start + i;
             let selected = i == app.model_picker_index;
-            if let super::state::ModelChoice::Model { provider, .. } = item {
-                if last_provider != Some(provider.as_str()) {
-                    if wrote_provider_header {
-                        lines.push(Line::from(""));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        provider.clone(),
-                        Style::default()
-                            .fg(app.input_accent)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    last_provider = Some(provider.as_str());
-                    wrote_provider_header = true;
+            let super::state::ModelChoice::Model { provider, .. } = item;
+            if last_provider != Some(provider.as_str()) {
+                if wrote_provider_header {
+                    lines.push(Line::from(""));
                 }
+                lines.push(Line::from(Span::styled(
+                    provider.clone(),
+                    Style::default()
+                        .fg(app.input_accent)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                last_provider = Some(provider.as_str());
+                wrote_provider_header = true;
             }
             let style = picker_item_style(selected);
             lines.push(Line::from(vec![
@@ -188,7 +187,6 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 fn model_choice_label(choice: &super::state::ModelChoice) -> String {
     match choice {
-        super::state::ModelChoice::Default => "Default model".into(),
         super::state::ModelChoice::Model { model_id, .. } => model_id.clone(),
     }
 }

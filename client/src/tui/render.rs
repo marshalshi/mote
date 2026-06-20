@@ -68,18 +68,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
-    let rect = centered_rect(
-        area,
-        area.width.min(92).max(44),
-        area.height.min(22).max(9),
-    );
-    frame.render_widget(Clear, rect);
-
-    let block = Block::default()
-        .title(" Sessions ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.input_accent));
-    frame.render_widget(block, rect);
+    let rect = render_picker_popup(frame, area, app.input_accent, " Sessions ");
 
     let inner = inset(rect, 2, 1);
     let mut lines: Vec<Line> = vec![
@@ -112,13 +101,7 @@ fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
             let name = s.summary.as_deref().unwrap_or("(no name)");
             lines.push(Line::from(vec![Span::styled(
                 format!("{} {}", marker, name),
-                if selected {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                },
+                picker_item_style(selected),
             )]));
             lines.push(Line::from(Span::styled(
                 format!("   {} · {} · {} msgs", s.id, s.model, s.message_count),
@@ -141,17 +124,8 @@ fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
-    let rect = centered_rect(
-        area,
-        area.width.min(92).max(44),
-        area.height.min(22).max(9),
-    );
-    frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(" Model Picker ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.input_accent));
-    frame.render_widget(block, rect);
+    let rect =
+        render_picker_popup(frame, area, app.input_accent, " Model Picker ");
     let inner = inset(rect, 2, 1);
 
     let mut lines: Vec<Line> = vec![
@@ -176,28 +150,21 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
         for (i, item) in app.model_picker_items[start..end].iter().enumerate() {
             let i = start + i;
             let selected = i == app.model_picker_index;
-            if let super::state::ModelChoice::Model { provider, .. } = item {
-                if last_provider != Some(provider.as_str()) {
-                    if wrote_provider_header {
-                        lines.push(Line::from(""));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        provider.clone(),
-                        Style::default()
-                            .fg(app.input_accent)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    last_provider = Some(provider.as_str());
-                    wrote_provider_header = true;
+            let super::state::ModelChoice::Model { provider, .. } = item;
+            if last_provider != Some(provider.as_str()) {
+                if wrote_provider_header {
+                    lines.push(Line::from(""));
                 }
+                lines.push(Line::from(Span::styled(
+                    provider.clone(),
+                    Style::default()
+                        .fg(app.input_accent)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                last_provider = Some(provider.as_str());
+                wrote_provider_header = true;
             }
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
+            let style = picker_item_style(selected);
             lines.push(Line::from(vec![
                 Span::styled(if selected { "› " } else { "  " }, style),
                 Span::styled(model_choice_label(item), style),
@@ -220,8 +187,37 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
 
 fn model_choice_label(choice: &super::state::ModelChoice) -> String {
     match choice {
-        super::state::ModelChoice::Default => "Default model".into(),
         super::state::ModelChoice::Model { model_id, .. } => model_id.clone(),
+    }
+}
+
+fn render_picker_popup(
+    frame: &mut Frame,
+    area: Rect,
+    accent: Color,
+    title: &'static str,
+) -> Rect {
+    let rect = centered_rect(
+        area,
+        area.width.min(92).max(44),
+        area.height.min(22).max(9),
+    );
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent));
+    frame.render_widget(block, rect);
+    rect
+}
+
+fn picker_item_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
     }
 }
 
@@ -449,7 +445,6 @@ fn render_markdown(
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(text, opts);
 
-    // Style stack to handle nested formatting
     let mut bold = false;
     let mut italic = false;
     let mut in_heading = false;
@@ -461,67 +456,19 @@ fn render_markdown(
     let mut code_buf = String::new();
     let mut in_table_head = false;
     let mut table_state: Option<MarkdownTableState> = None;
-
-    // Current line spans being built
     let mut current_spans: Vec<Span<'static>> = Vec::new();
-
-    let push_blank_line = |lines: &mut Vec<Line<'static>>, accent: Style| {
-        lines.push(Line::from(vec![Span::styled(
-            accent_prefix.to_string(),
-            accent,
-        )]));
-    };
-
-    let flush_line = |lines: &mut Vec<Line<'static>>,
-                      spans: &mut Vec<Span<'static>>,
-                      accent: Style,
-                      prefix: &str,
-                      max_w: usize| {
-        if spans.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(accent_prefix.to_string(), accent),
-                Span::raw(prefix.to_string()),
-            ]));
-            return;
-        }
-        // Build the full text for word-wrapping measurement
-        let full_text: String =
-            spans.iter().map(|s| s.content.as_ref()).collect();
-        let prefixed = format!("{}{}", prefix, full_text);
-        let wrapped = word_wrap_line(&prefixed, max_w);
-        for (i, part) in wrapped.iter().enumerate() {
-            if i == 0 {
-                let mut line_spans =
-                    vec![Span::styled(accent_prefix.to_string(), accent)];
-                // Re-apply the original styling to the first line
-                line_spans.push(Span::styled(
-                    part.clone(),
-                    spans.first().map(|s| s.style).unwrap_or_default(),
-                ));
-                lines.push(Line::from(line_spans));
-            } else {
-                let mut line_spans =
-                    vec![Span::styled(accent_prefix.to_string(), accent)];
-                line_spans.push(Span::styled(
-                    format!("{}{}", " ".repeat(prefix.len()), part),
-                    spans.first().map(|s| s.style).unwrap_or_default(),
-                ));
-                lines.push(Line::from(line_spans));
-            }
-        }
-        spans.clear();
-    };
 
     for event in parser {
         match event {
             Event::Start(Tag::Table(alignments)) => {
                 if !current_spans.is_empty() {
-                    flush_line(
+                    flush_wrapped_spans(
                         lines,
                         &mut current_spans,
-                        accent_style,
-                        if in_blockquote { "  │ " } else { "" },
                         max_width,
+                        accent_prefix,
+                        accent_style,
+                        blockquote_prefix(in_blockquote),
                     );
                 }
                 table_state = Some(MarkdownTableState::new(alignments));
@@ -535,7 +482,7 @@ fn render_markdown(
                         accent_style,
                         max_width,
                     );
-                    push_blank_line(lines, accent_style);
+                    push_accent_blank_line(lines, accent_prefix, accent_style);
                 }
             }
             Event::Start(Tag::TableHead) => {
@@ -572,24 +519,18 @@ fn render_markdown(
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 in_heading = true;
-                let _ = level; // all headings get bold treatment
+                let _ = level;
             }
             Event::End(TagEnd::Heading(_)) => {
-                // Flush heading line with bold
-                let heading_text: String =
-                    current_spans.iter().map(|s| s.content.as_ref()).collect();
-                let wrapped = word_wrap_line(&heading_text, max_width);
-                for part in wrapped {
-                    lines.push(Line::from(vec![
-                        Span::styled(accent_prefix.to_string(), accent_style),
-                        Span::styled(
-                            part,
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                }
+                push_heading_lines(
+                    lines,
+                    &current_spans,
+                    max_width,
+                    accent_prefix,
+                    accent_style,
+                );
                 current_spans.clear();
-                push_blank_line(lines, accent_style);
+                push_accent_blank_line(lines, accent_prefix, accent_style);
                 in_heading = false;
             }
             Event::Start(Tag::Strong) => bold = true,
@@ -606,48 +547,32 @@ fn render_markdown(
                 list_depth = list_depth.saturating_sub(1);
                 if list_depth == 0 {
                     ordered_index = None;
-                    push_blank_line(lines, accent_style);
+                    push_accent_blank_line(lines, accent_prefix, accent_style);
                 }
             }
             Event::Start(Tag::Item) => {}
             Event::End(TagEnd::Item) => {
-                // Flush the list item
-                let item_text: String =
-                    current_spans.iter().map(|s| s.content.as_ref()).collect();
-                let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
-                let bullet = if let Some(ref mut idx) = ordered_index {
-                    let s = format!("{}{}. ", indent, idx);
-                    *idx += 1;
-                    s
-                } else {
-                    format!(
-                        "{} {} ",
-                        indent,
-                        if list_depth <= 1 {
-                            "\u{2022}"
-                        } else {
-                            "\u{25E6}"
-                        }
-                    )
-                };
-                let prefixed = format!("{}{}", bullet, item_text);
-                let style =
-                    current_spans.first().map(|s| s.style).unwrap_or_default();
-                let wrapped = word_wrap_line(&prefixed, max_width);
-                for (i, part) in wrapped.iter().enumerate() {
-                    let mut line_spans = vec![Span::styled(
-                        accent_prefix.to_string(),
-                        accent_style,
-                    )];
-                    if i > 0 {
-                        line_spans.push(Span::styled(
-                            format!("{}{}", " ".repeat(bullet.len()), part),
-                            style,
-                        ));
+                let item_text: String = current_spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                let bullet = list_item_prefix(list_depth, &mut ordered_index);
+                let style = current_spans
+                    .first()
+                    .map(|span| span.style)
+                    .unwrap_or_default();
+                let wrapped =
+                    word_wrap_line(&format!("{bullet}{item_text}"), max_width);
+                for (index, part) in wrapped.iter().enumerate() {
+                    let content = if index == 0 {
+                        part.clone()
                     } else {
-                        line_spans.push(Span::styled(part.clone(), style));
-                    }
-                    lines.push(Line::from(line_spans));
+                        format!("{}{}", " ".repeat(bullet.len()), part)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(accent_prefix.to_string(), accent_style),
+                        Span::styled(content, style),
+                    ]));
                 }
                 current_spans.clear();
             }
@@ -660,7 +585,6 @@ fn render_markdown(
                 code_buf.clear();
             }
             Event::End(TagEnd::CodeBlock) => {
-                // Syntax-highlight the code block
                 let code = code_buf.trim_matches('\n');
                 if !code.is_empty() {
                     if code_lang.eq_ignore_ascii_case("diff") {
@@ -683,26 +607,25 @@ fn render_markdown(
                         }
                     }
                 }
-                push_blank_line(lines, accent_style);
+                push_accent_blank_line(lines, accent_prefix, accent_style);
                 in_code_block = false;
                 code_buf.clear();
             }
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
                 if !current_spans.is_empty() {
-                    let prefix = if in_blockquote { "  │ " } else { "" };
-                    flush_line(
+                    flush_wrapped_spans(
                         lines,
                         &mut current_spans,
-                        accent_style,
-                        prefix,
                         max_width,
+                        accent_prefix,
+                        accent_style,
+                        blockquote_prefix(in_blockquote),
                     );
                 }
-                push_blank_line(lines, accent_style);
+                push_accent_blank_line(lines, accent_prefix, accent_style);
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
-                // Just show the link text in blue underlined
                 let _ = dest_url;
             }
             Event::End(TagEnd::Link) => {}
@@ -734,7 +657,6 @@ fn render_markdown(
                 if let Some(table) = table_state.as_mut() {
                     table.push_text(&code);
                 } else {
-                    // Inline code: dim background style
                     current_spans.push(Span::styled(
                         format!("`{}`", code),
                         Style::default().fg(Color::Yellow),
@@ -752,34 +674,127 @@ fn render_markdown(
                 if let Some(table) = table_state.as_mut() {
                     table.push_text(" ");
                 } else if !current_spans.is_empty() {
-                    let prefix = if in_blockquote { "  │ " } else { "" };
-                    flush_line(
+                    flush_wrapped_spans(
                         lines,
                         &mut current_spans,
-                        accent_style,
-                        prefix,
                         max_width,
+                        accent_prefix,
+                        accent_style,
+                        blockquote_prefix(in_blockquote),
                     );
                 }
             }
             Event::Rule => {
-                push_blank_line(lines, accent_style);
+                push_accent_blank_line(lines, accent_prefix, accent_style);
                 let rule = "─".repeat(max_width.min(40));
                 lines.push(Line::from(vec![
                     Span::styled(accent_prefix.to_string(), accent_style),
                     Span::styled(rule, Style::default().fg(Color::DarkGray)),
                 ]));
-                push_blank_line(lines, accent_style);
+                push_accent_blank_line(lines, accent_prefix, accent_style);
             }
             _ => {}
         }
     }
 
-    // Flush any remaining spans
     if !current_spans.is_empty() {
-        let prefix = if in_blockquote { "  │ " } else { "" };
-        flush_line(lines, &mut current_spans, accent_style, prefix, max_width);
+        flush_wrapped_spans(
+            lines,
+            &mut current_spans,
+            max_width,
+            accent_prefix,
+            accent_style,
+            blockquote_prefix(in_blockquote),
+        );
     }
+}
+
+fn push_accent_blank_line(
+    lines: &mut Vec<Line<'static>>,
+    accent_prefix: &str,
+    accent_style: Style,
+) {
+    lines.push(Line::from(vec![Span::styled(
+        accent_prefix.to_string(),
+        accent_style,
+    )]));
+}
+
+fn flush_wrapped_spans(
+    lines: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    max_width: usize,
+    accent_prefix: &str,
+    accent_style: Style,
+    prefix: &str,
+) {
+    if spans.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(accent_prefix.to_string(), accent_style),
+            Span::raw(prefix.to_string()),
+        ]));
+        return;
+    }
+
+    let full_text: String =
+        spans.iter().map(|span| span.content.as_ref()).collect();
+    let wrapped = word_wrap_line(&format!("{prefix}{full_text}"), max_width);
+    let style = spans.first().map(|span| span.style).unwrap_or_default();
+    let continuation_indent = " ".repeat(prefix.len());
+
+    for (index, part) in wrapped.iter().enumerate() {
+        let content = if index == 0 {
+            part.clone()
+        } else {
+            format!("{continuation_indent}{part}")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(accent_prefix.to_string(), accent_style),
+            Span::styled(content, style),
+        ]));
+    }
+
+    spans.clear();
+}
+
+fn push_heading_lines(
+    lines: &mut Vec<Line<'static>>,
+    spans: &[Span<'static>],
+    max_width: usize,
+    accent_prefix: &str,
+    accent_style: Style,
+) {
+    let heading_text: String =
+        spans.iter().map(|span| span.content.as_ref()).collect();
+    for part in word_wrap_line(&heading_text, max_width) {
+        lines.push(Line::from(vec![
+            Span::styled(accent_prefix.to_string(), accent_style),
+            Span::styled(part, Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+    }
+}
+
+fn list_item_prefix(
+    list_depth: u32,
+    ordered_index: &mut Option<u64>,
+) -> String {
+    let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
+    if let Some(index) = ordered_index.as_mut() {
+        let prefix = format!("{indent}{index}. ");
+        *index += 1;
+        prefix
+    } else {
+        let bullet = if list_depth <= 1 {
+            "\u{2022}"
+        } else {
+            "\u{25E6}"
+        };
+        format!("{indent} {bullet} ")
+    }
+}
+
+fn blockquote_prefix(in_blockquote: bool) -> &'static str {
+    if in_blockquote { "  │ " } else { "" }
 }
 
 #[derive(Debug, Clone)]

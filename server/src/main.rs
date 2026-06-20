@@ -127,12 +127,23 @@ async fn get_config(
         .map(|(n, _)| n.clone())
         .collect();
     subagent_names.sort();
+    let mut agent_model_info = HashMap::new();
+    agent_model_info.insert("default".to_string(), cfg.effective_model_info(None));
+    for (name, agent_cfg) in state
+        .merged_agents
+        .iter()
+        .filter(|(_, a)| a.is_user_selectable())
+    {
+        agent_model_info
+            .insert(name.clone(), cfg.effective_model_info(agent_cfg.model.as_deref()));
+    }
     Json(marshaling_protocol::UiConfig {
         input_accent: cfg.input_accent().to_string(),
         user_accent: cfg.user_accent().to_string(),
         agent_names,
         subagent_names,
         model_info: format!("{}/{}", cfg.model.provider, cfg.model.model_id),
+        agent_model_info,
     })
 }
 

@@ -11,6 +11,7 @@ use ratatui::{
 use std::sync::OnceLock;
 
 use super::state::{App, AppState, SubagentView};
+use dirs;
 
 /// Paint a frame.
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -266,7 +267,7 @@ fn render_permission_popup(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
     ];
 
-    let mut args_lines = json_to_yaml_lines(&perm.args, content_width);
+    let mut args_lines = json_to_yaml_lines_for_popup(&perm.args, content_width);
     let max_args =
         inner
             .height
@@ -661,14 +662,24 @@ fn render_markdown(
                 // Syntax-highlight the code block
                 let code = code_buf.trim_matches('\n');
                 if !code.is_empty() {
-                    let highlighted = highlight_code(&code_lang, code);
-                    for hl_line in highlighted {
-                        let mut spans = vec![Span::styled(
-                            accent_prefix.to_string(),
+                    if code_lang.eq_ignore_ascii_case("diff") {
+                        render_diff_code_block(
+                            lines,
+                            code,
+                            accent_prefix,
                             accent_style,
-                        )];
-                        spans.extend(hl_line.into_iter());
-                        lines.push(Line::from(spans));
+                            max_width,
+                        );
+                    } else {
+                        let highlighted = highlight_code(&code_lang, code);
+                        for hl_line in highlighted {
+                            let mut spans = vec![Span::styled(
+                                accent_prefix.to_string(),
+                                accent_style,
+                            )];
+                            spans.extend(hl_line.into_iter());
+                            lines.push(Line::from(spans));
+                        }
                     }
                 }
                 push_blank_line(lines, accent_style);
@@ -1094,22 +1105,32 @@ fn push_tool_changes(
                     ),
                 ]));
                 for dl in &ch.diff_lines {
-                    let (prefix, color) = match dl.kind {
+                    let (prefix, style) = match dl.kind {
                         marshaling_protocol::DiffLineKind::Added => {
-                            ("+", Color::Green)
+                            (
+                                "+",
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .bg(Color::Rgb(19, 48, 35)),
+                            )
                         }
                         marshaling_protocol::DiffLineKind::Removed => {
-                            ("-", Color::Red)
+                            (
+                                "-",
+                                Style::default()
+                                    .fg(Color::Red)
+                                    .bg(Color::Rgb(58, 29, 33)),
+                            )
                         }
                         marshaling_protocol::DiffLineKind::Context => {
-                            (" ", Color::DarkGray)
+                            (" ", Style::default().fg(Color::DarkGray))
                         }
                     };
                     lines.push(Line::from(vec![
                         Span::styled("    ", Style::default()),
                         Span::styled(
                             format!(" {}{}", prefix, dl.content),
-                            Style::default().fg(color),
+                            style,
                         ),
                     ]));
                 }
@@ -1141,6 +1162,33 @@ fn push_tool_changes(
                     ),
                 ]));
             }
+        }
+    }
+}
+
+fn render_diff_code_block(
+    lines: &mut Vec<Line<'static>>,
+    code: &str,
+    accent_prefix: &str,
+    accent_style: Style,
+    max_width: usize,
+) {
+    for raw_line in code.trim_matches('\n').split('\n') {
+        let style = if raw_line.starts_with('+') {
+            Style::default()
+                .fg(Color::Green)
+                .bg(Color::Rgb(19, 48, 35))
+        } else if raw_line.starts_with('-') {
+            Style::default().fg(Color::Red).bg(Color::Rgb(58, 29, 33))
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let wrapped = word_wrap_line(raw_line, max_width);
+        for part in wrapped {
+            lines.push(Line::from(vec![
+                Span::styled(accent_prefix.to_string(), accent_style),
+                Span::styled(part, style),
+            ]));
         }
     }
 }
@@ -1480,7 +1528,10 @@ fn build_subagent_lines(
 
 /// Convert a JSON args string into YAML-like display lines.
 /// Handles flat objects, simple values, and arrays of strings.
-fn json_to_yaml_lines(json_str: &str, max_width: usize) -> Vec<String> {
+pub(crate) fn json_to_yaml_lines_for_popup(
+    json_str: &str,
+    max_width: usize,
+) -> Vec<String> {
     if json_str.is_empty() || json_str == "null" {
         return Vec::new();
     }
@@ -1621,9 +1672,7 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
             display_cursor,
             content_width.saturating_sub(prompt_width),
         );
-        let content_x = 4 + prompt_width + col; // 4 for accent bar " ▌  " + prompt
-        let cx = area.x
-            + content_x.min(area.width.saturating_sub(6) as usize) as u16;
+        let cx = area.x + input_cursor_screen_x(area.width, prompt_width, col);
         let cy = area.y + 2 + visual_row as u16; // +1 for spacer +1 for top accent padding
         frame.set_cursor_position(ratatui::prelude::Position::new(cx, cy));
     }
@@ -1666,10 +1715,27 @@ fn cursor_pos_after_wrap(
     (col, visual_row)
 }
 
+fn input_cursor_screen_x(area_width: u16, prompt_width: usize, col: usize) -> u16 {
+    let content_x = 4 + prompt_width + col;
+    let max_cursor_x = area_width.saturating_sub(2) as usize;
+    content_x.min(max_cursor_x) as u16
+}
+
 // ── Status bar ──────────────────────────────────────────
 
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    // Agent name on the left, follows current accent color. Blinks when agent is running.
+    // Split the 2-line status area into status + workspace path.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    render_status_line(frame, rows[0], app);
+    render_workspace_line(frame, rows[1], app);
+}
+
+/// First status line: agent name, hints, model, tokens.
+fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
     let is_running = matches!(
         app.state,
         AppState::AgentRunning | AppState::WaitingResponse
@@ -1678,7 +1744,6 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     if is_running {
         agent_style = agent_style.add_modifier(Modifier::SLOW_BLINK);
     }
-    // Capitalize agent name for display
     let display_name = {
         let s = app.current_agent.as_str();
         let mut chars = s.chars();
@@ -1696,7 +1761,6 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     };
     let left = format!(" {}{} ", display_name, server_status);
 
-    // Right side: model, subagent info, tokens (no agent name — it's on the left now)
     let right_info = if let Some(idx) = app.current_subagent_index {
         if let Some(sv) = app.subagent_views.get(idx) {
             let status = if sv.done { "done" } else { "running" };
@@ -1769,6 +1833,44 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(right, style));
     }
     frame.render_widget(Paragraph::new(Text::from(Line::from(spans))), area);
+}
+
+/// Second status line: current working directory / workspace root.
+fn render_workspace_line(frame: &mut Frame, area: Rect, app: &App) {
+    let style = Style::default().fg(Color::DarkGray);
+    let max_width = area.width.max(5) as usize;
+
+    let path = &app.workspace_root;
+    if path.is_empty() {
+        return;
+    }
+
+    // Abbreviate home directory to ~ for brevity.
+    let home = dirs::home_dir().and_then(|h| h.to_str().map(|s| s.to_owned()));
+    let display = home
+        .as_ref()
+        .and_then(|h| path.strip_prefix(h).map(|tail| format!("~{tail}")))
+        .unwrap_or_else(|| path.clone());
+
+    let label = " ";
+    let full = format!("{label}{display}");
+
+    let text = if full.len() > max_width {
+        let avail = max_width.saturating_sub(3); // " …" prefix
+        if avail <= 1 {
+            "…".to_string()
+        } else {
+            let start = display.len().saturating_sub(avail);
+            format!(" …{}", &display[start..])
+        }
+    } else {
+        full
+    };
+
+    frame.render_widget(
+        Paragraph::new(Text::from(Line::from(vec![Span::styled(text, style)]))),
+        area,
+    );
 }
 
 /// Loading bar: shows a spinner with context during agent activity.
@@ -1933,12 +2035,83 @@ mod tests {
     }
 
     #[test]
+    fn test_input_cursor_screen_x_allows_end_of_line_position() {
+        // area.width = 20
+        // accent = 4, prompt = 2, text width = 12, so cursor after the final
+        // character should land at x = 18, not be clamped left to 14.
+        assert_eq!(input_cursor_screen_x(20, 2, 12), 18);
+    }
+
+    #[test]
     fn test_session_picker_window_centers_and_clamps() {
         assert_eq!(session_picker_window(0, 0, 4), (0, 0));
         assert_eq!(session_picker_window(10, 0, 3), (0, 3));
         assert_eq!(session_picker_window(10, 5, 3), (4, 7));
         assert_eq!(session_picker_window(10, 9, 3), (7, 10));
         assert_eq!(session_picker_window(4, 100, 3), (1, 4));
+    }
+
+    #[test]
+    fn test_push_tool_changes_styles_added_and_removed_backgrounds() {
+        let mut lines = Vec::new();
+        push_tool_changes(
+            &mut lines,
+            &[marshaling_protocol::FileChange {
+                path: "src/main.rs".into(),
+                kind: marshaling_protocol::FileChangeKind::Modified,
+                diff_lines: vec![
+                    marshaling_protocol::DiffLine {
+                        kind: marshaling_protocol::DiffLineKind::Added,
+                        content: "let added = true;".into(),
+                    },
+                    marshaling_protocol::DiffLine {
+                        kind: marshaling_protocol::DiffLineKind::Removed,
+                        content: "let removed = false;".into(),
+                    },
+                ],
+                truncated: false,
+            }],
+        );
+
+        let added = &lines[1].spans[1];
+        let removed = &lines[2].spans[1];
+        assert_eq!(added.style.bg, Some(Color::Rgb(19, 48, 35)));
+        assert_eq!(removed.style.bg, Some(Color::Rgb(58, 29, 33)));
+    }
+
+    #[test]
+    fn test_markdown_diff_code_block_preserves_plus_minus_and_backgrounds() {
+        let mut lines = Vec::new();
+        let accent = Style::default().fg(Color::Cyan);
+        let base = Style::default();
+        render_markdown(
+            &mut lines,
+            "```diff\ndiff -- src/main.rs\n+let added = true;\n-let removed = false;\n```",
+            80,
+            " ▌",
+            accent,
+            base,
+        );
+
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|s| s.content.as_ref().contains("+let added = true;"))
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|s| s.content.as_ref().contains("-let removed = false;"))
+        }));
+
+        let added = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|s| s.content.as_ref().contains("+let added = true;"))
+            .unwrap();
+        let removed = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|s| s.content.as_ref().contains("-let removed = false;"))
+            .unwrap();
+        assert_eq!(added.style.bg, Some(Color::Rgb(19, 48, 35)));
+        assert_eq!(removed.style.bg, Some(Color::Rgb(58, 29, 33)));
     }
 
     // ── Markdown rendering tests ───────────────────────────

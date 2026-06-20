@@ -330,6 +330,12 @@ impl Config {
         def.unwrap_or_else(|| self.model.model_id.clone())
     }
 
+    pub fn effective_model_info(&self, agent_override: Option<&str>) -> String {
+        let provider = self.effective_provider(agent_override);
+        let model_id = self.effective_model_id(agent_override);
+        format!("{provider}/{model_id}")
+    }
+
     pub fn effective_temperature(&self, agent_override: Option<f32>) -> f32 {
         agent_override.unwrap_or(self.model.temperature)
     }

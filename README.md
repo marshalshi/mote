@@ -252,6 +252,26 @@ You can override log directory in `config.toml`:
 dir = "logs/"
 ```
 
+## Docker sandbox
+
+Mote can run entirely inside a Docker container for workspace isolation.
+Built-in tools (read, write, bash, grep, glob) cannot escape the mounted workspace directory.
+
+```bash
+# Build the image
+docker build -f docker/Dockerfile -t mote:latest .
+
+# Run with current directory as the sandboxed workspace
+./docker/run.sh
+
+# Run with a specific project directory
+./docker/run.sh /path/to/your/project
+```
+
+Your `~/.config/mote/` is mounted automatically, so config, auth keys, and session history carry over.
+
+See [docker/README.md](docker/README.md) for the full guide.
+
 ## Architecture
 
 Mote is split into a **server** (LLM providers, agent loop, tool execution) and a **client** (TUI, keybindings, rendering), communicating via WebSocket + HTTP.

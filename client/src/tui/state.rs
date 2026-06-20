@@ -1,7 +1,7 @@
 use crate::llm::Role;
 use marshaling_protocol::{ModelInfo, ToolCallDisplay, ToolStatus};
 use ratatui::style::Color;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,8 @@ pub struct App {
     pub scroll_offset: usize,
     pub auto_scroll: bool,
     pub model_info: String,
+    pub default_model_info: String,
+    pub agent_model_info: HashMap<String, String>,
     pub tokens_input: u64,
     pub tokens_output: u64,
     pub stream_buffer: String,
@@ -77,11 +79,8 @@ pub struct App {
     /// Tool calls currently being executed (during agent loop).
     pub tool_calls: Vec<ToolCallDisplay>,
 
-    /// Override the model_id (set by /models <name>).
-    pub model_override: Option<String>,
-
-    /// Override the provider name (set alongside model_override).
-    pub provider_override: Option<String>,
+    /// Per-agent model overrides selected by the user.
+    pub agent_model_overrides: HashMap<String, AgentModelOverride>,
 
     /// Cached (provider, model_id) pairs from the last /model fetch.
     pub models_cache: Vec<(String, String)>,
@@ -179,6 +178,12 @@ pub enum ModelChoice {
     Model { provider: String, model_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentModelOverride {
+    pub provider: Option<String>,
+    pub model_id: String,
+}
+
 /// An async action triggered by a slash command that the TUI event loop
 /// should process asynchronously.
 #[derive(Debug, Clone)]
@@ -247,6 +252,10 @@ impl App {
         agent_names.sort();
         let mut subagent_names: Vec<String> = ui_config.subagent_names.clone();
         subagent_names.sort();
+        let mut agent_model_info = ui_config.agent_model_info.clone();
+        agent_model_info
+            .entry("default".into())
+            .or_insert_with(|| model_info.clone());
         Self {
             state: AppState::Idle,
             messages: Vec::new(),
@@ -254,7 +263,12 @@ impl App {
             input_cursor: 0,
             scroll_offset: 0,
             auto_scroll: true,
-            model_info,
+            model_info: agent_model_info
+                .get("default")
+                .cloned()
+                .unwrap_or_else(|| model_info.clone()),
+            default_model_info: model_info,
+            agent_model_info,
             tokens_input: 0,
             tokens_output: 0,
             stream_buffer: String::new(),
@@ -268,8 +282,7 @@ impl App {
             suggestions: Vec::new(),
             suggestion_index: 0,
             tool_calls: Vec::new(),
-            model_override: None,
-            provider_override: None,
+            agent_model_overrides: HashMap::new(),
             models_cache: Vec::new(),
             input_accent: agent_accent_color("default"),
             user_accent: parse_ui_color(&ui_config.user_accent),
@@ -312,6 +325,47 @@ impl App {
 
     pub fn clear_esc_cancel_arm(&mut self) {
         self.esc_cancel_deadline = None;
+    }
+
+    pub fn current_model_override(&self) -> Option<&AgentModelOverride> {
+        self.agent_model_overrides.get(&self.current_agent)
+    }
+
+    pub fn current_model_override_parts(&self) -> (Option<String>, Option<String>) {
+        let Some(ov) = self.current_model_override() else {
+            return (None, None);
+        };
+        (Some(ov.model_id.clone()), ov.provider.clone())
+    }
+
+    fn default_model_info_for_agent(&self, agent: &str) -> String {
+        self.agent_model_info
+            .get(agent)
+            .cloned()
+            .unwrap_or_else(|| self.default_model_info.clone())
+    }
+
+    fn default_provider_for_agent(&self, agent: &str) -> Option<String> {
+        self.default_model_info_for_agent(agent)
+            .split_once('/')
+            .map(|(provider, _)| provider.to_string())
+    }
+
+    fn effective_model_info_for_agent(&self, agent: &str) -> String {
+        if let Some(ov) = self.agent_model_overrides.get(agent) {
+            let provider = ov
+                .provider
+                .clone()
+                .or_else(|| self.default_provider_for_agent(agent))
+                .unwrap_or_else(|| "?".into());
+            format!("{provider}/{}", ov.model_id)
+        } else {
+            self.default_model_info_for_agent(agent)
+        }
+    }
+
+    fn sync_current_agent_model_info(&mut self) {
+        self.model_info = self.effective_model_info_for_agent(&self.current_agent);
     }
 
     // ── Input submission ──────────────────────────────────
@@ -429,9 +483,13 @@ impl App {
                         self.current_agent = name.to_string();
                         self.input_accent =
                             agent_accent_color(&self.current_agent);
+                        self.sync_current_agent_model_info();
                         self.messages.push(DisplayMessage::command(
                             Role::Assistant,
-                            format!("Switched to agent: {}", name),
+                            format!(
+                                "Switched to agent: {} ({})",
+                                name, self.model_info
+                            ),
                         ));
                     } else {
                         self.messages.push(DisplayMessage::command(
@@ -574,11 +632,9 @@ impl App {
                 } else {
                     let name = parts[1];
                     if name == "default" {
-                        self.model_override = None;
-                        self.provider_override = None;
-                        // Restore original model info from config — but we don't have Config here.
-                        // Just show the reset message.
-                        self.messages.push(DisplayMessage::command(Role::Assistant, "Reset to default model. Start a new message to apply.".into()));
+                        self.agent_model_overrides.remove(&self.current_agent);
+                        self.sync_current_agent_model_info();
+                        self.messages.push(DisplayMessage::command(Role::Assistant, format!("Reset agent '{}' to default model: {}", self.current_agent, self.model_info)));
                     } else {
                         // Split provider/model format: "deepseek/deepseek-v4-pro" → provider "deepseek", model "deepseek-v4-pro"
                         let (model_name, provider) =
@@ -593,18 +649,22 @@ impl App {
                                     .map(|(p, _)| p.clone());
                                 (name.to_string(), prov)
                             };
-                        self.model_override = Some(model_name.clone());
-                        self.provider_override = provider.clone();
-                        let prov = provider.as_deref().unwrap_or("?");
-                        self.model_info = format!("{}/{}", prov, model_name);
+                        self.agent_model_overrides.insert(
+                            self.current_agent.clone(),
+                            AgentModelOverride {
+                                provider: provider.clone(),
+                                model_id: model_name.clone(),
+                            },
+                        );
+                        self.sync_current_agent_model_info();
                         let extra = provider
                             .map(|p| format!(" (provider: {})", p))
                             .unwrap_or_default();
                         self.messages.push(DisplayMessage::command(
                             Role::Assistant,
                             format!(
-                                "Switched to model: {}{}",
-                                model_name, extra
+                                "Switched agent '{}' to model: {}{}",
+                                self.current_agent, model_name, extra
                             ),
                         ));
                     }
@@ -936,6 +996,7 @@ impl App {
         let next = names[(idx + 1) % names.len()].clone();
         self.current_agent = next.clone();
         self.input_accent = agent_accent_color(&self.current_agent);
+        self.sync_current_agent_model_info();
     }
 
     pub fn open_session_picker(
@@ -1008,21 +1069,31 @@ impl App {
     pub fn apply_model_choice(&mut self, choice: ModelChoice) {
         match choice {
             ModelChoice::Default => {
-                self.model_override = None;
-                self.provider_override = None;
+                self.agent_model_overrides.remove(&self.current_agent);
+                self.sync_current_agent_model_info();
                 self.messages.push(DisplayMessage::command(
                     Role::Assistant,
-                    "Reset to default model. Start a new message to apply."
-                        .into(),
+                    format!(
+                        "Reset agent '{}' to default model: {}",
+                        self.current_agent, self.model_info
+                    ),
                 ));
             }
             ModelChoice::Model { provider, model_id } => {
-                self.model_override = Some(model_id.clone());
-                self.provider_override = Some(provider.clone());
-                self.model_info = format!("{provider}/{model_id}");
+                self.agent_model_overrides.insert(
+                    self.current_agent.clone(),
+                    AgentModelOverride {
+                        provider: Some(provider.clone()),
+                        model_id: model_id.clone(),
+                    },
+                );
+                self.sync_current_agent_model_info();
                 self.messages.push(DisplayMessage::command(
                     Role::Assistant,
-                    format!("Switched to model: {provider}/{model_id}"),
+                    format!(
+                        "Switched agent '{}' to model: {provider}/{model_id}",
+                        self.current_agent
+                    ),
                 ));
             }
         }
@@ -1275,6 +1346,7 @@ fn render_change_summary(tool_calls: &[ToolCallDisplay]) -> String {
         for ch in &tc.changes {
             match ch.kind {
                 marshaling_protocol::FileChangeKind::Modified => {
+                    lines.push("```diff".into());
                     lines.push(format!("diff -- {}", ch.path));
                     for dl in &ch.diff_lines {
                         let prefix = match dl.kind {
@@ -1287,6 +1359,7 @@ fn render_change_summary(tool_calls: &[ToolCallDisplay]) -> String {
                     if ch.truncated {
                         lines.push("[diff truncated]".into());
                     }
+                    lines.push("```".into());
                 }
                 marshaling_protocol::FileChangeKind::Added => {
                     lines.push(format!("! new file added: {}", ch.path));
@@ -1309,12 +1382,15 @@ mod tests {
     use super::*;
 
     fn test_ui_config() -> marshaling_protocol::UiConfig {
+        let mut agent_model_info = HashMap::new();
+        agent_model_info.insert("default".into(), "test/test-model".into());
         marshaling_protocol::UiConfig {
             input_accent: "cyan".into(),
             user_accent: "cyan".into(),
             agent_names: vec!["default".into()],
             subagent_names: vec!["review".into()],
             model_info: "test/test-model".into(),
+            agent_model_info,
         }
     }
 
@@ -1325,7 +1401,7 @@ mod tests {
         assert_eq!(app.state, AppState::Idle);
         assert!(app.messages.is_empty());
         assert_eq!(app.current_agent, "default");
-        assert!(app.model_override.is_none());
+        assert!(app.current_model_override().is_none());
     }
 
     #[test]
@@ -1457,13 +1533,14 @@ mod tests {
         app.model_picker_down();
         let choice = app.selected_model_choice().unwrap();
         app.apply_model_choice(choice);
-        assert_eq!(app.provider_override.as_deref(), Some("deepseek"));
-        assert_eq!(app.model_override.as_deref(), Some("deepseek-chat"));
+        let ov = app.current_model_override().unwrap();
+        assert_eq!(ov.provider.as_deref(), Some("deepseek"));
+        assert_eq!(ov.model_id, "deepseek-chat");
         assert_eq!(app.model_info, "deepseek/deepseek-chat");
 
         app.apply_model_choice(ModelChoice::Default);
-        assert!(app.provider_override.is_none());
-        assert!(app.model_override.is_none());
+        assert!(app.current_model_override().is_none());
+        assert_eq!(app.model_info, "test/test-model");
     }
 
     #[test]
@@ -1628,6 +1705,11 @@ mod tests {
             agent_names: vec!["plan".into(), "review".into()],
             subagent_names: vec![],
             model_info: "test/test-model".into(),
+            agent_model_info: HashMap::from([
+                ("default".into(), "test/test-model".into()),
+                ("plan".into(), "deepseek/plan-model".into()),
+                ("review".into(), "github/review-model".into()),
+            ]),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
 
@@ -1771,6 +1853,11 @@ mod tests {
             agent_names: vec!["plan".into(), "review".into()],
             subagent_names: vec![],
             model_info: "test/test-model".into(),
+            agent_model_info: HashMap::from([
+                ("default".into(), "test/test-model".into()),
+                ("plan".into(), "deepseek/plan-model".into()),
+                ("review".into(), "github/review-model".into()),
+            ]),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.current_agent, "default");
@@ -1791,9 +1878,76 @@ mod tests {
     fn test_model_override() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        assert!(app.model_override.is_none());
-        app.model_override = Some("deepseek-chat".into());
-        assert_eq!(app.model_override.as_deref(), Some("deepseek-chat"));
+        assert!(app.current_model_override().is_none());
+        app.agent_model_overrides.insert(
+            app.current_agent.clone(),
+            AgentModelOverride {
+                provider: Some("deepseek".into()),
+                model_id: "deepseek-chat".into(),
+            },
+        );
+        let ov = app.current_model_override().unwrap();
+        assert_eq!(ov.provider.as_deref(), Some("deepseek"));
+        assert_eq!(ov.model_id, "deepseek-chat");
+    }
+
+    #[test]
+    fn test_switching_agent_updates_model_info() {
+        let cfg = marshaling_protocol::UiConfig {
+            input_accent: "cyan".into(),
+            user_accent: "cyan".into(),
+            agent_names: vec!["plan".into(), "review".into()],
+            subagent_names: vec![],
+            model_info: "test/test-model".into(),
+            agent_model_info: HashMap::from([
+                ("default".into(), "test/test-model".into()),
+                ("plan".into(), "deepseek/plan-model".into()),
+                ("review".into(), "github/review-model".into()),
+            ]),
+        };
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        assert_eq!(app.model_info, "test/test-model");
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "plan");
+        assert_eq!(app.model_info, "deepseek/plan-model");
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "review");
+        assert_eq!(app.model_info, "github/review-model");
+    }
+
+    #[test]
+    fn test_model_override_is_scoped_per_agent() {
+        let cfg = marshaling_protocol::UiConfig {
+            input_accent: "cyan".into(),
+            user_accent: "cyan".into(),
+            agent_names: vec!["plan".into(), "review".into()],
+            subagent_names: vec![],
+            model_info: "test/test-model".into(),
+            agent_model_info: HashMap::from([
+                ("default".into(), "test/test-model".into()),
+                ("plan".into(), "deepseek/plan-model".into()),
+                ("review".into(), "github/review-model".into()),
+            ]),
+        };
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.cycle_agent();
+        app.apply_model_choice(ModelChoice::Model {
+            provider: "deepseek".into(),
+            model_id: "plan-override".into(),
+        });
+        assert_eq!(app.model_info, "deepseek/plan-override");
+
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "review");
+        assert_eq!(app.model_info, "github/review-model");
+
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "default");
+        assert_eq!(app.model_info, "test/test-model");
+
+        app.cycle_agent();
+        assert_eq!(app.current_agent, "plan");
+        assert_eq!(app.model_info, "deepseek/plan-override");
     }
 
     #[test]
@@ -2224,5 +2378,35 @@ mod tests {
     fn test_parse_ui_color_hex_invalid() {
         assert_eq!(parse_ui_color("#xyz"), Color::Cyan); // too short, falls through
         assert_eq!(parse_ui_color("#gggggg"), Color::Cyan); // invalid hex digits
+    }
+
+    #[test]
+    fn test_render_change_summary_wraps_modified_diff_in_fenced_block() {
+        let summary = render_change_summary(&[ToolCallDisplay {
+            id: "1".into(),
+            name: "edit".into(),
+            status: ToolStatus::Success,
+            changes: vec![marshaling_protocol::FileChange {
+                path: "src/main.rs".into(),
+                kind: marshaling_protocol::FileChangeKind::Modified,
+                diff_lines: vec![
+                    marshaling_protocol::DiffLine {
+                        kind: marshaling_protocol::DiffLineKind::Added,
+                        content: "let x = 1;".into(),
+                    },
+                    marshaling_protocol::DiffLine {
+                        kind: marshaling_protocol::DiffLineKind::Removed,
+                        content: "let x = 0;".into(),
+                    },
+                ],
+                truncated: false,
+            }],
+        }]);
+
+        assert!(summary.contains("```diff"));
+        assert!(summary.contains("diff -- src/main.rs"));
+        assert!(summary.contains("+let x = 1;"));
+        assert!(summary.contains("-let x = 0;"));
+        assert!(summary.contains("```"));
     }
 }

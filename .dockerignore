@@ -1,0 +1,26 @@
+# Built artifacts
+target/
+
+# Version control
+.git/
+.gitattributes
+.gitignore
+
+# Agent task tracking (user-local)
+agent_tasks/
+
+# Environment and secrets
+.env
+.env.example
+*.pem
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

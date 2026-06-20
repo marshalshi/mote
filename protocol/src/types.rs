@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Protocol version. Bump when breaking changes are made to ServerEvent/ChatRequest.
 pub const PROTOCOL_VERSION: &str = "2";
@@ -211,6 +212,9 @@ pub struct UiConfig {
     /// Agents available as subagent tool targets (includes "all" mode agents).
     pub subagent_names: Vec<String>,
     pub model_info: String,
+    /// Default effective model shown for each user-selectable agent.
+    #[serde(default)]
+    pub agent_model_info: HashMap<String, String>,
 }
 
 /// Session listing entry.

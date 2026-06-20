@@ -3,6 +3,13 @@ use crate::session::{Message, SessionMeta};
 use anyhow::{Context, Result};
 use std::path::Path;
 
+const FRONTMATTER_PREFIX_LF: &str = "---\n";
+const FRONTMATTER_PREFIX_CRLF: &str = "---\r\n";
+const FRONTMATTER_CLOSE_LF: &str = "\n---";
+const FRONTMATTER_CLOSE_CRLF: &str = "\r\n---";
+const MESSAGE_HEADING_PREFIX: &str = "## ";
+const MESSAGE_HEADING_SEPARATOR: &str = " — ";
+
 /// Parse a session file (markdown + YAML frontmatter) into its metadata and messages.
 pub fn parse_file(path: &Path) -> Result<(SessionMeta, Vec<Message>)> {
     let content = std::fs::read_to_string(path).with_context(|| {
@@ -14,14 +21,10 @@ pub fn parse_file(path: &Path) -> Result<(SessionMeta, Vec<Message>)> {
 /// Parse a session file's content string.
 pub fn parse(content: &str) -> Result<(SessionMeta, Vec<Message>)> {
     // Split on the first `---` to isolate YAML frontmatter.
-    let rest = content
-        .strip_prefix("---\n")
-        .or_else(|| content.strip_prefix("---\r\n"))
+    let rest = strip_frontmatter_prefix(content)
         .context("Session file must start with `---`")?;
 
-    let (yaml_text, body) = rest
-        .split_once("\n---")
-        .or_else(|| rest.split_once("\r\n---"))
+    let (yaml_text, body) = split_frontmatter(rest)
         .context("Session file missing closing `---` after frontmatter")?;
 
     let meta: SessionMeta = serde_yaml::from_str(yaml_text)
@@ -42,50 +45,78 @@ pub fn parse(content: &str) -> Result<(SessionMeta, Vec<Message>)> {
 ///   <content>
 fn parse_body(body: &str) -> Vec<Message> {
     let mut messages = Vec::new();
-    let mut current_role: Option<Role> = None;
-    let mut current_content = String::new();
+    let mut current_message = ParsedMessage::default();
 
     for line in body.lines() {
-        if let Some(rest) = line
-            .strip_prefix("## ")
-            .and_then(|r| r.split_once(" — "))
-            .or_else(|| {
-                line.strip_prefix("## ").and_then(|r| r.split_once(" — "))
-            })
-        {
-            let role_str = rest.0.trim();
-            // Flush previous message
-            if let Some(role) = current_role.take() {
-                let content =
-                    std::mem::take(&mut current_content).trim().to_string();
-                if !content.is_empty() {
-                    messages.push(Message::new(role, content));
-                }
-            }
-            current_role = match role_str {
-                "User" => Some(Role::User),
-                "Assistant" => Some(Role::Assistant),
-                _ => None,
-            };
-        } else if current_role.is_some() {
-            if !current_content.is_empty() || !line.trim().is_empty() {
-                if !current_content.is_empty() {
-                    current_content.push('\n');
-                }
-                current_content.push_str(line);
-            }
+        if let Some(role) = parse_message_heading(line) {
+            current_message.flush_into(&mut messages);
+            current_message.role = role;
+            continue;
+        }
+
+        if current_message.role.is_some() {
+            current_message.push_line(line);
         }
     }
 
-    // Flush last message
-    if let Some(role) = current_role {
-        let content = current_content.trim().to_string();
+    current_message.flush_into(&mut messages);
+
+    messages
+}
+
+fn strip_frontmatter_prefix(content: &str) -> Option<&str> {
+    content
+        .strip_prefix(FRONTMATTER_PREFIX_LF)
+        .or_else(|| content.strip_prefix(FRONTMATTER_PREFIX_CRLF))
+}
+
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    content
+        .split_once(FRONTMATTER_CLOSE_LF)
+        .or_else(|| content.split_once(FRONTMATTER_CLOSE_CRLF))
+}
+
+fn parse_message_heading(line: &str) -> Option<Option<Role>> {
+    let (role_str, _) = line
+        .strip_prefix(MESSAGE_HEADING_PREFIX)?
+        .split_once(MESSAGE_HEADING_SEPARATOR)?;
+
+    Some(match role_str.trim() {
+        "User" => Some(Role::User),
+        "Assistant" => Some(Role::Assistant),
+        _ => None,
+    })
+}
+
+#[derive(Default)]
+struct ParsedMessage {
+    role: Option<Role>,
+    content: String,
+}
+
+impl ParsedMessage {
+    fn push_line(&mut self, line: &str) {
+        if self.content.is_empty() && line.trim().is_empty() {
+            return;
+        }
+
+        if !self.content.is_empty() {
+            self.content.push('\n');
+        }
+        self.content.push_str(line);
+    }
+
+    fn flush_into(&mut self, messages: &mut Vec<Message>) {
+        let Some(role) = self.role.take() else {
+            self.content.clear();
+            return;
+        };
+
+        let content = std::mem::take(&mut self.content).trim().to_string();
         if !content.is_empty() {
             messages.push(Message::new(role, content));
         }
     }
-
-    messages
 }
 
 /// Serialize a session to a markdown string with YAML frontmatter.
@@ -271,6 +302,36 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content.trim(), "Hello");
         assert_eq!(msgs[1].content, "World");
+    }
+
+    #[test]
+    fn test_parse_unknown_heading_flushes_previous_message() {
+        let content = "---\n\
+                       id: x\ncreated: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n\
+                       model_provider: t\nmodel_id: t\n\
+                       tokens_input: 0\ntokens_output: 0\nversion: 0.1.0\n\
+                       ---\n\
+                       \n\
+                       ## User — 00:00:00\n\
+                       Hello\n\
+                       ## Tool — 00:00:01\n\
+                       ignored\n\
+                       ## Assistant — 00:00:02\n\
+                       World\n";
+        let (_, msgs) = parse(content).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[0].content, "Hello");
+        assert_eq!(msgs[1].role, Role::Assistant);
+        assert_eq!(msgs[1].content, "World");
+    }
+
+    #[test]
+    fn test_parse_unknown_heading_does_not_append_to_previous_message() {
+        let body = "## User — 00:00:00\nHello\n## System — 00:00:01\nignored\n";
+        let msgs = parse_body(body);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello");
     }
 
     #[test]

@@ -385,60 +385,89 @@ impl App {
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.auto_scroll = true;
+        self.remember_input(&text);
 
-        // Save to history first (including slash commands), dedup against last entry
-        if !text.is_empty()
-            && self.input_history.last().map_or(true, |last| last != &text)
-        {
-            self.input_history.push(text.clone());
-        }
-        self.input_history_idx = None;
-
-        if let Some(command) = shell_command_from_input(&text) {
-            self.suggestions.clear();
-            self.suggestion_index = 0;
-            self.handled_slash_command = true;
-            if command.is_empty() {
-                self.messages.push(DisplayMessage::command(
-                    Role::Assistant,
-                    "Usage: ! <shell command>".into(),
-                ));
-            } else {
-                self.messages.push(DisplayMessage::command(
-                    Role::User,
-                    format!("$ {command}"),
-                ));
-                self.pending_slash = Some(SlashAction::RunShell(command));
-            }
+        if self.handle_shell_input(&text) {
             return String::new();
         }
 
-        if text.starts_with('/') {
-            self.suggestions.clear();
-            self.suggestion_index = 0;
-            self.handled_slash_command = true;
-            self.handle_slash_command(&text);
+        if self.handle_slash_input(&text) {
             return String::new();
         }
-        self.suggestions.clear();
-        self.suggestion_index = 0;
+
+        self.reset_suggestions();
         self.handled_slash_command = false;
 
-        if !text.is_empty() {
-            // Transform @mentions into explicit subagent call instructions
-            let transformed = self.transform_mentions(&text);
-            self.messages.push(DisplayMessage {
-                role: Role::User,
-                content: transformed.clone(),
-                thinking: None,
-                source: MessageSource::Conversation,
-            });
-            // Clear stream/resoning buffers for the new turn
-            self.stream_buffer.clear();
-            self.reasoning_buffer.clear();
-            return transformed;
+        self.submit_conversation_input(text)
+    }
+
+    fn remember_input(&mut self, text: &str) {
+        // Save to history first (including slash commands), dedup against last entry
+        if !text.is_empty()
+            && self.input_history.last().map_or(true, |last| last != text)
+        {
+            self.input_history.push(text.to_string());
         }
-        text
+        self.input_history_idx = None;
+    }
+
+    fn handle_shell_input(&mut self, text: &str) -> bool {
+        let Some(command) = shell_command_from_input(text) else {
+            return false;
+        };
+
+        self.reset_suggestions();
+        self.handled_slash_command = true;
+        if command.is_empty() {
+            self.push_command_message(
+                Role::Assistant,
+                "Usage: ! <shell command>",
+            );
+        } else {
+            self.push_command_message(Role::User, format!("$ {command}"));
+            self.pending_slash = Some(SlashAction::RunShell(command));
+        }
+        true
+    }
+
+    fn handle_slash_input(&mut self, text: &str) -> bool {
+        if !text.starts_with('/') {
+            return false;
+        }
+
+        self.reset_suggestions();
+        self.handled_slash_command = true;
+        self.handle_slash_command(text);
+        true
+    }
+
+    fn submit_conversation_input(&mut self, text: String) -> String {
+        if text.is_empty() {
+            return text;
+        }
+
+        // Transform @mentions into explicit subagent call instructions
+        let transformed = self.transform_mentions(&text);
+        self.messages.push(DisplayMessage {
+            role: Role::User,
+            content: transformed.clone(),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        // Clear stream/resoning buffers for the new turn
+        self.stream_buffer.clear();
+        self.reasoning_buffer.clear();
+        transformed
+    }
+
+    fn reset_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.suggestion_index = 0;
+    }
+
+    fn push_command_message(&mut self, role: Role, content: impl Into<String>) {
+        self.messages
+            .push(DisplayMessage::command(role, content.into()));
     }
 
     /// Transform `@name` mentions in the message into text the LLM will understand as subagent calls.
@@ -477,73 +506,37 @@ impl App {
     fn handle_slash_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         match parts[0] {
-            "/agent" => {
-                if parts.len() < 2 {
-                    let all_agents = all_agent_names(&self.agent_names);
-                    self.messages.push(DisplayMessage {
-                        role: Role::Assistant,
-                        content: format!("Available agents:\n  {}\nType /agent <name> to switch.", all_agents.join("\n  ")),
-                        thinking: None,
-                        source: MessageSource::Command,
-                    });
-                } else {
-                    let name = parts[1];
-                    if name == "default"
-                        || self.agent_names.contains(&name.to_string())
-                    {
-                        self.current_agent = name.to_string();
-                        self.input_accent =
-                            agent_accent_color(&self.current_agent);
-                        self.sync_current_agent_model_info();
-                        self.messages.push(DisplayMessage::command(
-                            Role::Assistant,
-                            format!(
-                                "Switched to agent: {} ({})",
-                                name, self.model_info
-                            ),
-                        ));
-                    } else {
-                        self.messages.push(DisplayMessage::command(
-                            Role::Assistant,
-                            format!(
-                                "Unknown agent: {}. Available: {}",
-                                name,
-                                all_agent_names(&self.agent_names).join(", ")
-                            ),
-                        ));
-                    }
-                }
-            }
+            "/agent" => self.handle_agent_command(&parts),
             "/help" => {
                 self.messages.push(DisplayMessage {
                     role: Role::Assistant,
                     content: [
-                        "Commands:",
-                        "  /agent <name>     — Switch agent",
-                        "  /help             — Show this help",
-                        "  /tokens           — Show token usage",
-                        "  /new              — Start a new session",
-                        "  /sessions         — Open session picker",
-                        "  /model            — Show / switch model",
-                        "  /subagents        — List active subagents",
-                        "  /rollback last    — Rollback latest file changes",
-                        "  /login github <token>  — Save GitHub token",
-                        "  /login deepseek <key>  — Save DeepSeek API key",
-                        "  ! <command>       — Run local shell command",
+                        "## Commands",
+                        "- `/agent <name>` — Switch agent",
+                        "- `/help` — Show this help",
+                        "- `/tokens` — Show token usage",
+                        "- `/new` — Start a new session",
+                        "- `/sessions` — Open session picker",
+                        "- `/model` — Show / switch model",
+                        "- `/subagents` — List active subagents",
+                        "- `/rollback last` — Rollback latest file changes",
+                        "- `/login github <token>` — Save GitHub token",
+                        "- `/login deepseek <key>` — Save DeepSeek API key",
+                        "- `! <command>` — Run local shell command",
                         "",
-                        "Keybindings (configurable in keybindings.toml):",
-                        "  Enter             — Send message",
-                        "  Alt+Enter         — Newline",
-                        "  Ctrl+A / Ctrl+E   — Line start / end",
-                        "  Ctrl+D            — Delete current char",
-                        "  Ctrl+K            — Clear current line",
-                        "  Esc                — Press twice within 2s to stop running agent",
-                        "  Ctrl+C             — Quit / cancel immediately",
-                        "  Tab                — Cycle agent",
-                        "  Up/Down           — Input history",
-                        "  PgUp/PgDn, Ctrl+↑/↓ — Scroll",
-                        "  Ctrl+P            — Agent command",
-                        "  F5                — Cycle subagent views",
+                        "## Keybindings",
+                        "- `Enter` — Send message",
+                        "- `Alt+Enter` — Newline",
+                        "- `Ctrl+A / Ctrl+E` — Line start / end",
+                        "- `Ctrl+D` — Delete current char",
+                        "- `Ctrl+K` — Clear current line",
+                        "- `Esc` — Press twice within 2s to stop running agent",
+                        "- `Ctrl+C` — Quit / cancel immediately",
+                        "- `Tab` — Cycle agent",
+                        "- `Up/Down` — Input history",
+                        "- `PgUp/PgDn, Ctrl+↑/↓` — Scroll",
+                        "- `Ctrl+P` — Agent command",
+                        "- `F5` — Cycle subagent views",
                     ]
                     .join("\n"),
                     thinking: None,
@@ -631,62 +624,7 @@ impl App {
                     format!("Messages: {}", self.messages.len()),
                 ));
             }
-            "/model" => {
-                if parts.len() < 2 {
-                    self.messages.push(DisplayMessage {
-                        role: Role::Assistant,
-                        content: "Fetching available models...".into(),
-                        thinking: None,
-                        source: MessageSource::Command,
-                    });
-                    self.pending_slash = Some(SlashAction::FetchModels);
-                } else {
-                    let name = parts[1];
-                    if name == "default" {
-                        self.agent_model_overrides.remove(&self.current_agent);
-                        self.sync_current_agent_model_info();
-                        self.messages.push(DisplayMessage::command(
-                            Role::Assistant,
-                            format!(
-                                "Reset agent '{}' to default model: {}",
-                                self.current_agent, self.model_info
-                            ),
-                        ));
-                    } else {
-                        // Split provider/model format: "deepseek/deepseek-v4-pro" → provider "deepseek", model "deepseek-v4-pro"
-                        let (model_name, provider) =
-                            if let Some((p, m)) = name.split_once('/') {
-                                (m.to_string(), Some(p.to_string()))
-                            } else {
-                                // Look up the provider from cache (model names are stored without provider prefix)
-                                let prov = self
-                                    .models_cache
-                                    .iter()
-                                    .find(|(_, m)| m == name)
-                                    .map(|(p, _)| p.clone());
-                                (name.to_string(), prov)
-                            };
-                        self.agent_model_overrides.insert(
-                            self.current_agent.clone(),
-                            AgentModelOverride {
-                                provider: provider.clone(),
-                                model_id: model_name.clone(),
-                            },
-                        );
-                        self.sync_current_agent_model_info();
-                        let extra = provider
-                            .map(|p| format!(" (provider: {})", p))
-                            .unwrap_or_default();
-                        self.messages.push(DisplayMessage::command(
-                            Role::Assistant,
-                            format!(
-                                "Switched agent '{}' to model: {}{}",
-                                self.current_agent, model_name, extra
-                            ),
-                        ));
-                    }
-                }
-            }
+            "/model" => self.handle_model_command(&parts),
             "/subagents" => {
                 if self.subagent_views.is_empty() {
                     self.messages.push(DisplayMessage::command(
@@ -737,6 +675,102 @@ impl App {
                     format!("Unknown command: {}. Type /help.", cmd),
                 ));
             }
+        }
+    }
+
+    fn handle_agent_command(&mut self, parts: &[&str]) {
+        let all_agents = all_agent_names(&self.agent_names);
+        if parts.len() < 2 {
+            self.messages.push(DisplayMessage {
+                role: Role::Assistant,
+                content: format!(
+                    "Available agents:\n  {}\nType /agent <name> to switch.",
+                    all_agents.join("\n  ")
+                ),
+                thinking: None,
+                source: MessageSource::Command,
+            });
+            return;
+        }
+
+        let name = parts[1];
+        if name == "default" || self.agent_names.contains(&name.to_string()) {
+            self.current_agent = name.to_string();
+            self.input_accent = agent_accent_color(&self.current_agent);
+            self.sync_current_agent_model_info();
+            self.push_command_message(
+                Role::Assistant,
+                format!("Switched to agent: {} ({})", name, self.model_info),
+            );
+        } else {
+            self.push_command_message(
+                Role::Assistant,
+                format!(
+                    "Unknown agent: {}. Available: {}",
+                    name,
+                    all_agents.join(", ")
+                ),
+            );
+        }
+    }
+
+    fn handle_model_command(&mut self, parts: &[&str]) {
+        if parts.len() < 2 {
+            self.messages.push(DisplayMessage {
+                role: Role::Assistant,
+                content: "Fetching available models...".into(),
+                thinking: None,
+                source: MessageSource::Command,
+            });
+            self.pending_slash = Some(SlashAction::FetchModels);
+            return;
+        }
+
+        let name = parts[1];
+        if name == "default" {
+            self.agent_model_overrides.remove(&self.current_agent);
+            self.sync_current_agent_model_info();
+            self.push_command_message(
+                Role::Assistant,
+                format!(
+                    "Reset agent '{}' to default model: {}",
+                    self.current_agent, self.model_info
+                ),
+            );
+            return;
+        }
+
+        let (model_name, provider) = self.resolve_model_selection(name);
+        self.agent_model_overrides.insert(
+            self.current_agent.clone(),
+            AgentModelOverride {
+                provider: provider.clone(),
+                model_id: model_name.clone(),
+            },
+        );
+        self.sync_current_agent_model_info();
+        let extra = provider
+            .map(|p| format!(" (provider: {})", p))
+            .unwrap_or_default();
+        self.push_command_message(
+            Role::Assistant,
+            format!(
+                "Switched agent '{}' to model: {}{}",
+                self.current_agent, model_name, extra
+            ),
+        );
+    }
+
+    fn resolve_model_selection(&self, name: &str) -> (String, Option<String>) {
+        if let Some((provider, model)) = name.split_once('/') {
+            (model.to_string(), Some(provider.to_string()))
+        } else {
+            let provider = self
+                .models_cache
+                .iter()
+                .find(|(_, model)| model == name)
+                .map(|(provider, _)| provider.clone());
+            (name.to_string(), provider)
         }
     }
 
@@ -1490,7 +1524,13 @@ mod tests {
         assert!(text.is_empty());
         assert!(app.handled_slash_command);
         assert_eq!(app.messages.len(), 1);
-        assert!(app.messages[0].content.contains("Commands"));
+        assert!(app.messages[0].content.contains("## Commands"));
+        assert!(
+            app.messages[0]
+                .content
+                .contains("- `/help` — Show this help")
+        );
+        assert!(app.messages[0].content.contains("## Keybindings"));
     }
 
     #[test]

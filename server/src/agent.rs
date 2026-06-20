@@ -111,6 +111,20 @@ pub enum AgentEvent {
         /// Full conversation history including system messages, tool results, etc.
         history: Vec<ChatMessage>,
     },
+    /// The agent was explicitly cancelled by the user.
+    Cancelled {
+        content: String,
+        tokens_input: u64,
+        tokens_output: u64,
+        history: Vec<ChatMessage>,
+    },
+    /// The loop stopped before an explicit finish_task completion.
+    NeedsContinuation {
+        content: String,
+        tokens_input: u64,
+        tokens_output: u64,
+        history: Vec<ChatMessage>,
+    },
 }
 
 /// Run the agent loop.
@@ -176,10 +190,12 @@ pub async fn run_loop(
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
 
-    for _step in 0..max_steps {
+    let mut step = 0usize;
+    loop {
+        step += 1;
         tracing::debug!(
-            "agent turn {}/{}: {} tools, {} history messages",
-            _step + 1,
+            "agent turn {} (soft budget {}): {} tools, {} history messages",
+            step,
             max_steps,
             tools.len(),
             history.len()
@@ -187,7 +203,7 @@ pub async fn run_loop(
 
         // Check cancel
         if *cancel_rx.borrow() {
-            let _ = events_tx.send(Ok(AgentEvent::Done {
+            let _ = events_tx.send(Ok(AgentEvent::Cancelled {
                 content: "(cancelled)".into(),
                 tokens_input: total_input,
                 tokens_output: total_output,
@@ -210,7 +226,7 @@ pub async fn run_loop(
         let tool_defs = advertised_tool_defs(&tools, &permissions);
 
         let reminder_ctx = crate::prompt::ReminderContext {
-            step: _step + 1,
+            step,
             max_steps,
             working_directory: working_directory.clone(),
             tool_defs: &tool_defs,
@@ -239,17 +255,26 @@ pub async fn run_loop(
         let mut text_buf = String::new();
         let mut result: Option<ChatResult> = None;
 
-        while let Some(event) = stream_rx.recv().await {
-            if *cancel_rx.borrow() {
-                stream_handle.abort();
-                let _ = events_tx.send(Ok(AgentEvent::Done {
-                    content: "(cancelled)".into(),
-                    tokens_input: total_input,
-                    tokens_output: total_output,
-                    history,
-                }));
-                return;
-            }
+        loop {
+            let event = tokio::select! {
+                event = stream_rx.recv() => event,
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        stream_handle.abort();
+                        let _ = events_tx.send(Ok(AgentEvent::Cancelled {
+                            content: "(cancelled)".into(),
+                            tokens_input: total_input,
+                            tokens_output: total_output,
+                            history,
+                        }));
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 Ok(StreamEvent::Chunk(text)) => {
                     text_buf.push_str(&text);
@@ -273,7 +298,7 @@ pub async fn run_loop(
         let result = match result {
             Some(r) => r,
             None => {
-                let _ = events_tx.send(Ok(AgentEvent::Done {
+                let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
                     content: text_buf,
                     tokens_input: total_input,
                     tokens_output: total_output,
@@ -287,18 +312,18 @@ pub async fn run_loop(
         total_input += result.usage.prompt_tokens;
         total_output += result.usage.completion_tokens;
 
-        // Check for tool calls
+        // Check for tool calls. A plain assistant message is not treated as a
+        // completed task anymore: the model must call the internal finish_task
+        // tool when it is actually done. This avoids stopping in the middle of
+        // work just because the model emitted prose without another tool call.
         if result.tool_calls.is_empty() {
-            // No tools — agent is done
             let content = result.content.unwrap_or_default();
             history.push(ChatMessage::assistant_text(content.clone()));
-            let _ = events_tx.send(Ok(AgentEvent::Done {
-                content,
-                tokens_input: total_input,
-                tokens_output: total_output,
-                history,
+            let _ = events_tx.send(Ok(AgentEvent::TurnDone {
+                text: content,
+                tool_calls: Vec::new(),
             }));
-            return;
+            continue;
         }
 
         // ── Phase 2: Execute tool calls ─────────────────────────
@@ -321,8 +346,30 @@ pub async fn run_loop(
         let mut displays = Vec::new();
         for tc in &result.tool_calls {
             if *cancel_rx.borrow() {
-                let _ = events_tx.send(Ok(AgentEvent::Done {
+                let _ = events_tx.send(Ok(AgentEvent::Cancelled {
                     content: "(cancelled)".into(),
+                    tokens_input: total_input,
+                    tokens_output: total_output,
+                    history,
+                }));
+                return;
+            }
+
+            if tc.function.name == "finish_task" {
+                let final_answer = serde_json::from_str::<serde_json::Value>(
+                    &tc.function.arguments,
+                )
+                .ok()
+                .and_then(|args| {
+                    args.get("final_answer")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| result.content.clone())
+                .unwrap_or_else(|| "(task finished)".to_string());
+                history.push(ChatMessage::assistant_text(final_answer.clone()));
+                let _ = events_tx.send(Ok(AgentEvent::Done {
+                    content: final_answer,
                     tokens_input: total_input,
                     tokens_output: total_output,
                     history,
@@ -452,7 +499,7 @@ pub async fn run_loop(
                             }
                             _ = cancel_rx.changed() => {
                                 if *cancel_rx.borrow() {
-                                    let _ = events_tx.send(Ok(AgentEvent::Done { content: "(cancelled)".into(), tokens_input: total_input, tokens_output: total_output, history }));
+                                    let _ = events_tx.send(Ok(AgentEvent::Cancelled { content: "(cancelled)".into(), tokens_input: total_input, tokens_output: total_output, history }));
                                     return;
                                 }
                             }
@@ -531,13 +578,6 @@ pub async fn run_loop(
 
         // History now contains tool results — loop continues
     }
-
-    let _ = events_tx.send(Ok(AgentEvent::Done {
-        content: "(max steps reached)".into(),
-        tokens_input: total_input,
-        tokens_output: total_output,
-        history,
-    }));
 }
 
 /// Extract tool results from the most recent turn in history.
@@ -670,8 +710,15 @@ mod tests {
                 .collect();
             self.seen_tools.lock().unwrap().extend(names);
             let _ = sender.send(Ok(StreamEvent::Done(ChatResult {
-                content: Some("final answer".into()),
-                tool_calls: Vec::new(),
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_finish".into(),
+                    call_type: "function".into(),
+                    function: ToolFunction {
+                        name: "finish_task".into(),
+                        arguments: r#"{"final_answer":"final answer"}"#.into(),
+                    },
+                }],
                 usage: Usage {
                     prompt_tokens: 1,
                     completion_tokens: 2,
@@ -767,10 +814,12 @@ mod tests {
         let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
             Box::new(NamedTool("read")),
             Box::new(NamedTool("bash")),
+            Box::new(NamedTool("finish_task")),
         ]);
         let permissions = std::collections::HashMap::from([
             ("read".to_string(), crate::config::Permission::Allow),
             ("bash".to_string(), crate::config::Permission::Deny),
+            ("finish_task".to_string(), crate::config::Permission::Allow),
         ]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -801,9 +850,15 @@ mod tests {
         }
         let history = done_history.expect("Done event should be emitted");
         assert!(matches!(history[0].role, Role::User));
-        assert!(matches!(history[1].role, Role::Assistant));
-        assert_eq!(history[1].content.as_deref(), Some("final answer"));
-        assert_eq!(seen_tools.lock().unwrap().as_slice(), ["read"]);
+        assert!(matches!(history.last().unwrap().role, Role::Assistant));
+        assert_eq!(
+            history.last().unwrap().content.as_deref(),
+            Some("final answer")
+        );
+        assert_eq!(
+            seen_tools.lock().unwrap().as_slice(),
+            ["read", "finish_task"]
+        );
     }
 
     #[test]

@@ -267,7 +267,8 @@ fn render_permission_popup(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
     ];
 
-    let mut args_lines = json_to_yaml_lines_for_popup(&perm.args, content_width);
+    let mut args_lines =
+        json_to_yaml_lines_for_popup(&perm.args, content_width);
     let max_args =
         inner
             .height
@@ -1106,22 +1107,18 @@ fn push_tool_changes(
                 ]));
                 for dl in &ch.diff_lines {
                     let (prefix, style) = match dl.kind {
-                        marshaling_protocol::DiffLineKind::Added => {
-                            (
-                                "+",
-                                Style::default()
-                                    .fg(Color::Green)
-                                    .bg(Color::Rgb(19, 48, 35)),
-                            )
-                        }
-                        marshaling_protocol::DiffLineKind::Removed => {
-                            (
-                                "-",
-                                Style::default()
-                                    .fg(Color::Red)
-                                    .bg(Color::Rgb(58, 29, 33)),
-                            )
-                        }
+                        marshaling_protocol::DiffLineKind::Added => (
+                            "+",
+                            Style::default()
+                                .fg(Color::Green)
+                                .bg(Color::Rgb(19, 48, 35)),
+                        ),
+                        marshaling_protocol::DiffLineKind::Removed => (
+                            "-",
+                            Style::default()
+                                .fg(Color::Red)
+                                .bg(Color::Rgb(58, 29, 33)),
+                        ),
                         marshaling_protocol::DiffLineKind::Context => {
                             (" ", Style::default().fg(Color::DarkGray))
                         }
@@ -1173,20 +1170,42 @@ fn render_diff_code_block(
     accent_style: Style,
     max_width: usize,
 ) {
-    for raw_line in code.trim_matches('\n').split('\n') {
+    let raw_lines: Vec<&str> = code.trim_matches('\n').split('\n').collect();
+    let line_no_width = raw_lines.len().max(1).to_string().len();
+    for (idx, raw_line) in raw_lines.into_iter().enumerate() {
+        let line_no = format!("{:>width$}", idx + 1, width = line_no_width);
+        let line_no_span = Span::styled(
+            format!("{} | ", line_no),
+            Style::default().fg(Color::DarkGray),
+        );
         let style = if raw_line.starts_with('+') {
-            Style::default()
-                .fg(Color::Green)
-                .bg(Color::Rgb(19, 48, 35))
+            Style::default().fg(Color::Green).bg(Color::Rgb(19, 48, 35))
         } else if raw_line.starts_with('-') {
             Style::default().fg(Color::Red).bg(Color::Rgb(58, 29, 33))
         } else {
             Style::default().fg(Color::DarkGray)
         };
         let wrapped = word_wrap_line(raw_line, max_width);
-        for part in wrapped {
+        let continuation_prefix =
+            format!("{}{}", " ".repeat(line_no_width), " | ");
+        for (part_idx, part) in wrapped.into_iter().enumerate() {
+            let prefix = if part_idx == 0 {
+                vec![
+                    line_no_span.clone(),
+                    Span::styled(accent_prefix.to_string(), accent_style),
+                ]
+            } else {
+                vec![
+                    Span::styled(
+                        continuation_prefix.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(accent_prefix.to_string(), accent_style),
+                ]
+            };
             lines.push(Line::from(vec![
-                Span::styled(accent_prefix.to_string(), accent_style),
+                prefix[0].clone(),
+                prefix[1].clone(),
                 Span::styled(part, style),
             ]));
         }
@@ -1226,7 +1245,7 @@ fn welcome_logo_lines() -> Vec<String> {
         "       SP                   SP                ".to_string(),
         "       Y                    Y                 ".to_string(),
         "".to_string(),
-        "    --         ---          -          .".to_string(), 
+        "    --         ---          -          .".to_string(),
     ]
 }
 
@@ -1271,12 +1290,20 @@ fn render_welcome_screen(frame: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .fg(Color::Rgb(default_logo.0, default_logo.1, default_logo.2))
+                        .fg(Color::Rgb(
+                            default_logo.0,
+                            default_logo.1,
+                            default_logo.2,
+                        ))
                         .add_modifier(Modifier::BOLD)
                 }
             } else {
                 Style::default()
-                    .fg(Color::Rgb(default_logo.0, default_logo.1, default_logo.2))
+                    .fg(Color::Rgb(
+                        default_logo.0,
+                        default_logo.1,
+                        default_logo.2,
+                    ))
                     .add_modifier(Modifier::BOLD)
             };
             spans.push(Span::styled(ch.to_string(), style));
@@ -1289,7 +1316,6 @@ fn render_welcome_screen(frame: &mut Frame, area: Rect, app: &App) {
 
     let subtitle_y = start_y + logo.len() as u16 + 1;
     let body_style = Style::default().fg(Color::DarkGray);
-    let subtitle_style = Style::default().fg(Color::White);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from(Span::styled(
@@ -1820,7 +1846,11 @@ fn cursor_pos_after_wrap(
     (col, visual_row)
 }
 
-fn input_cursor_screen_x(area_width: u16, prompt_width: usize, col: usize) -> u16 {
+fn input_cursor_screen_x(
+    area_width: u16,
+    prompt_width: usize,
+    col: usize,
+) -> u16 {
     let content_x = 4 + prompt_width + col;
     let max_cursor_x = area_width.saturating_sub(2) as usize;
     content_x.min(max_cursor_x) as u16
@@ -2199,10 +2229,14 @@ mod tests {
         );
 
         assert!(lines.iter().any(|line| {
-            line.spans.iter().any(|s| s.content.as_ref().contains("+let added = true;"))
+            line.spans
+                .iter()
+                .any(|s| s.content.as_ref().contains("+let added = true;"))
         }));
         assert!(lines.iter().any(|line| {
-            line.spans.iter().any(|s| s.content.as_ref().contains("-let removed = false;"))
+            line.spans
+                .iter()
+                .any(|s| s.content.as_ref().contains("-let removed = false;"))
         }));
 
         let added = lines

@@ -196,6 +196,8 @@ impl MoteClient {
                                 let is_terminal = matches!(
                                     event,
                                     ServerEvent::Done { .. }
+                                        | ServerEvent::Cancelled { .. }
+                                        | ServerEvent::NeedsContinuation { .. }
                                         | ServerEvent::Error { .. }
                                 );
                                 if tx.send(event).is_err() {

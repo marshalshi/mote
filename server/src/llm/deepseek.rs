@@ -20,7 +20,6 @@ impl DeepSeekProvider {
             api_key: config.resolve_deepseek_api_key(auth)?,
             base_url: config.deepseek_base_url()?,
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .context("Failed to create HTTP client")?,
         })
@@ -402,18 +401,9 @@ impl LlmProvider for DeepSeekProvider {
             }
         }
 
-        let result = finalize(
-            &mut text_content,
-            &mut tool_call_acc,
-            usage,
-            &mut reasoning_content,
-        );
-        tracing::debug!(
-            "LLM stream result finalized: content_len={}, tool_calls={}",
-            result.content.as_ref().map_or(0, String::len),
-            result.tool_calls.len()
-        );
-        let _ = sender.send(Ok(StreamEvent::Done(result)));
+        let _ = sender.send(Err(anyhow::anyhow!(
+            "DeepSeek stream ended before completion marker"
+        )));
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {

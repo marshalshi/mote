@@ -4,6 +4,7 @@ use marshaling_protocol::{DiffLine, DiffLineKind, FileChange, FileChangeKind};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 use tokio::fs;
 
 use crate::llm::{
@@ -806,16 +807,22 @@ impl Tool for BashTool {
         let timeout_secs =
             args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
 
-        // Use sh -c for portable shell execution, with a timeout guard
+        // Use sh -c for portable shell execution, with a timeout guard.
+        // `kill_on_drop(true)` ensures a timed-out command does not keep
+        // running in the background after the future is dropped.
         let child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.ctx.workspace)
-            .output();
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to execute command")?;
 
         let output = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            child,
+            child.wait_with_output(),
         )
         .await
         {
@@ -944,6 +951,37 @@ impl Tool for UseSkillTool {
         } else {
             Ok(result_no_changes(body))
         }
+    }
+}
+
+/// Internal completion marker. The agent loop handles this tool specially and
+/// does not execute it as a normal external tool.
+pub struct FinishTaskTool;
+
+#[async_trait]
+impl Tool for FinishTaskTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            def_type: "function".into(),
+            function: ToolFunctionDef {
+                name: "finish_task".into(),
+                description: "Call exactly once when the user's request is fully complete. Provide the final answer to show the user.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "final_answer": {
+                            "type": "string",
+                            "description": "Final response to the user, including concise summary and any caveats."
+                        }
+                    },
+                    "required": ["final_answer"]
+                }),
+            },
+        }
+    }
+
+    async fn execute(&self, _args: Value) -> Result<ToolExecutionResult> {
+        Ok(result_no_changes("[task finished]".into()))
     }
 }
 
@@ -1142,6 +1180,7 @@ impl SubagentRunner for AgentSubagentRunner {
         // Create channels for the subagent
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
         let (sub_cancel_tx, sub_cancel_rx) = tokio::sync::watch::channel(false);
+        let timeout_cancel_tx = sub_cancel_tx.clone();
         // Link subagent cancellation to parent: when parent cancels, subagent cancels too
         let mut parent_cancel = self.cancel_rx.clone();
         tokio::spawn(async move {
@@ -1202,6 +1241,14 @@ impl SubagentRunner for AgentSubagentRunner {
                 match event {
                     Ok(crate::agent::AgentEvent::Done {
                         content: c, ..
+                    })
+                    | Ok(crate::agent::AgentEvent::Cancelled {
+                        content: c,
+                        ..
+                    })
+                    | Ok(crate::agent::AgentEvent::NeedsContinuation {
+                        content: c,
+                        ..
                     }) => {
                         content = c;
                         break;
@@ -1290,8 +1337,9 @@ impl SubagentRunner for AgentSubagentRunner {
                 agent_name,
                 subagent_timeout.as_secs()
             );
-            content = format!(
-                "[Sub-agent '{}' timed out after {}s]",
+            let _ = timeout_cancel_tx.send(true);
+            anyhow::bail!(
+                "Sub-agent '{}' timed out after {}s",
                 agent_name,
                 subagent_timeout.as_secs()
             );

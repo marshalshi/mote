@@ -136,6 +136,9 @@ pub struct App {
     /// Session key used by server to scope runtime mutable state.
     pub runtime_session_key: String,
 
+    /// Active server-side run ID, used to reattach after transient websocket drops.
+    pub active_run_id: Option<String>,
+
     /// Session picker popup state.
     pub session_picker_open: bool,
     pub session_picker_items: Vec<marshaling_protocol::SessionInfo>,
@@ -304,6 +307,7 @@ impl App {
             workspace_root,
             repo_agents_md,
             runtime_session_key,
+            active_run_id: None,
             session_picker_open: false,
             session_picker_items: Vec::new(),
             session_picker_index: 0,
@@ -335,7 +339,9 @@ impl App {
         self.agent_model_overrides.get(&self.current_agent)
     }
 
-    pub fn current_model_override_parts(&self) -> (Option<String>, Option<String>) {
+    pub fn current_model_override_parts(
+        &self,
+    ) -> (Option<String>, Option<String>) {
         let Some(ov) = self.current_model_override() else {
             return (None, None);
         };
@@ -369,7 +375,8 @@ impl App {
     }
 
     fn sync_current_agent_model_info(&mut self) {
-        self.model_info = self.effective_model_info_for_agent(&self.current_agent);
+        self.model_info =
+            self.effective_model_info_for_agent(&self.current_agent);
     }
 
     // ── Input submission ──────────────────────────────────
@@ -638,7 +645,13 @@ impl App {
                     if name == "default" {
                         self.agent_model_overrides.remove(&self.current_agent);
                         self.sync_current_agent_model_info();
-                        self.messages.push(DisplayMessage::command(Role::Assistant, format!("Reset agent '{}' to default model: {}", self.current_agent, self.model_info)));
+                        self.messages.push(DisplayMessage::command(
+                            Role::Assistant,
+                            format!(
+                                "Reset agent '{}' to default model: {}",
+                                self.current_agent, self.model_info
+                            ),
+                        ));
                     } else {
                         // Split provider/model format: "deepseek/deepseek-v4-pro" → provider "deepseek", model "deepseek-v4-pro"
                         let (model_name, provider) =
@@ -1147,6 +1160,7 @@ impl App {
         self.scroll_to_bottom();
         self.tokens_input = 0;
         self.tokens_output = 0;
+        self.active_run_id = None;
     }
 
     pub fn start_new_session(&mut self) {
@@ -1172,6 +1186,7 @@ impl App {
         self.close_session_picker();
         self.close_model_picker();
         self.active_session_id = None;
+        self.active_run_id = None;
         self.tokens_input = 0;
         self.tokens_output = 0;
         self.scroll_to_bottom();

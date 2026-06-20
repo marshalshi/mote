@@ -37,6 +37,9 @@ pub struct ChatRequest {
     /// Client session key for scoping mutable runtime state (rollback, permission remembers).
     #[serde(default)]
     pub runtime_session_key: Option<String>,
+    /// Optional active run to attach to instead of starting a new agent run.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 // ── Client ↔ Server (bi-directional events during a session) ──
@@ -69,6 +72,12 @@ pub enum ClientEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerEvent {
+    #[serde(rename = "run_started")]
+    RunStarted { run_id: String },
+    #[serde(rename = "run_attached")]
+    RunAttached { run_id: String },
+    #[serde(rename = "run_detached")]
+    RunDetached { run_id: String },
     #[serde(rename = "text_delta")]
     TextDelta { data: String },
     #[serde(rename = "reasoning_delta")]
@@ -129,6 +138,18 @@ pub enum ServerEvent {
     SubagentDone { id: String, content: String },
     #[serde(rename = "done")]
     Done {
+        content: String,
+        tokens_input: u64,
+        tokens_output: u64,
+    },
+    #[serde(rename = "cancelled")]
+    Cancelled {
+        content: String,
+        tokens_input: u64,
+        tokens_output: u64,
+    },
+    #[serde(rename = "needs_continuation")]
+    NeedsContinuation {
         content: String,
         tokens_input: u64,
         tokens_output: u64,
@@ -335,6 +356,7 @@ mod tests {
         assert!(req.workspace_root.is_none());
         assert!(req.repo_agents_md.is_none());
         assert!(req.runtime_session_key.is_none());
+        assert!(req.run_id.is_none());
     }
 
     #[test]

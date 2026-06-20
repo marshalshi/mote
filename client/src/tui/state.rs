@@ -148,6 +148,9 @@ pub struct App {
 
     /// Active session id to continue on next turns.
     pub active_session_id: Option<String>,
+
+    /// Latest mouse position in terminal coordinates.
+    pub mouse_position: Option<(u16, u16)>,
 }
 
 /// Tracks a running subagent's output for the multi-agent TUI.
@@ -308,6 +311,7 @@ impl App {
             model_picker_items: Vec::new(),
             model_picker_index: 0,
             active_session_id: None,
+            mouse_position: None,
         }
     }
 

@@ -687,6 +687,7 @@ fn handle_key_event(
             handle_action(app, action, key.code, key.modifiers);
         }
         Event::Mouse(m) => {
+            app.mouse_position = Some((m.column, m.row));
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if handle_permission_mouse_click(app, m.column, m.row) {

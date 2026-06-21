@@ -348,6 +348,7 @@ async fn single_message(
         workspace_root: Some(workspace_ctx.root.to_string_lossy().to_string()),
         repo_agents_md: workspace_ctx.repo_agents_md.clone(),
         runtime_session_key: Some(workspace_ctx.runtime_session_key.clone()),
+        run_id: None,
     };
     let mut stream = client
         .chat_stream(request)
@@ -361,7 +362,11 @@ async fn single_message(
                 print!("{}", data);
                 content.push_str(&data);
             }
-            marshaling_protocol::ServerEvent::Done { .. } => break,
+            marshaling_protocol::ServerEvent::Done { .. }
+            | marshaling_protocol::ServerEvent::Cancelled { .. }
+            | marshaling_protocol::ServerEvent::NeedsContinuation { .. } => {
+                break;
+            }
             marshaling_protocol::ServerEvent::Error { message } => {
                 eprintln!("Error: {}", message);
                 return Err(anyhow::anyhow!(message));

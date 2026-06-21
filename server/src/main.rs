@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Serialize;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info};
 
@@ -74,6 +74,8 @@ struct AppState {
     device_flows: tokio::sync::Mutex<HashMap<String, DeviceFlow>>,
     /// Runtime state partitioned by client-provided session key.
     runtime_states: tokio::sync::Mutex<HashMap<String, RuntimeSessionState>>,
+    /// Long-running agent tasks that outlive websocket subscribers.
+    runs: tokio::sync::Mutex<HashMap<String, ActiveRun>>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +98,41 @@ struct RequestContext {
     workspace_display: String,
     runtime_session_key: String,
     repo_agents_md: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStatus {
+    Done,
+    Cancelled,
+    NeedsContinuation,
+    Failed,
+}
+
+struct ActiveRun {
+    runtime_session_key: String,
+    events: Vec<marshaling_protocol::ServerEvent>,
+    tx: broadcast::Sender<marshaling_protocol::ServerEvent>,
+    cancel_tx: watch::Sender<bool>,
+    permission_tx: mpsc::UnboundedSender<(String, bool)>,
+    pending_permission_tools: HashMap<String, String>,
+}
+
+impl ActiveRun {
+    fn new(
+        runtime_session_key: String,
+        cancel_tx: watch::Sender<bool>,
+        permission_tx: mpsc::UnboundedSender<(String, bool)>,
+    ) -> Self {
+        let (tx, _) = broadcast::channel(512);
+        Self {
+            runtime_session_key,
+            events: Vec::new(),
+            tx,
+            cancel_tx,
+            permission_tx,
+            pending_permission_tools: HashMap::new(),
+        }
+    }
 }
 
 // ── HTTP routes ─────────────────────────────────────────
@@ -128,14 +165,17 @@ async fn get_config(
         .collect();
     subagent_names.sort();
     let mut agent_model_info = HashMap::new();
-    agent_model_info.insert("default".to_string(), cfg.effective_model_info(None));
+    agent_model_info
+        .insert("default".to_string(), cfg.effective_model_info(None));
     for (name, agent_cfg) in state
         .merged_agents
         .iter()
         .filter(|(_, a)| a.is_user_selectable())
     {
-        agent_model_info
-            .insert(name.clone(), cfg.effective_model_info(agent_cfg.model.as_deref()));
+        agent_model_info.insert(
+            name.clone(),
+            cfg.effective_model_info(agent_cfg.model.as_deref()),
+        );
     }
     Json(marshaling_protocol::UiConfig {
         input_accent: cfg.input_accent().to_string(),
@@ -636,14 +676,6 @@ async fn auth_save(
 
 // ── WebSocket chat handler ──────────────────────────────
 
-/// Drop guard that signals cancellation when the WS handler exits for any reason.
-struct CancelGuard(tokio::sync::watch::Sender<bool>);
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        let _ = self.0.send(true);
-    }
-}
-
 /// Helper: send an error event over WebSocket.
 async fn send_error(socket: &mut WebSocket, msg: impl Into<String>) {
     let json =
@@ -652,6 +684,56 @@ async fn send_error(socket: &mut WebSocket, msg: impl Into<String>) {
         })
         .unwrap();
     let _ = socket.send(Message::Text(json.into())).await;
+}
+
+fn new_run_id() -> String {
+    format!("run_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"))
+}
+
+fn terminal_status(
+    event: &marshaling_protocol::ServerEvent,
+) -> Option<RunStatus> {
+    match event {
+        marshaling_protocol::ServerEvent::Done { .. } => Some(RunStatus::Done),
+        marshaling_protocol::ServerEvent::Cancelled { .. } => {
+            Some(RunStatus::Cancelled)
+        }
+        marshaling_protocol::ServerEvent::NeedsContinuation { .. } => {
+            Some(RunStatus::NeedsContinuation)
+        }
+        marshaling_protocol::ServerEvent::Error { .. } => {
+            Some(RunStatus::Failed)
+        }
+        _ => None,
+    }
+}
+
+fn is_terminal_event(event: &marshaling_protocol::ServerEvent) -> bool {
+    terminal_status(event).is_some()
+}
+
+async fn record_run_event(
+    state: &Arc<AppState>,
+    run_id: &str,
+    event: marshaling_protocol::ServerEvent,
+) {
+    let mut runs = state.runs.lock().await;
+    let Some(run) = runs.get_mut(run_id) else {
+        return;
+    };
+
+    if let marshaling_protocol::ServerEvent::PermissionRequest {
+        id,
+        tool_name,
+        ..
+    } = &event
+    {
+        run.pending_permission_tools
+            .insert(id.clone(), tool_name.clone());
+    }
+
+    run.events.push(event.clone());
+    let _ = run.tx.send(event);
 }
 
 /// Validate a session ID to prevent path traversal.
@@ -864,6 +946,8 @@ pub fn build_permission_map(
     }
     // use_skill is always allowed (safe read-only)
     perms.insert("use_skill".into(), config::Permission::Allow);
+    // finish_task is an internal completion marker handled by the loop.
+    perms.insert("finish_task".into(), config::Permission::Allow);
     // Resolve subagent permission
     let subagent_perm = agent_permissions
         .and_then(|ap| ap.get("subagent"))
@@ -887,11 +971,13 @@ fn build_augmented_tools(
     let mut augmented: Vec<Box<dyn llm::Tool>> =
         llm::builtin_tools(workspace.to_path_buf());
     augmented.push(Box::new(tools::UseSkillTool));
+    augmented.push(Box::new(tools::FinishTaskTool));
 
     // Subagent tool set: builtins + use_skill (no subagent tool to prevent recursion).
     let subagent_tools: Arc<Vec<Box<dyn llm::Tool>>> = {
         let mut v = llm::builtin_tools(workspace.to_path_buf());
         v.push(Box::new(tools::UseSkillTool));
+        v.push(Box::new(tools::FinishTaskTool));
         Arc::new(v)
     };
 
@@ -1020,13 +1106,25 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Run the agent loop — pass channels for events and permission responses
+    // Run the agent loop — pass channels for events and permission responses.
+    // The run is owned by AppState, not by this websocket. Disconnecting this
+    // websocket only detaches the subscriber; explicit ClientEvent::Cancel is
+    // required to stop the agent.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let _cancel_guard = CancelGuard(cancel_tx.clone());
+    let (cancel_tx, cancel_rx) = watch::channel(false);
     let (permission_tx, permission_rx) =
         mpsc::unbounded_channel::<(String, bool)>();
-    let mut pending_permission_tools: HashMap<String, String> = HashMap::new();
+    let run_id = request.run_id.clone().unwrap_or_else(new_run_id);
+
+    if request.run_id.is_some() {
+        let exists = state.runs.lock().await.contains_key(&run_id);
+        if !exists {
+            send_error(&mut socket, format!("Unknown run_id: {run_id}")).await;
+            return;
+        }
+        attach_socket_to_run(socket, state, run_id).await;
+        return;
+    }
 
     // Build augmented tools (builtins + use_skill + subagent)
     let augmented_tools = build_augmented_tools(
@@ -1064,7 +1162,27 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let prov_spawn = ctx.provider;
     let workspace_display = req_ctx.workspace_display.clone();
 
-    let agent_handle = tokio::spawn(async move {
+    {
+        let mut runs = state.runs.lock().await;
+        runs.insert(
+            run_id.clone(),
+            ActiveRun::new(
+                req_ctx.runtime_session_key.clone(),
+                cancel_tx.clone(),
+                permission_tx.clone(),
+            ),
+        );
+    }
+    record_run_event(
+        &state,
+        &run_id,
+        marshaling_protocol::ServerEvent::RunStarted {
+            run_id: run_id.clone(),
+        },
+    )
+    .await;
+
+    tokio::spawn(async move {
         agent::run_loop(
             prov_spawn,
             augmented_tools_spawn,
@@ -1082,123 +1200,271 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         .await;
     });
 
-    // Forward agent events to WebSocket
-    loop {
-        tokio::select! {
-            agent_event = agent_rx.recv() => {
-                match agent_event {
-                    Some(Ok(agent::AgentEvent::Done { content, tokens_input, tokens_output, history })) => {
-                        // Save session to disk (in blocking thread)
-                        let mut session = session::Session::from_chat_history(
-                            &eff_model_id_save,
-                            &eff_provider,
-                            &agent_name,
-                            tokens_input,
-                            tokens_output,
-                            &history,
-                        );
-                        apply_selected_session_id(
-                            &mut session,
-                            selected_session_id.as_deref(),
-                        );
-                        let hist_dir = history_dir_for_session(
-                            &state.config.history.dir,
-                            &req_ctx.runtime_session_key,
-                        );
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = history::save_session(&hist_dir, &session) {
-                                tracing::warn!("Failed to save session: {e}");
-                            }
-                        });
-
-                        // Forward Done to client (without internal history)
-                        let server_event = marshaling_protocol::ServerEvent::Done {
+    let state_for_events = Arc::clone(&state);
+    let run_id_for_events = run_id.clone();
+    let runtime_session_key = req_ctx.runtime_session_key.clone();
+    let history_dir = state.config.history.dir.clone();
+    tokio::spawn(async move {
+        while let Some(agent_event) = agent_rx.recv().await {
+            match agent_event {
+                Ok(agent::AgentEvent::Done {
+                    content,
+                    tokens_input,
+                    tokens_output,
+                    history,
+                }) => {
+                    save_run_session(
+                        history,
+                        eff_model_id_save.clone(),
+                        eff_provider.clone(),
+                        agent_name.clone(),
+                        tokens_input,
+                        tokens_output,
+                        selected_session_id.clone(),
+                        history_dir.clone(),
+                        runtime_session_key.clone(),
+                    );
+                    record_run_event(
+                        &state_for_events,
+                        &run_id_for_events,
+                        marshaling_protocol::ServerEvent::Done {
                             content,
                             tokens_input,
                             tokens_output,
-                        };
-                        let json = serde_json::to_string(&server_event).unwrap();
-                        let _ = socket.send(Message::Text(json.into())).await;
-                        break;
+                        },
+                    )
+                    .await;
+                    break;
+                }
+                Ok(agent::AgentEvent::Cancelled {
+                    content,
+                    tokens_input,
+                    tokens_output,
+                    history,
+                }) => {
+                    save_run_session(
+                        history,
+                        eff_model_id_save.clone(),
+                        eff_provider.clone(),
+                        agent_name.clone(),
+                        tokens_input,
+                        tokens_output,
+                        selected_session_id.clone(),
+                        history_dir.clone(),
+                        runtime_session_key.clone(),
+                    );
+                    record_run_event(
+                        &state_for_events,
+                        &run_id_for_events,
+                        marshaling_protocol::ServerEvent::Cancelled {
+                            content,
+                            tokens_input,
+                            tokens_output,
+                        },
+                    )
+                    .await;
+                    break;
+                }
+                Ok(agent::AgentEvent::NeedsContinuation {
+                    content,
+                    tokens_input,
+                    tokens_output,
+                    history,
+                }) => {
+                    save_run_session(
+                        history,
+                        eff_model_id_save.clone(),
+                        eff_provider.clone(),
+                        agent_name.clone(),
+                        tokens_input,
+                        tokens_output,
+                        selected_session_id.clone(),
+                        history_dir.clone(),
+                        runtime_session_key.clone(),
+                    );
+                    record_run_event(
+                        &state_for_events,
+                        &run_id_for_events,
+                        marshaling_protocol::ServerEvent::NeedsContinuation {
+                            content,
+                            tokens_input,
+                            tokens_output,
+                        },
+                    )
+                    .await;
+                    break;
+                }
+                Ok(agent::AgentEvent::ToolCompleted {
+                    id,
+                    name,
+                    result,
+                    changes,
+                    rollback_entries,
+                }) => {
+                    if !rollback_entries.is_empty() {
+                        let mut sessions =
+                            state_for_events.runtime_states.lock().await;
+                        let session_state = sessions
+                            .entry(runtime_session_key.clone())
+                            .or_default();
+                        session_state.rollback_journal.push(
+                            RollbackChangeSet {
+                                id: id.clone(),
+                                tool_name: name,
+                                entries: rollback_entries,
+                                display_changes: changes.clone(),
+                            },
+                        );
                     }
-                    Some(Ok(event)) => {
-                        if let agent::AgentEvent::ToolCompleted { id, name, result, changes, rollback_entries } = event {
-                            if !rollback_entries.is_empty() {
-                                let mut sessions = state.runtime_states.lock().await;
-                                let session_state = sessions.entry(req_ctx.runtime_session_key.clone()).or_default();
-                                session_state.rollback_journal.push(RollbackChangeSet {
-                                    id: id.clone(),
-                                    tool_name: name,
-                                    entries: rollback_entries,
-                                    display_changes: changes.clone(),
-                                });
-                            }
-                            let server_event = marshaling_protocol::ServerEvent::ToolCompleted { id, result, changes };
-                            let json = serde_json::to_string(&server_event).unwrap();
-                            if socket.send(Message::Text(json.into())).await.is_err() {
-                                break;
-                            }
-                            continue;
-                        }
+                    record_run_event(
+                        &state_for_events,
+                        &run_id_for_events,
+                        marshaling_protocol::ServerEvent::ToolCompleted {
+                            id,
+                            result,
+                            changes,
+                        },
+                    )
+                    .await;
+                }
+                Ok(event) => {
+                    record_run_event(
+                        &state_for_events,
+                        &run_id_for_events,
+                        agent_event_to_server_event(event),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    record_run_event(
+                        &state_for_events,
+                        &run_id_for_events,
+                        marshaling_protocol::ServerEvent::Error {
+                            message: format!("{:#}", e),
+                        },
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+    });
 
-                        if let agent::AgentEvent::PermissionRequest { id, tool_name, .. } = &event {
-                            pending_permission_tools.insert(id.clone(), tool_name.clone());
-                        }
+    attach_socket_to_run(socket, state, run_id).await;
+}
 
-                        let server_event = agent_event_to_server_event(event);
-                        let json = serde_json::to_string(&server_event).unwrap();
+fn save_run_session(
+    history: Vec<llm::ChatMessage>,
+    model_id: String,
+    provider: String,
+    agent_name: String,
+    tokens_input: u64,
+    tokens_output: u64,
+    selected_session_id: Option<String>,
+    history_base_dir: PathBuf,
+    runtime_session_key: String,
+) {
+    let mut session = session::Session::from_chat_history(
+        &model_id,
+        &provider,
+        &agent_name,
+        tokens_input,
+        tokens_output,
+        &history,
+    );
+    apply_selected_session_id(&mut session, selected_session_id.as_deref());
+    let hist_dir =
+        history_dir_for_session(&history_base_dir, &runtime_session_key);
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = history::save_session(&hist_dir, &session) {
+            tracing::warn!("Failed to save session: {e}");
+        }
+    });
+}
+
+async fn attach_socket_to_run(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    run_id: String,
+) {
+    let (mut rx, replay, runtime_session_key) = {
+        let runs = state.runs.lock().await;
+        let Some(run) = runs.get(&run_id) else {
+            send_error(&mut socket, format!("Unknown run_id: {run_id}")).await;
+            return;
+        };
+        (
+            run.tx.subscribe(),
+            run.events.clone(),
+            run.runtime_session_key.clone(),
+        )
+    };
+
+    for event in replay {
+        let terminal = is_terminal_event(&event);
+        let json = match serde_json::to_string(&event) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("Failed to serialize replay event: {e}");
+                continue;
+            }
+        };
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+        if terminal {
+            return;
+        }
+    }
+
+    let attached = marshaling_protocol::ServerEvent::RunAttached {
+        run_id: run_id.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&attached) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            run_event = rx.recv() => {
+                match run_event {
+                    Ok(event) => {
+                        let terminal = is_terminal_event(&event);
+                        let json = match serde_json::to_string(&event) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                tracing::warn!("Failed to serialize run event: {e}");
+                                continue;
+                            }
+                        };
                         if socket.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
-                        // If done, the agent loop finished. Send nothing else.
-                        if matches!(server_event, marshaling_protocol::ServerEvent::Done { .. }) {
+                        if terminal {
                             break;
                         }
                     }
-                    Some(Err(e)) => {
-                        send_error(&mut socket, format!("{:#}", e)).await;
-                        break;
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("Websocket subscriber lagged by {skipped} run events");
+                        continue;
                     }
-                    None => break,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             ws_msg = socket.recv() => {
                 match ws_msg {
-                    Some(Ok(Message::Close(_))) | None => {
-                        let _ = cancel_tx.send(true);
-                        break;
-                    }
+                    Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Text(text))) => {
-                        // Check if this is a ClientEvent (e.g., permission response, cancel)
-                        if let Ok(client_event) = serde_json::from_str::<marshaling_protocol::ClientEvent>(&text) {
-                            match client_event {
-                                marshaling_protocol::ClientEvent::PermissionResponse { id, allowed, remember } => {
-                                    if remember && allowed {
-                                        if let Some(tool_name) = pending_permission_tools.get(&id).cloned() {
-                                            let mut sessions = state.runtime_states.lock().await;
-                                            let sess = sessions.entry(req_ctx.runtime_session_key.clone()).or_default();
-                                            sess.remember_allow_tools.insert(tool_name);
-                                        }
-                                    }
-                                    let _ = permission_tx.send((id, allowed));
-                                }
-                                marshaling_protocol::ClientEvent::Cancel => {
-                                    debug!("Client requested cancellation");
-                                    let _ = cancel_tx.send(true);
-                                }
-                                marshaling_protocol::ClientEvent::RollbackLast { runtime_session_key } => {
-                                    let key = runtime_session_key.unwrap_or_else(|| req_ctx.runtime_session_key.clone());
-                                    let payload = apply_rollback_last(&state, &key).await;
-                                    let evt = marshaling_protocol::ServerEvent::RollbackResult {
-                                        success: payload.success,
-                                        message: payload.message,
-                                        changes: payload.changes,
-                                    };
-                                    let json = serde_json::to_string(&evt).unwrap();
-                                    let _ = socket.send(Message::Text(json.into())).await;
-                                }
-                            }
-                        }
+                        handle_client_event_for_run(
+                            &state,
+                            &run_id,
+                            &runtime_session_key,
+                            &mut socket,
+                            &text,
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -1206,9 +1472,77 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Check if the agent task panicked
-    if let Err(e) = agent_handle.await {
-        tracing::error!("Agent loop panicked: {:#}", e);
+    let detached = marshaling_protocol::ServerEvent::RunDetached { run_id };
+    if let Ok(json) = serde_json::to_string(&detached) {
+        let _ = socket.send(Message::Text(json.into())).await;
+    }
+}
+
+async fn handle_client_event_for_run(
+    state: &Arc<AppState>,
+    run_id: &str,
+    runtime_session_key: &str,
+    socket: &mut WebSocket,
+    text: &str,
+) {
+    let Ok(client_event) =
+        serde_json::from_str::<marshaling_protocol::ClientEvent>(text)
+    else {
+        return;
+    };
+
+    match client_event {
+        marshaling_protocol::ClientEvent::PermissionResponse {
+            id,
+            allowed,
+            remember,
+        } => {
+            let (permission_tx, remembered_tool) = {
+                let runs = state.runs.lock().await;
+                let Some(run) = runs.get(run_id) else {
+                    return;
+                };
+                (
+                    run.permission_tx.clone(),
+                    run.pending_permission_tools.get(&id).cloned(),
+                )
+            };
+            if remember && allowed {
+                if let Some(tool_name) = remembered_tool {
+                    let mut sessions = state.runtime_states.lock().await;
+                    let sess = sessions
+                        .entry(runtime_session_key.to_string())
+                        .or_default();
+                    sess.remember_allow_tools.insert(tool_name);
+                }
+            }
+            let _ = permission_tx.send((id, allowed));
+        }
+        marshaling_protocol::ClientEvent::Cancel => {
+            debug!("Client requested cancellation for run {run_id}");
+            let cancel_tx = {
+                let runs = state.runs.lock().await;
+                runs.get(run_id).map(|run| run.cancel_tx.clone())
+            };
+            if let Some(cancel_tx) = cancel_tx {
+                let _ = cancel_tx.send(true);
+            }
+        }
+        marshaling_protocol::ClientEvent::RollbackLast {
+            runtime_session_key: requested_key,
+        } => {
+            let key = requested_key
+                .unwrap_or_else(|| runtime_session_key.to_string());
+            let payload = apply_rollback_last(state, &key).await;
+            let evt = marshaling_protocol::ServerEvent::RollbackResult {
+                success: payload.success,
+                message: payload.message,
+                changes: payload.changes,
+            };
+            if let Ok(json) = serde_json::to_string(&evt) {
+                let _ = socket.send(Message::Text(json.into())).await;
+            }
+        }
     }
 }
 
@@ -1305,6 +1639,26 @@ fn agent_event_to_server_event(
             tokens_output,
             ..
         } => marshaling_protocol::ServerEvent::Done {
+            content,
+            tokens_input,
+            tokens_output,
+        },
+        AgentEvent::Cancelled {
+            content,
+            tokens_input,
+            tokens_output,
+            ..
+        } => marshaling_protocol::ServerEvent::Cancelled {
+            content,
+            tokens_input,
+            tokens_output,
+        },
+        AgentEvent::NeedsContinuation {
+            content,
+            tokens_input,
+            tokens_output,
+            ..
+        } => marshaling_protocol::ServerEvent::NeedsContinuation {
             content,
             tokens_input,
             tokens_output,
@@ -1621,6 +1975,7 @@ async fn main() -> Result<()> {
         config,
         device_flows: tokio::sync::Mutex::new(HashMap::new()),
         runtime_states: tokio::sync::Mutex::new(HashMap::new()),
+        runs: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let configured_port = state.config.server.port;
@@ -1803,6 +2158,7 @@ read = "allow"
                     remember_allow_tools: HashSet::new(),
                 },
             )])),
+            runs: tokio::sync::Mutex::new(HashMap::new()),
         });
 
         let result = apply_rollback_last(&state, "sess").await;

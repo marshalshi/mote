@@ -85,9 +85,33 @@ impl PromptAssembler {
             self.build_env_block(model_id, self.workspace_root.as_deref()),
         );
 
-        // Layer 2: Model-specific prompt
-        //   - Config override (model_specific) takes precedence
-        //   - Otherwise auto-detect: prompts/<provider>.txt (e.g., prompts/deepseek.txt)
+        if let Some(layer) = self.load_model_prompt_layer(model_provider)? {
+            layers.push(layer);
+        }
+
+        if let Some(layer) = self.load_global_agents_layer()? {
+            layers.push(layer);
+        }
+
+        if let Some(layer) = self.workspace_agents_layer() {
+            layers.push(layer);
+        }
+
+        if let Some(layer) = self.agent_instructions_layer() {
+            layers.push(layer);
+        }
+
+        if let Some(layer) = self.skills_layer() {
+            layers.push(layer);
+        }
+
+        Ok(layers)
+    }
+
+    fn load_model_prompt_layer(
+        &self,
+        model_provider: &str,
+    ) -> Result<Option<String>> {
         let model_prompt_path = self
             .config
             .prompts
@@ -99,130 +123,147 @@ impl PromptAssembler {
             });
         let model_prompt = self.load_file_or_default(&model_prompt_path, "")?;
         if !model_prompt.is_empty() {
-            layers.push(model_prompt);
-        } else {
-            // Layer 2 (fallback): Default system prompt — only if no provider-specific prompt
-            let default =
-                self.load_file_or_default(&self.config.prompts.default, "")?;
-            if !default.is_empty() {
-                layers.push(default);
-            }
+            return Ok(Some(model_prompt));
         }
 
-        // Layer 3: User AGENTS.md from ~/.config/mote/AGENTS.md (if it exists)
-        if let Some(home) = dirs::home_dir() {
-            let agents_path =
-                home.join(".config").join("mote").join("AGENTS.md");
-            if agents_path.exists() {
-                let content = std::fs::read_to_string(&agents_path)
-                    .with_context(|| {
-                        format!("Failed to read: {}", agents_path.display())
-                    })?;
-                if !content.trim().is_empty() {
-                    layers.push(format!(
-                        "Instructions from: {}\n{}",
-                        agents_path.display(),
-                        content.trim()
-                    ));
-                }
-            }
+        let default =
+            self.load_file_or_default(&self.config.prompts.default, "")?;
+        Ok((!default.is_empty()).then_some(default))
+    }
+
+    fn load_global_agents_layer(&self) -> Result<Option<String>> {
+        let Some(home) = dirs::home_dir() else {
+            return Ok(None);
+        };
+
+        let agents_path = home.join(".config").join("mote").join("AGENTS.md");
+        if !agents_path.exists() {
+            return Ok(None);
         }
 
-        // Layer 4: Workspace AGENTS.md passed by the client (if present)
-        if let Some(ref content) = self.repo_agents_md {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                let src = self
-                    .workspace_root
-                    .as_ref()
-                    .map(|p| p.join("AGENTS.md").display().to_string())
-                    .unwrap_or_else(|| "<workspace>/AGENTS.md".to_string());
-                layers.push(format!("Instructions from: {}\n{}", src, trimmed));
-            }
+        let content =
+            std::fs::read_to_string(&agents_path).with_context(|| {
+                format!("Failed to read: {}", agents_path.display())
+            })?;
+        Ok(Self::format_instructions_layer(
+            agents_path.display().to_string(),
+            &content,
+        ))
+    }
+
+    fn workspace_agents_layer(&self) -> Option<String> {
+        let src = self
+            .workspace_root
+            .as_ref()
+            .map(|p| p.join("AGENTS.md").display().to_string())
+            .unwrap_or_else(|| "<workspace>/AGENTS.md".to_string());
+        self.repo_agents_md
+            .as_deref()
+            .and_then(|content| Self::format_instructions_layer(src, content))
+    }
+
+    fn agent_instructions_layer(&self) -> Option<String> {
+        self.agent_instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn skills_layer(&self) -> Option<String> {
+        let skills_dir = dirs::home_dir()?
+            .join(".config")
+            .join("mote")
+            .join("skills");
+        if !skills_dir.is_dir() {
+            return None;
         }
 
-        // Layer 5: Agent-specific instructions (if set for this agent)
-        if let Some(ref instructions) = self.agent_instructions {
-            let trimmed = instructions.trim();
-            if !trimmed.is_empty() {
-                layers.push(trimmed.to_string());
-            }
+        let skill_entries = self.load_skill_entries(&skills_dir);
+        if skill_entries.is_empty() {
+            return None;
         }
 
-        // Layer 6: Skills index — only name + description (not full content)
-        // Full content is loaded on demand via the `use_skill` tool.
-        if let Some(home) = dirs::home_dir() {
-            let skills_dir = home.join(".config").join("mote").join("skills");
-            if skills_dir.is_dir() {
-                let mut skill_entries: Vec<(String, String)> = Vec::new(); // (name, description)
-                if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-                    let mut folders: Vec<_> = entries
-                        .flatten()
-                        .filter(|e| e.path().is_dir())
-                        .collect();
-                    folders.sort_by_key(|e| e.file_name());
-                    for entry in folders {
-                        let folder_name =
-                            entry.file_name().to_string_lossy().to_string();
-                        let skill_path = entry.path().join("SKILL.md");
-                        if !skill_path.exists() {
-                            continue;
-                        }
-                        if let Ok(content) =
-                            std::fs::read_to_string(&skill_path)
-                        {
-                            // Parse YAML frontmatter for name + description
-                            let (meta, _body) = if let Some(rest) = content
-                                .strip_prefix("---\n")
-                                .or_else(|| content.strip_prefix("---\r\n"))
-                            {
-                                if let Some((yaml_text, _rest_body)) = rest
-                                    .split_once("\n---")
-                                    .or_else(|| rest.split_once("\r\n---"))
-                                {
-                                    let skill_meta: Option<SkillMeta> =
-                                        serde_yaml::from_str(yaml_text).ok();
-                                    (skill_meta, "")
-                                } else {
-                                    (None, "")
-                                }
-                            } else {
-                                (None, "")
-                            };
-                            if let Some(meta) = meta {
-                                let skill_name = meta
-                                    .name
-                                    .unwrap_or_else(|| folder_name.clone());
-                                skill_entries
-                                    .push((skill_name, meta.description));
-                            } else {
-                                // No frontmatter — still list the skill with folder name
-                                skill_entries
-                                    .push((folder_name, String::new()));
-                            }
-                        }
-                    }
-                }
-                if !skill_entries.is_empty() {
-                    let mut skills_text = String::from(
-                        "Skills available:\n\
-                         Review the skills below. If a skill's description matches the current task, ",
-                    );
-                    skills_text.push_str("call use_skill(\"<name>\") to load its full guidance, then apply it.\n");
-                    for (name, desc) in &skill_entries {
-                        if desc.is_empty() {
-                            skills_text.push_str(&format!("  {}\n", name));
-                        } else {
-                            skills_text
-                                .push_str(&format!("  {} — {}\n", name, desc));
-                        }
-                    }
-                    layers.push(skills_text);
-                }
+        let mut skills_text = String::from(
+            "Skills available:\n\
+             Review the skills below. If a skill's description matches the current task, ",
+        );
+        skills_text.push_str(
+            "call use_skill(\"<name>\") to load its full guidance, then apply it.\n",
+        );
+        for (name, desc) in &skill_entries {
+            if desc.is_empty() {
+                skills_text.push_str(&format!("  {}\n", name));
+            } else {
+                skills_text.push_str(&format!("  {} — {}\n", name, desc));
             }
         }
+        Some(skills_text)
+    }
 
-        Ok(layers)
+    fn load_skill_entries(&self, skills_dir: &Path) -> Vec<(String, String)> {
+        let Ok(entries) = std::fs::read_dir(skills_dir) else {
+            return Vec::new();
+        };
+
+        let mut folders: Vec<_> =
+            entries.flatten().filter(|e| e.path().is_dir()).collect();
+        folders.sort_by_key(|e| e.file_name());
+
+        folders
+            .into_iter()
+            .filter_map(|entry| self.load_skill_entry(&entry))
+            .collect()
+    }
+
+    fn load_skill_entry(
+        &self,
+        entry: &std::fs::DirEntry,
+    ) -> Option<(String, String)> {
+        let folder_name = entry.file_name().to_string_lossy().to_string();
+        let skill_path = entry.path().join("SKILL.md");
+        if !skill_path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&skill_path).ok()?;
+        let (meta, _) = Self::parse_skill_frontmatter(&content);
+        Some(match meta {
+            Some(meta) => (meta.name.unwrap_or(folder_name), meta.description),
+            None => (folder_name, String::new()),
+        })
+    }
+
+    fn parse_skill_frontmatter(content: &str) -> (Option<SkillMeta>, &str) {
+        let trimmed = content.trim();
+        let Some(rest) = content
+            .strip_prefix("---\n")
+            .or_else(|| content.strip_prefix("---\r\n"))
+        else {
+            return (None, trimmed);
+        };
+
+        let Some((yaml_text, rest_body)) = rest
+            .split_once("\n---")
+            .or_else(|| rest.split_once("\r\n---"))
+        else {
+            return (None, trimmed);
+        };
+
+        let body = rest_body
+            .trim_start_matches("\r\n")
+            .trim_start_matches('\n')
+            .trim();
+        (serde_yaml::from_str(yaml_text).ok(), body)
+    }
+
+    fn format_instructions_layer(
+        source: String,
+        content: &str,
+    ) -> Option<String> {
+        let trimmed = content.trim();
+        (!trimmed.is_empty())
+            .then(|| format!("Instructions from: {}\n{}", source, trimmed))
     }
 
     /// Build the environment info block (Layer 1).
@@ -338,16 +379,16 @@ pub fn build_system_reminder(ctx: &ReminderContext) -> String {
     };
 
     let guidance = if ctx.step == 1 {
-        "You are at the start of a task. Use the tools above to accomplish the user's request."
+        "You are at the start of a task. Use the tools above to accomplish the user's request. When the request is fully complete, call finish_task with the final answer. Do not stop with plain text unless you are blocked."
     } else {
-        "Continue the task based on these results. Do not repeat tool calls that already succeeded."
+        "Continue the task based on these results. Do not repeat tool calls that already succeeded. When the request is fully complete, call finish_task with the final answer."
     };
 
     format!(
         "<system-reminder>\n\
          Current time: {}\n\
          Working directory: {}\n\
-         Step: Turn {} of {}\n\n\
+         Step: Turn {} (soft budget: {})\n\n\
          {}\
          {}\
          {}\
@@ -569,19 +610,7 @@ description: Does something
 ---
 Skill content here."#;
 
-        // Parse frontmatter
-        let (meta, body) = if let Some(rest) = content.strip_prefix("---\n") {
-            if let Some((yaml_text, rest_body)) = rest.split_once("\n---") {
-                let skill_meta: Option<super::SkillMeta> =
-                    serde_yaml::from_str(yaml_text).ok();
-                let body = rest_body.trim_start_matches('\n').trim();
-                (skill_meta, body)
-            } else {
-                (None, content.trim())
-            }
-        } else {
-            (None, content.trim())
-        };
+        let (meta, body) = PromptAssembler::parse_skill_frontmatter(content);
 
         assert!(meta.is_some());
         assert_eq!(meta.as_ref().unwrap().name.as_deref(), Some("my-skill"));
@@ -595,19 +624,7 @@ Skill content here."#;
         let folder_name = "my-folder-name";
 
         // No frontmatter → name should fall back to folder name
-        let trimmed = content.trim();
-        let (meta, _body) = if let Some(rest) = content.strip_prefix("---\n") {
-            if let Some((yaml_text, rest_body)) = rest.split_once("\n---") {
-                let skill_meta: Option<super::SkillMeta> =
-                    serde_yaml::from_str(yaml_text).ok();
-                let body = rest_body.trim_start_matches('\n').trim();
-                (skill_meta, body)
-            } else {
-                (None, trimmed)
-            }
-        } else {
-            (None, trimmed)
-        };
+        let (meta, _body) = PromptAssembler::parse_skill_frontmatter(content);
 
         let skill_name = meta
             .as_ref()
@@ -633,7 +650,7 @@ Skill content here."#;
         let reminder = build_system_reminder(&ctx);
         assert!(reminder.contains("<system-reminder>"));
         assert!(reminder.contains("</system-reminder>"));
-        assert!(reminder.contains("Turn 1 of 10"));
+        assert!(reminder.contains("Turn 1 (soft budget: 10)"));
         assert!(reminder.contains("/tmp/test"));
         assert!(reminder.contains("<reminder>"));
         // First turn should NOT have <last_turn_results>
@@ -662,7 +679,7 @@ Skill content here."#;
             last_user_message: Some("find the config file".into()),
         };
         let reminder = build_system_reminder(&ctx);
-        assert!(reminder.contains("Turn 2 of 10"));
+        assert!(reminder.contains("Turn 2 (soft budget: 10)"));
         assert!(reminder.contains("<last_turn_results>"));
         assert!(reminder.contains("read(\"file contents...\") → Success"));
         assert!(reminder.contains("bash(\"command not found\") → Failed"));

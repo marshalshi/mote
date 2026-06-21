@@ -21,7 +21,6 @@ impl GitHubModelsProvider {
             token: config.resolve_github_token(auth)?,
             base_url: config.github_base_url()?,
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .context("Failed to create HTTP client")?,
         })
@@ -387,8 +386,9 @@ impl LlmProvider for GitHubModelsProvider {
             }
         }
 
-        let result = finalize_gh(&mut text_content, &mut tool_call_acc, usage);
-        let _ = sender.send(Ok(StreamEvent::Done(result)));
+        let _ = sender.send(Err(anyhow::anyhow!(
+            "GitHub Models stream ended before completion marker"
+        )));
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {

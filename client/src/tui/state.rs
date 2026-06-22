@@ -152,6 +152,18 @@ pub struct App {
     /// Active session id to continue on next turns.
     pub active_session_id: Option<String>,
 
+    /// Persisted compacted context for older conversation turns.
+    pub compaction_state: Option<marshaling_protocol::CompactionState>,
+
+    /// Pending auto-compaction confirmation before sending the latest message.
+    pub pending_compact_confirmation: bool,
+
+    /// Resume sending the latest user message after auto-compaction confirmation.
+    pub pending_auto_compact_send: bool,
+
+    /// Latest message for which auto-compaction was declined.
+    compact_declined_for_message: Option<String>,
+
     /// Latest mouse position in terminal coordinates.
     pub mouse_position: Option<(u16, u16)>,
 }
@@ -196,6 +208,7 @@ pub enum SlashAction {
     FetchModels,
     OpenSessions,
     LoadSession(String),
+    Compact { include_latest_user: bool },
     SaveCredential(String, String, String), // provider, key, value
     RollbackLast,
     RunShell(String),
@@ -211,6 +224,8 @@ pub enum AppState {
 
 // ── Built-in commands ─────────────────────────────────────
 
+const AUTO_COMPACT_CHAR_THRESHOLD: usize = 100_000;
+
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
     ("/login", "Login to a provider (github)"),
@@ -219,6 +234,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/sessions", "Open session picker"),
     ("/model", "Show / switch model"),
+    ("/compact", "Compact conversation context"),
     ("/subagents", "List active subagents"),
     ("/rollback", "Rollback last changes"),
 ];
@@ -314,6 +330,10 @@ impl App {
             model_picker_items: Vec::new(),
             model_picker_index: 0,
             active_session_id: None,
+            compaction_state: None,
+            pending_compact_confirmation: false,
+            pending_auto_compact_send: false,
+            compact_declined_for_message: None,
             mouse_position: None,
         }
     }
@@ -469,6 +489,135 @@ impl App {
             .push(DisplayMessage::command(role, content.into()));
     }
 
+    pub fn compact_history_messages(
+        &self,
+        include_latest_user: bool,
+    ) -> Vec<marshaling_protocol::HistoryMessage> {
+        let compacted_count = self
+            .compaction_state
+            .as_ref()
+            .map(|c| c.compacted_message_count)
+            .unwrap_or(0);
+        let mut conversation_seen = 0usize;
+        self.messages
+            .iter()
+            .filter(|m| m.source == MessageSource::Conversation)
+            .filter_map(|m| {
+                conversation_seen += 1;
+                if conversation_seen <= compacted_count {
+                    return None;
+                }
+                if !include_latest_user
+                    && conversation_seen == self.conversation_message_count()
+                    && m.role == Role::User
+                {
+                    return None;
+                }
+                Some(marshaling_protocol::HistoryMessage {
+                    role: match m.role {
+                        Role::User => "user".into(),
+                        Role::Assistant => "assistant".into(),
+                    },
+                    content: m.content.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn apply_compaction(
+        &mut self,
+        session_id: String,
+        compaction: marshaling_protocol::CompactionState,
+    ) {
+        self.active_session_id = Some(session_id);
+        self.compaction_state = Some(compaction);
+        self.pending_compact_confirmation = false;
+        self.compact_declined_for_message = None;
+        self.push_command_message(
+            Role::Assistant,
+            "Conversation context compacted. Older turns will be sent as a summary.",
+        );
+    }
+
+    pub fn needs_auto_compact(&self) -> bool {
+        let Some(last_content) = self.pending_user_message_content() else {
+            return false;
+        };
+        if self.pending_compact_confirmation {
+            return false;
+        }
+        if self.compact_declined_for_message.as_deref() == Some(last_content) {
+            return false;
+        }
+        self.uncompacted_context_chars(false) > AUTO_COMPACT_CHAR_THRESHOLD
+    }
+
+    pub fn request_auto_compact_confirmation(&mut self) {
+        self.pending_compact_confirmation = true;
+        self.push_command_message(
+            Role::Assistant,
+            "Conversation context is getting large. Compact before sending? Press `Y` to compact and continue, or `N` to send without compacting. If you decline, the model may miss older details or exceed context limits.",
+        );
+    }
+
+    pub fn accept_auto_compact(&mut self) {
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = true;
+        self.pending_slash = Some(SlashAction::Compact {
+            include_latest_user: false,
+        });
+    }
+
+    pub fn deny_auto_compact(&mut self) {
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = true;
+        if let Some(content) = self.pending_user_message_content() {
+            self.compact_declined_for_message = Some(content.to_string());
+        }
+        self.push_command_message(
+            Role::Assistant,
+            "Continuing without compaction. Risk: the model may lose older context or hit token limits.",
+        );
+    }
+
+    pub fn suppress_auto_compact_for_latest_message(&mut self) {
+        if let Some(content) = self.pending_user_message_content() {
+            self.compact_declined_for_message = Some(content.to_string());
+        }
+    }
+
+    pub fn pending_user_message_content(&self) -> Option<&str> {
+        let latest_conversation = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.source == MessageSource::Conversation)?;
+
+        (latest_conversation.role == Role::User)
+            .then_some(latest_conversation.content.as_str())
+    }
+
+    fn conversation_message_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| m.source == MessageSource::Conversation)
+            .count()
+    }
+
+    fn uncompacted_conversation_message_count(
+        &self,
+        include_latest_user: bool,
+    ) -> usize {
+        self.compact_history_messages(include_latest_user).len()
+    }
+
+    fn uncompacted_context_chars(&self, include_latest_user: bool) -> usize {
+        self.compact_history_messages(include_latest_user)
+            .iter()
+            .map(|m| m.content.len())
+            .sum()
+    }
+
     /// Transform `@name` mentions in the message into text the LLM will understand as subagent calls.
     /// E.g., `@review check this` → `[use subagent "review"] check this`
     fn transform_mentions(&self, text: &str) -> String {
@@ -513,6 +662,7 @@ impl App {
             "/sessions" => self.handle_sessions_command(),
             "/models" => self.handle_models_command(),
             "/model" => self.handle_model_command(&parts),
+            "/compact" => self.handle_compact_command(),
             "/subagents" => self.handle_subagents_command(),
             "/rollback" => self.handle_rollback_command(&parts),
             _ => self.handle_unknown_command(cmd),
@@ -530,6 +680,7 @@ impl App {
                 "- `/new` — Start a new session",
                 "- `/sessions` — Open session picker",
                 "- `/model` — Show / switch model",
+                "- `/compact` — Compact older conversation context",
                 "- `/subagents` — List active subagents",
                 "- `/rollback last` — Rollback latest file changes",
                 "- `/login github <token>` — Save GitHub token",
@@ -652,6 +803,30 @@ impl App {
             Role::Assistant,
             format!("Messages: {}", self.messages.len()),
         );
+    }
+
+    fn handle_compact_command(&mut self) {
+        if self.state != AppState::Idle {
+            self.push_command_message(
+                Role::Assistant,
+                "Cannot compact while agent is running.",
+            );
+            return;
+        }
+        if self.uncompacted_conversation_message_count(true) == 0 {
+            self.push_command_message(
+                Role::Assistant,
+                "Nothing new to compact.",
+            );
+            return;
+        }
+        self.push_command_message(
+            Role::Assistant,
+            "Compacting older conversation context...",
+        );
+        self.pending_slash = Some(SlashAction::Compact {
+            include_latest_user: true,
+        });
     }
 
     fn handle_agent_command(&mut self, parts: &[&str]) {
@@ -1201,6 +1376,10 @@ impl App {
         self.tokens_input = 0;
         self.tokens_output = 0;
         self.active_run_id = None;
+        self.compaction_state = None;
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = false;
+        self.compact_declined_for_message = None;
     }
 
     pub fn start_new_session(&mut self) {
@@ -1227,6 +1406,10 @@ impl App {
         self.close_model_picker();
         self.active_session_id = None;
         self.active_run_id = None;
+        self.compaction_state = None;
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = false;
+        self.compact_declined_for_message = None;
         self.tokens_input = 0;
         self.tokens_output = 0;
         self.scroll_to_bottom();
@@ -1537,6 +1720,87 @@ mod tests {
                 .contains("- `/help` — Show this help")
         );
         assert!(app.messages[0].content.contains("## Keybindings"));
+    }
+
+    #[test]
+    fn test_slash_compact_sets_pending_action() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.messages.push(DisplayMessage {
+            role: Role::User,
+            content: "older question".into(),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        app.input = "/compact".into();
+
+        app.submit_input();
+
+        assert!(matches!(
+            app.pending_slash,
+            Some(SlashAction::Compact {
+                include_latest_user: true
+            })
+        ));
+    }
+
+    #[test]
+    fn test_compact_history_skips_compacted_messages() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        for content in ["u1", "a1", "u2"] {
+            app.messages.push(DisplayMessage {
+                role: if content.starts_with('u') {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: content.into(),
+                thinking: None,
+                source: MessageSource::Conversation,
+            });
+        }
+        app.compaction_state = Some(marshaling_protocol::CompactionState {
+            summary: "u1/a1".into(),
+            compacted_message_count: 2,
+            model_provider: "test".into(),
+            model_id: "test-model".into(),
+        });
+
+        let history = app.compact_history_messages(false);
+
+        assert!(history.is_empty());
+        let history = app.compact_history_messages(true);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "u2");
+    }
+
+    #[test]
+    fn test_auto_compact_confirmation_flow() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.messages.push(DisplayMessage {
+            role: Role::Assistant,
+            content: "x".repeat(AUTO_COMPACT_CHAR_THRESHOLD + 1),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        app.messages.push(DisplayMessage {
+            role: Role::User,
+            content: "latest".into(),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+
+        assert!(app.needs_auto_compact());
+        app.request_auto_compact_confirmation();
+        assert!(app.pending_compact_confirmation);
+        assert_eq!(app.pending_user_message_content(), Some("latest"));
+        app.deny_auto_compact();
+        assert_eq!(app.compact_declined_for_message.as_deref(), Some("latest"));
+        assert!(app.pending_auto_compact_send);
+        assert_eq!(app.pending_user_message_content(), Some("latest"));
+        assert!(!app.needs_auto_compact());
     }
 
     #[test]

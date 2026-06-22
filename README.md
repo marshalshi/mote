@@ -111,6 +111,7 @@ agent_command = "ctrl+space"
 | `/help` | Show help |
 | `/agent` | List / switch agents |
 | `/model` | Open model picker popup (↑/↓, Enter, Esc) |
+| `/compact` | Compact older conversation context into a persisted summary |
 | `/tokens` | Show token usage |
 | `/new` | Start a fresh chat session |
 | `/sessions` | Open session picker (↑/↓, Enter, Esc) |
@@ -123,7 +124,10 @@ agent_command = "ctrl+space"
 Notes:
 - `/sessions` is available only when the app is idle (not during an active streaming turn).
 - `/new` clears the current transcript and active resumed session id, while keeping your selected agent/model/workspace.
-- `/model <provider/model>` and `/model default` still work, but `/model` opens the picker for easier selection.
+- `/model <provider/model>` still works, but `/model` opens the picker for easier provider/model selection.
+- `/compact` summarizes older conversation turns using the current effective agent model. The visible transcript remains, but already-compacted turns are replaced by the summary when future requests are sent to the LLM.
+- When the local conversation context gets large, mote asks before auto-compacting. If you decline, mote continues and warns that the model may lose older context or hit token limits.
+- Compaction state is saved with sessions and restored when a session is resumed.
 - `!` commands are local TUI commands; their output is shown in the transcript but is not sent to the LLM as conversation history.
 
 ### Agents
@@ -314,6 +318,7 @@ mote/
 | `GET` | `/config` | UI settings (accent colors, agent names, model info) |
 | `GET` | `/models` | Available models from all providers |
 | `GET` | `/sessions` | Saved session list |
+| `POST` | `/compact` | Summarize older conversation context for persisted compacted sessions |
 | `POST` | `/rollback/last` | Roll back latest tracked file changes |
 | `WS` | `/chat` | Streaming chat |
 

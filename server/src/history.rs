@@ -353,10 +353,20 @@ mod tests {
             tokens_output: 30,
             version: "0.1.0".into(),
             summary: None,
+            compaction: Some(marshaling_protocol::CompactionState {
+                summary: "Older context summary".into(),
+                compacted_message_count: 4,
+                model_provider: "ollama".into(),
+                model_id: "r1".into(),
+            }),
         };
         let out = serialize(&meta, &msgs).unwrap();
         let (meta2, msgs2) = parse(&out).unwrap();
         assert_eq!(meta2.id, "test");
+        assert_eq!(
+            meta2.compaction.as_ref().unwrap().compacted_message_count,
+            4
+        );
         assert_eq!(msgs2.len(), 2);
         assert_eq!(msgs2[0].content, "Multi\nline\ninput");
         assert!(msgs2[1].content.contains("fn main()"));

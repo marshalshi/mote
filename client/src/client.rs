@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use marshaling_protocol::{
-    ChatRequest, ModelInfo, RollbackResultPayload, ServerEvent, SessionInfo,
-    UiConfig,
+    ChatRequest, CompactRequest, CompactResponse, ModelInfo,
+    RollbackResultPayload, ServerEvent, SessionInfo, UiConfig,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -119,6 +119,24 @@ impl MoteClient {
             .await?;
         if !resp.status().is_success() {
             anyhow::bail!("Server returned {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
+    pub async fn compact(
+        &self,
+        request: &CompactRequest,
+    ) -> Result<CompactResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/compact", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server returned {status}: {body}");
         }
         Ok(resp.json().await?)
     }

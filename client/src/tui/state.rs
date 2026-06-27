@@ -166,6 +166,9 @@ pub struct App {
 
     /// Latest mouse position in terminal coordinates.
     pub mouse_position: Option<(u16, u16)>,
+
+    /// True when terminal-native text selection/copy mode is active.
+    pub selection_mode: bool,
 }
 
 /// Tracks a running subagent's output for the multi-agent TUI.
@@ -224,7 +227,7 @@ pub enum AppState {
 
 // ── Built-in commands ─────────────────────────────────────
 
-const AUTO_COMPACT_CHAR_THRESHOLD: usize = 100_000;
+const AUTO_COMPACT_CHAR_THRESHOLD: usize = 50_000;
 
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
@@ -335,6 +338,7 @@ impl App {
             pending_auto_compact_send: false,
             compact_declined_for_message: None,
             mouse_position: None,
+            selection_mode: false,
         }
     }
 
@@ -352,6 +356,29 @@ impl App {
 
     pub fn clear_esc_cancel_arm(&mut self) {
         self.esc_cancel_deadline = None;
+    }
+
+    pub fn selection_mode_blocked(&self) -> bool {
+        self.pending_compact_confirmation
+            || self.session_picker_open
+            || self.model_picker_open
+            || self.pending_permission.is_some()
+    }
+
+    pub fn selection_mode_block_reason(&self) -> Option<&'static str> {
+        if self.pending_compact_confirmation {
+            Some("Finish compact confirmation before entering selection mode.")
+        } else if self.session_picker_open {
+            Some("Close the session picker before entering selection mode.")
+        } else if self.model_picker_open {
+            Some("Close the model picker before entering selection mode.")
+        } else if self.pending_permission.is_some() {
+            Some(
+                "Resolve the permission prompt before entering selection mode.",
+            )
+        } else {
+            None
+        }
     }
 
     pub fn current_model_override(&self) -> Option<&AgentModelOverride> {
@@ -690,6 +717,7 @@ impl App {
                 "## Keybindings",
                 "- `Enter` — Send message",
                 "- `Alt+Enter` — Newline",
+                "- `F6` — Toggle selection mode for native terminal copy",
                 "- `Ctrl+A / Ctrl+E` — Line start / end",
                 "- `Ctrl+D` — Delete current char",
                 "- `Ctrl+K` — Clear current line",
@@ -1644,6 +1672,22 @@ mod tests {
         assert!(app.messages.is_empty());
         assert_eq!(app.current_agent, "default");
         assert!(app.current_model_override().is_none());
+        assert!(!app.selection_mode);
+    }
+
+    #[test]
+    fn test_selection_mode_block_reason() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        assert!(!app.selection_mode_blocked());
+        assert_eq!(app.selection_mode_block_reason(), None);
+
+        app.session_picker_open = true;
+        assert!(app.selection_mode_blocked());
+        assert_eq!(
+            app.selection_mode_block_reason(),
+            Some("Close the session picker before entering selection mode.")
+        );
     }
 
     #[test]

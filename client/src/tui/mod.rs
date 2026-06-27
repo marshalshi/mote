@@ -740,6 +740,20 @@ fn handle_key_event(
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if app.selection_mode {
+                let action = keys.lookup(key.code, key.modifiers);
+                if key.code == crossterm::event::KeyCode::Esc {
+                    set_selection_mode(app, false);
+                    return;
+                }
+                if action == Some(Action::ToggleSelectionMode) {
+                    set_selection_mode(app, false);
+                } else if action == Some(Action::Quit) {
+                    app.clear_esc_cancel_arm();
+                    app.state = AppState::Quitting;
+                }
+                return;
+            }
             if app.pending_compact_confirmation {
                 match key.code {
                     crossterm::event::KeyCode::Char('y')
@@ -798,6 +812,9 @@ fn handle_key_event(
             handle_action(app, action, key.code, key.modifiers);
         }
         Event::Mouse(m) => {
+            if app.selection_mode {
+                return;
+            }
             app.mouse_position = Some((m.column, m.row));
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -966,6 +983,19 @@ fn handle_action(
             app.auto_scroll = true;
             return;
         }
+        Some(Action::ToggleSelectionMode) => {
+            if app.selection_mode_blocked() {
+                if let Some(reason) = app.selection_mode_block_reason() {
+                    app.messages.push(self::state::DisplayMessage::command(
+                        crate::llm::Role::Assistant,
+                        reason.into(),
+                    ));
+                }
+                return;
+            }
+            set_selection_mode(app, !app.selection_mode);
+            return;
+        }
         _ => {}
     }
 
@@ -1040,6 +1070,48 @@ fn handle_action(
     }
 
     normal_action(app, action, code, modifiers);
+}
+
+fn set_selection_mode(app: &mut App, enabled: bool) {
+    if app.selection_mode == enabled {
+        return;
+    }
+    if update_mouse_capture(!enabled).is_ok() {
+        apply_selection_mode_state(app, enabled);
+    } else {
+        app.messages.push(self::state::DisplayMessage {
+            role: crate::llm::Role::Assistant,
+            content: format!(
+                "Failed to {} selection mode.",
+                if enabled { "enable" } else { "disable" }
+            ),
+            thinking: None,
+            source: self::state::MessageSource::Error,
+        });
+    }
+}
+
+fn apply_selection_mode_state(app: &mut App, enabled: bool) {
+    app.selection_mode = enabled;
+    app.mouse_position = None;
+    app.messages.push(self::state::DisplayMessage::command(
+        crate::llm::Role::Assistant,
+        if enabled {
+            "Selection mode enabled. Drag to select in your terminal, then copy normally. Press Esc or F6 to return.".into()
+        } else {
+            "Selection mode disabled. Mouse scrolling and clicks restored.".into()
+        },
+    ));
+}
+
+fn update_mouse_capture(enabled: bool) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    if enabled {
+        crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)?;
+    } else {
+        crossterm::execute!(stdout, crossterm::event::DisableMouseCapture)?;
+    }
+    Ok(())
 }
 
 fn normal_action(
@@ -1328,6 +1400,27 @@ mod tests {
         let req = build_chat_request(&app, "hello".into());
         assert_eq!(req.session_id.as_deref(), Some("sess-abc"));
         assert_eq!(req.runtime_session_key.as_deref(), Some("runtime-key"));
+    }
+
+    #[test]
+    fn test_set_selection_mode_state_changes() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        apply_selection_mode_state(&mut app, true);
+        assert!(app.selection_mode);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selection mode enabled"))
+        );
+
+        apply_selection_mode_state(&mut app, false);
+        assert!(!app.selection_mode);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selection mode disabled"))
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ A Rust AI coding assistant with a local server and a terminal UI.
 
 ## Highlights
 
-- Default `cargo run` starts the client and a local server together.
+- Build the client/server once, then run the compiled binaries directly.
 - Works with local Ollama models or remote providers like DeepSeek and GitHub Models.
 - Supports agents, subagents, skills, session history, and rollback.
 - Each agent gets a stable, distinct terminal color within the current app session.
@@ -18,6 +18,25 @@ A Rust AI coding assistant with a local server and a terminal UI.
 - [Ollama](https://ollama.com) with a model, or a DeepSeek API key
 
 ### First run
+
+### Build
+
+Build debug binaries:
+
+```bash
+cargo build --workspace
+```
+
+Build optimized release binaries:
+
+```bash
+cargo build --workspace --release
+```
+
+Compiled binaries:
+
+- Client: `./target/debug/mote-client` or `./target/release/mote-client`
+- Server: `./target/debug/mote-server` or `./target/release/mote-server`
 
 Config files live in `~/.config/mote/`:
 
@@ -38,32 +57,50 @@ cp auth.json.example ~/.config/mote/auth.json
 Or use the `--login` CLI flag to set them interactively:
 
 ```bash
-# DeepSeek — enter your API key
-cargo run -- --login deepseek
+# DeepSeek — enter your API key (debug build)
+./target/debug/mote-client --login deepseek
 
-# GitHub — enter a Personal Access Token with models:read scope
-cargo run -- --login github
+# DeepSeek — enter your API key (release build)
+./target/release/mote-client --login deepseek
+
+# GitHub — enter a Personal Access Token with models:read scope (debug build)
+./target/debug/mote-client --login github
+
+# GitHub — enter a Personal Access Token with models:read scope (release build)
+./target/release/mote-client --login github
 ```
 
 ### Run
 
-Start Mote with the TUI:
+Start Mote with the compiled client binary:
 
 ```bash
-# Starts a local server in the background, then shows the TUI
-cargo run
+# Starts a local server in the background, then shows the TUI (debug build)
+./target/debug/mote-client
 
-# Standalone server package
-cargo run -p mote-server
+# Starts a local server in the background, then shows the TUI (release build)
+./target/release/mote-client
 
-# TUI-only mode, connecting to an existing server
-cargo run -- --tui --server-url http://127.0.0.1:9847
+# Standalone server (debug build)
+./target/debug/mote-server
 
-# Optional: force a specific session key namespace
-cargo run -- --session-key team-a
+# Standalone server (release build)
+./target/release/mote-server
+
+# TUI-only mode, connecting to an existing server (debug build)
+./target/debug/mote-client --tui --server-url http://127.0.0.1:9847
+
+# TUI-only mode, connecting to an existing server (release build)
+./target/release/mote-client --tui --server-url http://127.0.0.1:9847
+
+# Optional: force a specific session key namespace (debug build)
+./target/debug/mote-client --session-key team-a
+
+# Optional: force a specific session key namespace (release build)
+./target/release/mote-client --session-key team-a
 ```
 
-From the repo root, `cargo run` targets `mote-client` by default. The client starts a local server on a free localhost port by default and only displays the frontend. Use `-p mote-client` or `-p mote-server` to target a specific workspace package explicitly, and `--tui --server-url http://127.0.0.1:<port>` to connect a frontend to an already-running server.
+`mote-client` starts a local server on a free localhost port by default and shows the TUI frontend. Use `mote-server` when you want to run the server separately, and `mote-client --tui --server-url http://127.0.0.1:<port>` to connect a frontend to an already-running server.
 
 ### Runtime folders
 
@@ -241,10 +278,10 @@ Recursion is limited to 3 levels.
 
 ```bash
 # Server: set RUST_LOG=debug for verbose output
-RUST_LOG=debug cargo run -p mote-server
+RUST_LOG=debug ./target/debug/mote-server
 
 # Client: use -v or RUST_LOG=debug
-cargo run -p mote-client -- -v
+./target/debug/mote-client -v
 ```
 
 Verbose logs are saved to `~/.config/mote/logs/mote.log`.

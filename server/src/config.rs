@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Permission level for a tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -144,21 +144,13 @@ fn default_history_dir() -> HistoryConfig {
 pub struct PromptConfig {
     #[serde(default = "default_prompt_file")]
     pub default: PathBuf,
-    pub model_specific: Option<PathBuf>,
-    #[serde(default)]
-    #[allow(dead_code)] // deserialized from config, used at runtime
-    pub instructions: Vec<PathBuf>,
 }
 fn default_prompt_file() -> PathBuf {
-    PathBuf::from("prompts/default.txt")
+    PathBuf::from("prompts/system/mote.md")
 }
 impl Default for PromptConfig {
     fn default() -> Self {
-        Self {
-            default: default_prompt_file(),
-            model_specific: None,
-            instructions: vec![],
-        }
+        Self { default: default_prompt_file() }
     }
 }
 
@@ -194,6 +186,9 @@ pub struct ServerConfig {
     /// keeps running until explicit finish_task or user cancellation.
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
+    /// Agent name used when no agent is specified (default: "build").
+    #[serde(default = "default_agent_name")]
+    pub default_agent: String,
 }
 
 fn default_server_port() -> u16 {
@@ -202,12 +197,16 @@ fn default_server_port() -> u16 {
 fn default_max_steps() -> usize {
     10
 }
+fn default_agent_name() -> String {
+    marshaling_protocol::DEFAULT_AGENT_NAME.into()
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: default_server_port(),
             max_steps: default_max_steps(),
+            default_agent: default_agent_name(),
         }
     }
 }
@@ -238,8 +237,6 @@ impl Default for LoggingConfig {
 pub struct AgentConfig {
     #[allow(dead_code)]
     pub model: Option<String>,
-    pub model_specific: Option<PathBuf>,
-    pub default: Option<PathBuf>,
     #[allow(dead_code)]
     pub temperature: Option<f32>,
     #[allow(dead_code)]
@@ -622,15 +619,33 @@ impl Config {
     }
 }
 
-/// Load agent definitions from `~/.config/mote/agents/*.toml`.
-/// Each file is named `<agent_name>.toml` and contains an `AgentConfig`.
+/// Load agent definitions from TOML files.
+///
+/// Reads from two locations, with later sources overriding earlier ones:
+/// 1. Built-in agents shipped in the repo: `prompts/agents/*.toml`
+/// 2. User agents: `~/.config/mote/agents/*.toml` (falls back to `./agents`)
 pub fn load_file_agents() -> HashMap<String, AgentConfig> {
-    let dir = resolve_config_path("agents");
-    if !dir.is_dir() {
-        return HashMap::new();
-    }
     let mut agents = HashMap::new();
-    match std::fs::read_dir(&dir) {
+
+    // 1. Built-in agents shipped in the repo.
+    load_agents_from_dir(&PathBuf::from("prompts/agents"), &mut agents);
+
+    // 2. User agents (override built-in on name collision).
+    let user_dir = resolve_config_path("agents");
+    load_agents_from_dir(&user_dir, &mut agents);
+
+    agents
+}
+
+/// Read `*.toml` agent files from `dir` into `agents`, overwriting on collision.
+fn load_agents_from_dir(
+    dir: &Path,
+    agents: &mut HashMap<String, AgentConfig>,
+) {
+    if !dir.is_dir() {
+        return;
+    }
+    match std::fs::read_dir(dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -682,7 +697,6 @@ pub fn load_file_agents() -> HashMap<String, AgentConfig> {
             );
         }
     }
-    agents
 }
 
 /// Get all agents: merged from config.toml `[agents]` and file-based agents.
@@ -752,8 +766,7 @@ default_max_tokens = 8192
 dir = "history"
 
 [prompts]
-default = "prompts/default.txt"
-instructions = ["prompts/instructions/"]
+default = "prompts/system/mote.md"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.model.provider, "deepseek");
@@ -943,8 +956,6 @@ base_url = "https://api.deepseek.com/v1"
             "code".into(),
             AgentConfig {
                 model: Some("ollama/qwen".into()),
-                model_specific: None,
-                default: None,
                 temperature: Some(0.3),
                 max_tokens: Some(4096),
                 permissions: HashMap::new(),

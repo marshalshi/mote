@@ -1497,9 +1497,10 @@ mod tests {
             agent_names: vec!["review".into()],
             subagent_names: vec![],
             agent_model_info: HashMap::from([
-                ("default".into(), "deepseek/deepseek-chat".into()),
+                ("build".into(), "deepseek/deepseek-chat".into()),
                 ("review".into(), "kimi/kimi-k2.6".into()),
             ]),
+            default_agent: "build".into(),
         }
     }
 
@@ -1719,7 +1720,7 @@ mod tests {
             "runtime-key".into(),
         );
         app.agent_model_overrides.insert(
-            "default".into(),
+            "build".into(),
             super::state::AgentModelOverride {
                 provider: Some("deepseek".into()),
                 model_id: "deepseek-reasoner".into(),

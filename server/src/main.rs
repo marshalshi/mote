@@ -129,8 +129,10 @@ async fn get_config(
         .collect();
     subagent_names.sort();
     let mut agent_model_info = HashMap::new();
-    agent_model_info
-        .insert("default".to_string(), cfg.effective_model_info(None));
+    agent_model_info.insert(
+        cfg.server.default_agent.clone(),
+        cfg.effective_model_info(None),
+    );
     for (name, agent_cfg) in state
         .merged_agents
         .iter()
@@ -148,6 +150,7 @@ async fn get_config(
         subagent_names,
         model_info: format!("{}/{}", cfg.model.provider, cfg.model.model_id),
         agent_model_info,
+        default_agent: cfg.server.default_agent.clone(),
     })
 }
 
@@ -341,7 +344,7 @@ async fn compact_conversation(
         anyhow::bail!("Invalid session_id");
     }
     let agent_name = if request.agent.is_empty() {
-        "default".to_string()
+        state.config.server.default_agent.clone()
     } else {
         request.agent.clone()
     };
@@ -980,9 +983,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         None
     };
 
-    // Resolve agent: empty agent → "default" for safety
+    // Resolve agent: empty agent → default agent for safety
     let agent_name = if request.agent.is_empty() {
-        "default".to_string()
+        state.config.server.default_agent.clone()
     } else {
         request.agent.clone()
     };
@@ -2125,7 +2128,7 @@ base_url = "http://localhost:11434"
             ],
             "deepseek-v4-flash".into(),
             "deepseek".into(),
-            "default".into(),
+            "build".into(),
             1,
             1,
             Some("chat-existing".into()),

@@ -360,13 +360,13 @@ fn command_exists(name: &str) -> bool {
 
 async fn single_message(
     client: &client::MoteClient,
-    _ui: &marshaling_protocol::UiConfig,
+    ui: &marshaling_protocol::UiConfig,
     msg: &str,
     workspace_ctx: &workspace::WorkspaceContext,
 ) -> Result<()> {
     let request = marshaling_protocol::ChatRequest {
         message: msg.to_string(),
-        agent: "default".into(),
+        agent: ui.default_agent.clone(),
         model_override: None,
         provider_override: None,
         history: vec![],

@@ -4,6 +4,10 @@ use std::collections::HashMap;
 /// Protocol version. Bump when breaking changes are made to ServerEvent/ChatRequest.
 pub const PROTOCOL_VERSION: &str = "2";
 
+/// The agent name used when no agent is specified. Both server and client
+/// reference this so they never diverge on the default agent identity.
+pub const DEFAULT_AGENT_NAME: &str = "build";
+
 // ── Client → Server ─────────────────────────────────────
 
 /// A single message from the conversation history (sent by the client).
@@ -275,6 +279,13 @@ pub struct UiConfig {
     /// Default effective model shown for each user-selectable agent.
     #[serde(default)]
     pub agent_model_info: HashMap<String, String>,
+    /// The agent name used when no agent is specified.
+    #[serde(default = "default_agent_name")]
+    pub default_agent: String,
+}
+
+fn default_agent_name() -> String {
+    DEFAULT_AGENT_NAME.into()
 }
 
 /// Session listing entry.

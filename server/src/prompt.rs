@@ -36,16 +36,8 @@ impl PromptAssembler {
         config: &Config,
         agent: Option<&crate::config::AgentConfig>,
     ) -> Self {
-        let mut cfg = config.clone();
+        let cfg = config.clone();
         let instructions = agent.and_then(|a| a.instructions.clone());
-        if let Some(agent) = agent {
-            if let Some(model_path) = &agent.model_specific {
-                cfg.prompts.model_specific = Some(model_path.clone());
-            }
-            if let Some(default_path) = &agent.default {
-                cfg.prompts.default = default_path.clone();
-            }
-        }
         Self {
             config: cfg,
             agent_instructions: instructions,
@@ -68,7 +60,7 @@ impl PromptAssembler {
     ///
     /// Layers are assembled in order:
     /// 1. Environment block (model info, platform, working directory, date)
-    /// 2. Provider-specific prompt (prompts/<provider>.txt) or default fallback
+    /// 2. Shared system prompt (`prompts/system/mote.md` by default)
     /// 3. User AGENTS.md — ~/.config/mote/AGENTS.md (optional)
     /// 4. Workspace AGENTS.md passed by client (optional)
     /// 5. Agent-specific instructions (from agent config `instructions` field, optional)
@@ -85,7 +77,7 @@ impl PromptAssembler {
             self.build_env_block(model_id, self.workspace_root.as_deref()),
         );
 
-        if let Some(layer) = self.load_model_prompt_layer(model_provider)? {
+        if let Some(layer) = self.load_system_prompt_layer(model_provider)? {
             layers.push(layer);
         }
 
@@ -108,27 +100,12 @@ impl PromptAssembler {
         Ok(layers)
     }
 
-    fn load_model_prompt_layer(
+    fn load_system_prompt_layer(
         &self,
-        model_provider: &str,
+        _model_provider: &str,
     ) -> Result<Option<String>> {
-        let model_prompt_path = self
-            .config
-            .prompts
-            .model_specific
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| {
-                Path::new("prompts").join(format!("{}.txt", model_provider))
-            });
-        let model_prompt = self.load_file_or_default(&model_prompt_path, "")?;
-        if !model_prompt.is_empty() {
-            return Ok(Some(model_prompt));
-        }
-
-        let default =
-            self.load_file_or_default(&self.config.prompts.default, "")?;
-        Ok((!default.is_empty()).then_some(default))
+        let prompt = self.load_file_or_default(&self.config.prompts.default, "")?;
+        Ok((!prompt.is_empty()).then_some(prompt))
     }
 
     fn load_global_agents_layer(&self) -> Result<Option<String>> {
@@ -420,8 +397,7 @@ model_id = "test-model"
 base_url = "http://localhost:11434"
 
 [prompts]
-default = "/nonexistent/prompts/default.txt"
-instructions = []
+default = "/nonexistent/prompts/system/mote.md"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         PromptAssembler::new(config)
@@ -511,7 +487,7 @@ instructions = []
     }
 
     #[test]
-    fn test_assemble_uses_provider_specific_before_default() {
+    fn test_assemble_uses_shared_prompt_file() {
         let toml = r#"
 [model]
 provider = "ollama"
@@ -519,29 +495,22 @@ model_id = "test-model"
 [providers.ollama]
 base_url = "http://localhost:11434"
 [prompts]
-default = "/nonexistent/default.txt"
-instructions = []
+default = "/nonexistent/mote.md"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let a = PromptAssembler::new(config);
-        // ollama.txt doesn't exist in this test context → falls back to default.txt
-        // default.txt is set to /nonexistent/default.txt → also doesn't exist
-        // AGENTS.md may exist at ~/.config/mote/AGENTS.md
         let layers = a.assemble("ollama", "test-model").unwrap();
-        // At minimum: env layer (1). AGENTS.md may add another.
         assert!(layers.len() >= 1);
         assert!(layers[0].contains("test-model"));
     }
 
     #[test]
-    fn test_assemble_default_fallback_when_no_provider_prompt() {
-        // Create a temp prompts dir with default.txt but no provider-specific file
+    fn test_assemble_reads_shared_prompt_file() {
         let dir = tempfile::tempdir().unwrap();
-        let prompts_dir = dir.path().join("prompts");
-        std::fs::create_dir(&prompts_dir).unwrap();
-        std::fs::write(prompts_dir.join("default.txt"), "DEFAULT PROMPT")
+        let prompts_dir = dir.path().join("prompts").join("system");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(prompts_dir.join("mote.md"), "MOTE PROMPT")
             .unwrap();
-        // Do NOT create prompts/ollama.txt — so default should be used
 
         let toml = format!(
             r#"
@@ -551,17 +520,15 @@ model_id = "m"
 [providers.ollama]
 base_url = "http://localhost:11434"
 [prompts]
-default = "{dir}/prompts/default.txt"
-instructions = []
+default = "{dir}/prompts/system/mote.md"
 "#,
             dir = dir.path().display()
         );
         let config: Config = toml::from_str(&toml).unwrap();
         let a = PromptAssembler::new(config);
         let layers = a.assemble("ollama", "m").unwrap();
-        // Should have env + default (since ollama.txt doesn't exist)
         assert!(layers.len() >= 2);
-        assert!(layers.iter().any(|l| l.contains("DEFAULT PROMPT")));
+        assert!(layers.iter().any(|l| l.contains("MOTE PROMPT")));
     }
 
     #[test]

@@ -61,6 +61,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.model_picker_open {
         render_model_picker(frame, full_area, app);
     }
+    if app.login_picker_open {
+        render_login_picker(frame, full_area, app);
+    }
 
     if app.pending_permission.is_some() {
         render_permission_popup(frame, full_area, app);
@@ -180,6 +183,58 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑/↓ select • Enter apply • Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn render_login_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let rect =
+        render_picker_popup(frame, area, app.input_accent, " Login Provider ");
+    let inner = inset(rect, 2, 1);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Select a provider, then paste its API key.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    if app.login_picker_items.is_empty() {
+        lines.push(Line::from("No login providers available."));
+    } else {
+        let available_rows = inner.height.saturating_sub(4) as usize;
+        let visible_items = (available_rows / 2).max(1);
+        let (start, end) = session_picker_window(
+            app.login_picker_items.len(),
+            app.login_picker_index,
+            visible_items,
+        );
+        for (i, item) in app.login_picker_items[start..end].iter().enumerate() {
+            let i = start + i;
+            let selected = i == app.login_picker_index;
+            let marker = if selected { "›" } else { " " };
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} {}", marker, item.display_name),
+                picker_item_style(selected),
+            )]));
+            lines.push(Line::from(Span::styled(
+                format!("   {} · {}", item.provider, item.key_url),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if end < app.login_picker_items.len() {
+            lines.push(Line::from(Span::styled(
+                format!("... {} more", app.login_picker_items.len() - end),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select • Enter apply • Click item • Esc close",
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -1771,6 +1826,16 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     let shell_mode = app.input.starts_with('!');
     let (prompt, display_input, display_cursor) =
         shell_input_display(&app.input, app.input_cursor);
+    let display_input = if let Some(provider_name) = app.secret_input_prompt() {
+        let masked = "•".repeat(display_input.chars().count());
+        if masked.is_empty() {
+            format!("[secure {} API key entry]", provider_name)
+        } else {
+            masked
+        }
+    } else {
+        display_input
+    };
     let is_placeholder =
         display_input.is_empty() && app.state == AppState::Idle;
     let display_text = if is_placeholder {

@@ -4,7 +4,7 @@ A Rust AI coding assistant with a local server and a terminal UI.
 
 ## Highlights
 
-- Default `cargo run` starts the client and a local server together.
+- Build the client/server once, then run the compiled binaries directly.
 - Works with local Ollama models or remote providers like DeepSeek and GitHub Models.
 - Supports agents, subagents, skills, session history, and rollback.
 - Each agent gets a stable, distinct terminal color within the current app session.
@@ -18,6 +18,25 @@ A Rust AI coding assistant with a local server and a terminal UI.
 - [Ollama](https://ollama.com) with a model, or a DeepSeek API key
 
 ### First run
+
+### Build
+
+Build debug binaries:
+
+```bash
+cargo build --workspace
+```
+
+Build optimized release binaries:
+
+```bash
+cargo build --workspace --release
+```
+
+Compiled binaries:
+
+- Client: `./target/debug/mote-client` or `./target/release/mote-client`
+- Server: `./target/debug/mote-server` or `./target/release/mote-server`
 
 Config files live in `~/.config/mote/`:
 
@@ -38,32 +57,50 @@ cp auth.json.example ~/.config/mote/auth.json
 Or use the `--login` CLI flag to set them interactively:
 
 ```bash
-# DeepSeek — enter your API key
-cargo run -- --login deepseek
+# DeepSeek — enter your API key (debug build)
+./target/debug/mote-client --login deepseek
 
-# GitHub — enter a Personal Access Token with models:read scope
-cargo run -- --login github
+# DeepSeek — enter your API key (release build)
+./target/release/mote-client --login deepseek
+
+# GitHub — enter a Personal Access Token with models:read scope (debug build)
+./target/debug/mote-client --login github
+
+# GitHub — enter a Personal Access Token with models:read scope (release build)
+./target/release/mote-client --login github
 ```
 
 ### Run
 
-Start Mote with the TUI:
+Start Mote with the compiled client binary:
 
 ```bash
-# Starts a local server in the background, then shows the TUI
-cargo run
+# Starts a local server in the background, then shows the TUI (debug build)
+./target/debug/mote-client
 
-# Standalone server package
-cargo run -p mote-server
+# Starts a local server in the background, then shows the TUI (release build)
+./target/release/mote-client
 
-# TUI-only mode, connecting to an existing server
-cargo run -- --tui --server-url http://127.0.0.1:9847
+# Standalone server (debug build)
+./target/debug/mote-server
 
-# Optional: force a specific session key namespace
-cargo run -- --session-key team-a
+# Standalone server (release build)
+./target/release/mote-server
+
+# TUI-only mode, connecting to an existing server (debug build)
+./target/debug/mote-client --tui --server-url http://127.0.0.1:9847
+
+# TUI-only mode, connecting to an existing server (release build)
+./target/release/mote-client --tui --server-url http://127.0.0.1:9847
+
+# Optional: force a specific session key namespace (debug build)
+./target/debug/mote-client --session-key team-a
+
+# Optional: force a specific session key namespace (release build)
+./target/release/mote-client --session-key team-a
 ```
 
-From the repo root, `cargo run` targets `mote-client` by default. The client starts a local server on a free localhost port by default and only displays the frontend. Use `-p mote-client` or `-p mote-server` to target a specific workspace package explicitly, and `--tui --server-url http://127.0.0.1:<port>` to connect a frontend to an already-running server.
+`mote-client` starts a local server on a free localhost port by default and shows the TUI frontend. Use `mote-server` when you want to run the server separately, and `mote-client --tui --server-url http://127.0.0.1:<port>` to connect a frontend to an already-running server.
 
 ### Runtime folders
 
@@ -111,6 +148,7 @@ agent_command = "ctrl+space"
 | `/help` | Show help |
 | `/agent` | List / switch agents |
 | `/model` | Open model picker popup (↑/↓, Enter, Esc) |
+| `/compact` | Compact older conversation context into a persisted summary |
 | `/tokens` | Show token usage |
 | `/new` | Start a fresh chat session |
 | `/sessions` | Open session picker (↑/↓, Enter, Esc) |
@@ -123,7 +161,10 @@ agent_command = "ctrl+space"
 Notes:
 - `/sessions` is available only when the app is idle (not during an active streaming turn).
 - `/new` clears the current transcript and active resumed session id, while keeping your selected agent/model/workspace.
-- `/model <provider/model>` and `/model default` still work, but `/model` opens the picker for easier selection.
+- `/model <provider/model>` still works, but `/model` opens the picker for easier provider/model selection.
+- `/compact` summarizes older conversation turns using the current effective agent model. The visible transcript remains, but already-compacted turns are replaced by the summary when future requests are sent to the LLM.
+- When the local conversation context gets large, mote asks before auto-compacting. If you decline, mote continues and warns that the model may lose older context or hit token limits.
+- Compaction state is saved with sessions and restored when a session is resumed.
 - `!` commands are local TUI commands; their output is shown in the transcript but is not sent to the LLM as conversation history.
 
 ### Agents
@@ -237,10 +278,10 @@ Recursion is limited to 3 levels.
 
 ```bash
 # Server: set RUST_LOG=debug for verbose output
-RUST_LOG=debug cargo run -p mote-server
+RUST_LOG=debug ./target/debug/mote-server
 
 # Client: use -v or RUST_LOG=debug
-cargo run -p mote-client -- -v
+./target/debug/mote-client -v
 ```
 
 Verbose logs are saved to `~/.config/mote/logs/mote.log`.
@@ -314,6 +355,7 @@ mote/
 | `GET` | `/config` | UI settings (accent colors, agent names, model info) |
 | `GET` | `/models` | Available models from all providers |
 | `GET` | `/sessions` | Saved session list |
+| `POST` | `/compact` | Summarize older conversation context for persisted compacted sessions |
 | `POST` | `/rollback/last` | Roll back latest tracked file changes |
 | `WS` | `/chat` | Streaming chat |
 

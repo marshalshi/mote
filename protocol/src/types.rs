@@ -13,6 +13,16 @@ pub struct HistoryMessage {
     pub content: String,
 }
 
+/// Persisted compacted context for older conversation turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionState {
+    pub summary: String,
+    /// Number of visible conversation messages represented by this summary.
+    pub compacted_message_count: usize,
+    pub model_provider: String,
+    pub model_id: String,
+}
+
 /// Initial message the client sends over WebSocket to start a chat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -40,6 +50,35 @@ pub struct ChatRequest {
     /// Optional active run to attach to instead of starting a new agent run.
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Summary of older turns that should replace the first N history messages.
+    #[serde(default)]
+    pub compaction: Option<CompactionState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactRequest {
+    pub agent: String,
+    pub model_override: Option<String>,
+    #[serde(default)]
+    pub provider_override: Option<String>,
+    #[serde(default)]
+    pub history: Vec<HistoryMessage>,
+    #[serde(default)]
+    pub prior_compaction: Option<CompactionState>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub repo_agents_md: Option<String>,
+    #[serde(default)]
+    pub runtime_session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactResponse {
+    pub session_id: String,
+    pub compaction: CompactionState,
 }
 
 // ── Client ↔ Server (bi-directional events during a session) ──
@@ -277,6 +316,8 @@ pub struct SessionData {
     pub created: String,
     pub model: String,
     pub messages: Vec<HistoryMessage>,
+    #[serde(default)]
+    pub compaction: Option<CompactionState>,
 }
 
 // ── Health check ─────────────────────────────────────────
@@ -357,6 +398,27 @@ mod tests {
         assert!(req.repo_agents_md.is_none());
         assert!(req.runtime_session_key.is_none());
         assert!(req.run_id.is_none());
+        assert!(req.compaction.is_none());
+    }
+
+    #[test]
+    fn test_session_data_compaction_default_none() {
+        let json = r#"{"id":"s","created":"now","model":"p/m","messages":[]}"#;
+        let session: SessionData = serde_json::from_str(json).unwrap();
+        assert!(session.compaction.is_none());
+    }
+
+    #[test]
+    fn test_compaction_state_roundtrip() {
+        let state = CompactionState {
+            summary: "important context".into(),
+            compacted_message_count: 3,
+            model_provider: "deepseek".into(),
+            model_id: "deepseek-chat".into(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let decoded: CompactionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, state);
     }
 
     #[test]

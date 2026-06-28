@@ -184,6 +184,8 @@ async fn main() -> Result<()> {
                         source: tui::state::MessageSource::Conversation,
                     });
                 }
+                app.compaction_state = session.compaction;
+                app.active_session_id = Some(session_id.clone());
                 tracing::info!(
                     "Resumed session {} with {} messages",
                     session_id,
@@ -349,6 +351,7 @@ async fn single_message(
         repo_agents_md: workspace_ctx.repo_agents_md.clone(),
         runtime_session_key: Some(workspace_ctx.runtime_session_key.clone()),
         run_id: None,
+        compaction: None,
     };
     let mut stream = client
         .chat_stream(request)

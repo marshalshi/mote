@@ -23,4 +23,5 @@
 # scroll_to_bottom = "ctrl+end"
 # agent_command = "ctrl+p"
 # complete = "tab"
+# toggle_selection_mode = "f6"
 # cancel_agent = "esc"

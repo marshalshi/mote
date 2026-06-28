@@ -210,6 +210,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                                     source: self::state::MessageSource::Conversation,
                                 });
                             }
+                            app.compaction_state = session.compaction;
                             app.active_session_id = Some(id.clone());
                             app.scroll_to_bottom();
                             app.messages.push(
@@ -230,6 +231,12 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                             })
                         }
                     }
+                }
+                SlashAction::Compact {
+                    include_latest_user,
+                } => {
+                    compact_conversation(client, &mut app, include_latest_user)
+                        .await;
                 }
                 SlashAction::SaveCredential(provider, key, value) => {
                     let result = match client
@@ -328,12 +335,16 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
         // After idle + no active chat: check if user sent a message → start chat
         if chat_stream.is_none() && app.state == AppState::Idle {
-            if let Some(last) = app.messages.last() {
-                if last.role == crate::llm::Role::User
-                    && last.source == self::state::MessageSource::Conversation
-                {
-                    start_chat(client, &mut app, &mut chat_stream).await;
+            let latest_message_is_user = app.messages.last().is_some_and(|m| {
+                m.role == crate::llm::Role::User
+                    && m.source == self::state::MessageSource::Conversation
+            });
+            if latest_message_is_user || app.pending_auto_compact_send {
+                if app.needs_auto_compact() {
+                    app.request_auto_compact_confirmation();
+                    continue;
                 }
+                start_chat(client, &mut app, &mut chat_stream).await;
             }
         }
     }
@@ -356,11 +367,12 @@ async fn start_chat(
     app: &mut App,
     chat_stream: &mut Option<ChatStream>,
 ) {
-    let user_msg = match app.messages.last() {
-        Some(m) if m.role == crate::llm::Role::User => m.content.clone(),
-        _ => return,
+    let user_msg = match app.pending_user_message_content() {
+        Some(content) => content.to_string(),
+        None => return,
     };
 
+    app.pending_auto_compact_send = false;
     app.start_agent();
 
     let request = build_chat_request(app, user_msg.clone());
@@ -388,6 +400,51 @@ async fn start_chat(
     }
 }
 
+async fn compact_conversation(
+    client: &MoteClient,
+    app: &mut App,
+    include_latest_user: bool,
+) {
+    let history = app.compact_history_messages(include_latest_user);
+    if history.is_empty() && app.compaction_state.is_none() {
+        app.messages.push(self::state::DisplayMessage::command(
+            crate::llm::Role::Assistant,
+            "Nothing new to compact.".into(),
+        ));
+        return;
+    }
+
+    let (model_override, provider_override) =
+        app.current_model_override_parts();
+    let request = marshaling_protocol::CompactRequest {
+        agent: app.current_agent.clone(),
+        model_override,
+        provider_override,
+        history,
+        prior_compaction: app.compaction_state.clone(),
+        session_id: app.active_session_id.clone(),
+        workspace_root: Some(app.workspace_root.clone()),
+        repo_agents_md: app.repo_agents_md.clone(),
+        runtime_session_key: Some(app.runtime_session_key.clone()),
+    };
+
+    match client.compact(&request).await {
+        Ok(response) => {
+            app.apply_compaction(response.session_id, response.compaction);
+        }
+        Err(e) => {
+            app.pending_auto_compact_send = false;
+            app.suppress_auto_compact_for_latest_message();
+            app.messages.push(self::state::DisplayMessage {
+                role: crate::llm::Role::Assistant,
+                content: format!("Compaction failed: {e:#}"),
+                thinking: None,
+                source: self::state::MessageSource::Error,
+            });
+        }
+    }
+}
+
 fn should_animate_loading(app: &App, chat_stream_active: bool) -> bool {
     app.loading_progress.is_some() || chat_stream_active
 }
@@ -398,20 +455,7 @@ fn build_chat_request(
 ) -> marshaling_protocol::ChatRequest {
     let (model_override, provider_override) =
         app.current_model_override_parts();
-    // Build conversation history from prior display messages (excluding the latest user message).
-    // Only include Conversation-sourced messages — skip command outputs and errors.
-    let history: Vec<marshaling_protocol::HistoryMessage> = app.messages
-        [..app.messages.len().saturating_sub(1)]
-        .iter()
-        .filter(|m| m.source == self::state::MessageSource::Conversation)
-        .map(|m| marshaling_protocol::HistoryMessage {
-            role: match m.role {
-                crate::llm::Role::User => "user".into(),
-                crate::llm::Role::Assistant => "assistant".into(),
-            },
-            content: m.content.clone(),
-        })
-        .collect();
+    let history = app.compact_history_messages(false);
 
     marshaling_protocol::ChatRequest {
         message: user_msg,
@@ -424,6 +468,7 @@ fn build_chat_request(
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
         run_id: None,
+        compaction: app.compaction_state.clone(),
     }
 }
 
@@ -444,6 +489,7 @@ fn build_attach_request(
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
         run_id: Some(run_id),
+        compaction: app.compaction_state.clone(),
     }
 }
 
@@ -694,6 +740,35 @@ fn handle_key_event(
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if app.selection_mode {
+                let action = keys.lookup(key.code, key.modifiers);
+                if key.code == crossterm::event::KeyCode::Esc {
+                    set_selection_mode(app, false);
+                    return;
+                }
+                if action == Some(Action::ToggleSelectionMode) {
+                    set_selection_mode(app, false);
+                } else if action == Some(Action::Quit) {
+                    app.clear_esc_cancel_arm();
+                    app.state = AppState::Quitting;
+                }
+                return;
+            }
+            if app.pending_compact_confirmation {
+                match key.code {
+                    crossterm::event::KeyCode::Char('y')
+                    | crossterm::event::KeyCode::Char('Y') => {
+                        app.accept_auto_compact();
+                    }
+                    crossterm::event::KeyCode::Char('n')
+                    | crossterm::event::KeyCode::Char('N')
+                    | crossterm::event::KeyCode::Esc => {
+                        app.deny_auto_compact();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if app.session_picker_open {
                 match key.code {
                     crossterm::event::KeyCode::Up => app.session_picker_up(),
@@ -737,6 +812,9 @@ fn handle_key_event(
             handle_action(app, action, key.code, key.modifiers);
         }
         Event::Mouse(m) => {
+            if app.selection_mode {
+                return;
+            }
             app.mouse_position = Some((m.column, m.row));
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -905,6 +983,19 @@ fn handle_action(
             app.auto_scroll = true;
             return;
         }
+        Some(Action::ToggleSelectionMode) => {
+            if app.selection_mode_blocked() {
+                if let Some(reason) = app.selection_mode_block_reason() {
+                    app.messages.push(self::state::DisplayMessage::command(
+                        crate::llm::Role::Assistant,
+                        reason.into(),
+                    ));
+                }
+                return;
+            }
+            set_selection_mode(app, !app.selection_mode);
+            return;
+        }
         _ => {}
     }
 
@@ -979,6 +1070,48 @@ fn handle_action(
     }
 
     normal_action(app, action, code, modifiers);
+}
+
+fn set_selection_mode(app: &mut App, enabled: bool) {
+    if app.selection_mode == enabled {
+        return;
+    }
+    if update_mouse_capture(!enabled).is_ok() {
+        apply_selection_mode_state(app, enabled);
+    } else {
+        app.messages.push(self::state::DisplayMessage {
+            role: crate::llm::Role::Assistant,
+            content: format!(
+                "Failed to {} selection mode.",
+                if enabled { "enable" } else { "disable" }
+            ),
+            thinking: None,
+            source: self::state::MessageSource::Error,
+        });
+    }
+}
+
+fn apply_selection_mode_state(app: &mut App, enabled: bool) {
+    app.selection_mode = enabled;
+    app.mouse_position = None;
+    app.messages.push(self::state::DisplayMessage::command(
+        crate::llm::Role::Assistant,
+        if enabled {
+            "Selection mode enabled. Drag to select in your terminal, then copy normally. Press Esc or F6 to return.".into()
+        } else {
+            "Selection mode disabled. Mouse scrolling and clicks restored.".into()
+        },
+    ));
+}
+
+fn update_mouse_capture(enabled: bool) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    if enabled {
+        crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)?;
+    } else {
+        crossterm::execute!(stdout, crossterm::event::DisableMouseCapture)?;
+    }
+    Ok(())
 }
 
 fn normal_action(
@@ -1270,6 +1403,27 @@ mod tests {
     }
 
     #[test]
+    fn test_set_selection_mode_state_changes() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        apply_selection_mode_state(&mut app, true);
+        assert!(app.selection_mode);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selection mode enabled"))
+        );
+
+        apply_selection_mode_state(&mut app, false);
+        assert!(!app.selection_mode);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selection mode disabled"))
+        );
+    }
+
+    #[test]
     fn test_build_chat_request_excludes_command_messages() {
         let cfg = test_ui_config();
         let mut app = App::new_with_workspace(
@@ -1293,6 +1447,42 @@ mod tests {
         let req = build_chat_request(&app, "hello".into());
 
         assert!(req.history.is_empty());
+    }
+
+    #[test]
+    fn test_build_chat_request_includes_compaction_and_skips_compacted_history()
+    {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        for (role, content) in [
+            (crate::llm::Role::User, "old user"),
+            (crate::llm::Role::Assistant, "old assistant"),
+            (crate::llm::Role::User, "latest"),
+        ] {
+            app.messages.push(super::state::DisplayMessage {
+                role,
+                content: content.into(),
+                thinking: None,
+                source: super::state::MessageSource::Conversation,
+            });
+        }
+        app.compaction_state = Some(marshaling_protocol::CompactionState {
+            summary: "old summary".into(),
+            compacted_message_count: 2,
+            model_provider: "deepseek".into(),
+            model_id: "deepseek-chat".into(),
+        });
+
+        let req = build_chat_request(&app, "latest".into());
+
+        assert!(req.history.is_empty());
+        assert_eq!(req.compaction.as_ref().unwrap().summary, "old summary");
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub enum Action {
     Complete,
     /// Switch between primary agent and subagent view.
     SwitchView,
+    /// Toggle terminal-native selection/copy mode.
+    ToggleSelectionMode,
     /// Cancel the running agent (Escape while streaming).
     CancelAgent,
 }
@@ -132,6 +134,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "agent_command" => Some(Action::AgentCommand),
         "complete" => Some(Action::Complete),
         "switch_view" => Some(Action::SwitchView),
+        "toggle_selection_mode" => Some(Action::ToggleSelectionMode),
         "cancel_agent" => Some(Action::CancelAgent),
         _ => None,
     }
@@ -160,6 +163,7 @@ fn default_bindings() -> Vec<(Action, Vec<String>)> {
         (Action::AgentCommand, vec!["ctrl+p".into()]),
         (Action::Complete, vec!["tab".into()]),
         (Action::SwitchView, vec!["f5".into()]),
+        (Action::ToggleSelectionMode, vec!["f6".into()]),
         (Action::CancelAgent, vec!["esc".into()]),
     ]
 }
@@ -285,6 +289,10 @@ mod tests {
         assert_eq!(
             kb.lookup(KeyCode::Esc, KeyModifiers::NONE),
             Some(Action::CancelAgent)
+        );
+        assert_eq!(
+            kb.lookup(KeyCode::F(6), KeyModifiers::NONE),
+            Some(Action::ToggleSelectionMode)
         );
         assert_eq!(
             kb.lookup(KeyCode::Char('c'), KeyModifiers::CONTROL),

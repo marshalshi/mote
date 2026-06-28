@@ -1954,9 +1954,17 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
         app.state,
         AppState::AgentRunning | AppState::WaitingResponse
     ) {
-        " Esc Esc stop · Ctrl+C quit · /help "
+        if app.selection_mode {
+            " Selection mode · drag select/copy · Esc/F6 exit "
+        } else {
+            " Esc Esc stop · Ctrl+C quit · /help "
+        }
     } else {
-        " Ctrl+C quit · /help "
+        if app.selection_mode {
+            " Selection mode · drag select/copy · Esc/F6 exit "
+        } else {
+            " Ctrl+C quit · /help "
+        }
     };
     let right = if total > left.len() + right_info.len() {
         right_info

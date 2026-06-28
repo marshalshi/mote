@@ -2,6 +2,7 @@ pub use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{ChatMessage, Role, Usage};
+use marshaling_protocol::CompactionState;
 
 /// A single entry in the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -35,6 +36,9 @@ pub struct SessionMeta {
     /// Short summary of the conversation (first user message or auto-generated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Compacted context for older conversation turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionState>,
 }
 
 /// In-memory conversation session.
@@ -49,6 +53,8 @@ pub struct Session {
     pub tokens_output: u64,
     /// Short summary of the conversation.
     pub summary: Option<String>,
+    /// Compacted context for older conversation turns.
+    pub compaction: Option<CompactionState>,
 }
 
 impl Session {
@@ -66,6 +72,7 @@ impl Session {
             tokens_input: 0,
             tokens_output: 0,
             summary: None,
+            compaction: None,
         }
     }
 
@@ -81,6 +88,7 @@ impl Session {
             model_id: meta.model_id,
             messages,
             summary: meta.summary,
+            compaction: meta.compaction,
         }
     }
 
@@ -184,6 +192,7 @@ impl Session {
             tokens_input,
             tokens_output,
             summary,
+            compaction: None,
         }
     }
 
@@ -199,6 +208,7 @@ impl Session {
             tokens_output: self.tokens_output,
             version: env!("CARGO_PKG_VERSION").to_string(),
             summary: self.summary.clone(),
+            compaction: self.compaction.clone(),
         }
     }
 }
@@ -267,12 +277,19 @@ mod tests {
             tokens_output: 50,
             version: "0.1.0".into(),
             summary: None,
+            compaction: Some(CompactionState {
+                summary: "old context".into(),
+                compacted_message_count: 2,
+                model_provider: "ollama".into(),
+                model_id: "r1".into(),
+            }),
         };
         let msgs = vec![Message::new(Role::User, "Hello".into())];
         let s = Session::from_meta(meta, msgs);
         assert_eq!(s.id, "chat-test");
         assert_eq!(s.tokens_input, 100);
         assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.compaction.as_ref().unwrap().summary, "old context");
     }
 
     #[test]

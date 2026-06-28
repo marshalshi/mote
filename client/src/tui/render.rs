@@ -2055,6 +2055,7 @@ fn render_loading_bar(frame: &mut Frame, area: Rect, app: &App) {
             matches!(tc.status, marshaling_protocol::ToolStatus::Running)
         })
         .map(|tc| format!("running {}", tc.name))
+        .or_else(|| app.loading_label.clone())
         .unwrap_or_else(|| "thinking".into());
 
     let style = Style::default().fg(Color::DarkGray);

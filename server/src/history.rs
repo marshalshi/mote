@@ -88,6 +88,33 @@ fn parse_message_heading(line: &str) -> Option<Option<Role>> {
     })
 }
 
+fn is_conversation_heading_line(line: &str) -> bool {
+    matches!(parse_message_heading(line), Some(Some(_)))
+}
+
+fn escape_message_line(line: &str) -> String {
+    if is_conversation_heading_line(line)
+        || line.starts_with("\\## User — ")
+        || line.starts_with("\\## Assistant — ")
+    {
+        format!("\\{line}")
+    } else {
+        line.to_string()
+    }
+}
+
+fn unescape_message_line(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix('\\') {
+        if is_conversation_heading_line(rest)
+            || rest.starts_with("\\## User — ")
+            || rest.starts_with("\\## Assistant — ")
+        {
+            return rest;
+        }
+    }
+    line
+}
+
 #[derive(Default)]
 struct ParsedMessage {
     role: Option<Role>,
@@ -96,6 +123,7 @@ struct ParsedMessage {
 
 impl ParsedMessage {
     fn push_line(&mut self, line: &str) {
+        let line = unescape_message_line(line);
         if self.content.is_empty() && line.trim().is_empty() {
             return;
         }
@@ -132,10 +160,12 @@ pub fn serialize(meta: &SessionMeta, messages: &[Message]) -> Result<String> {
             Role::Assistant => "Assistant",
             _ => continue,
         };
-        body.push_str(&format!(
-            "## {} — {}\n{}\n\n",
-            role_heading, time, msg.content
-        ));
+        body.push_str(&format!("## {} — {}\n", role_heading, time));
+        for line in msg.content.lines() {
+            body.push_str(&escape_message_line(line));
+            body.push('\n');
+        }
+        body.push('\n');
     }
 
     Ok(format!("---\n{}---\n\n{}", yaml, body.trim()))
@@ -370,5 +400,35 @@ mod tests {
         assert_eq!(msgs2.len(), 2);
         assert_eq!(msgs2[0].content, "Multi\nline\ninput");
         assert!(msgs2[1].content.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_serialize_parse_preserves_heading_like_content() {
+        let msgs = vec![
+            Message::new(
+                Role::User,
+                "Please keep this literal line:\n## Assistant — 12:34:56\nAnd this escaped form:\n\\## User — 00:00:00".into(),
+            ),
+            Message::new(Role::Assistant, "ack".into()),
+        ];
+        let meta = SessionMeta {
+            id: "test".into(),
+            created: chrono::Utc::now(),
+            updated: chrono::Utc::now(),
+            model_provider: "ollama".into(),
+            model_id: "r1".into(),
+            tokens_input: 1,
+            tokens_output: 1,
+            version: "0.1.0".into(),
+            summary: None,
+            compaction: None,
+        };
+
+        let out = serialize(&meta, &msgs).unwrap();
+        let (_meta2, parsed) = parse(&out).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].content, msgs[0].content);
+        assert_eq!(parsed[1].content, "ack");
     }
 }

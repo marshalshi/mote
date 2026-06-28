@@ -59,7 +59,7 @@ Response structure for non-trivial work:
 read = "allow"
 glob = "allow"
 grep = "allow"
-write = "allow"
+write = "ask"
 edit = "ask"
 bash = "ask"
 subagent = "allow"

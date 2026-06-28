@@ -18,6 +18,10 @@ use self::keybinding::{Action, Keybindings};
 use self::state::{App, AppState, ServerHealth, SlashAction};
 use crate::client::{ChatStream, MoteClient};
 
+enum BackgroundEvent {
+    CompactFinished(anyhow::Result<marshaling_protocol::CompactResponse>),
+}
+
 /// Run the TUI event loop. Returns when the user quits.
 pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
     // Setup terminal
@@ -40,6 +44,8 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
     // Agent / WS chat channels
     let mut chat_stream: Option<ChatStream> = None;
+    let (background_tx, mut background_rx) =
+        tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
 
     // Health check ticker
     let mut health_interval = tokio::time::interval(Duration::from_secs(5));
@@ -126,6 +132,11 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     if !healthy {
                         // If we were in a chat stream, it would have disconnected.
                         // Just update the status bar.
+                    }
+                }
+                background = background_rx.recv() => {
+                    if let Some(event) = background {
+                        handle_background_event(&mut app, event);
                     }
                 }
             }
@@ -235,8 +246,12 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                 SlashAction::Compact {
                     include_latest_user,
                 } => {
-                    compact_conversation(client, &mut app, include_latest_user)
-                        .await;
+                    start_compaction(
+                        client,
+                        &mut app,
+                        include_latest_user,
+                        &background_tx,
+                    );
                 }
                 SlashAction::SaveCredential(provider, key, value) => {
                     let result = match client
@@ -400,10 +415,11 @@ async fn start_chat(
     }
 }
 
-async fn compact_conversation(
+fn start_compaction(
     client: &MoteClient,
     app: &mut App,
     include_latest_user: bool,
+    background_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
 ) {
     let history = app.compact_history_messages(include_latest_user);
     if history.is_empty() && app.compaction_state.is_none() {
@@ -428,19 +444,38 @@ async fn compact_conversation(
         runtime_session_key: Some(app.runtime_session_key.clone()),
     };
 
-    match client.compact(&request).await {
-        Ok(response) => {
-            app.apply_compaction(response.session_id, response.compaction);
-        }
-        Err(e) => {
-            app.pending_auto_compact_send = false;
-            app.suppress_auto_compact_for_latest_message();
-            app.messages.push(self::state::DisplayMessage {
-                role: crate::llm::Role::Assistant,
-                content: format!("Compaction failed: {e:#}"),
-                thinking: None,
-                source: self::state::MessageSource::Error,
-            });
+    app.start_background_activity("compacting conversation");
+
+    let compact_client = client.clone();
+    let tx = background_tx.clone();
+    tokio::spawn(async move {
+        let result = compact_client.compact(&request).await;
+        let _ = tx.send(BackgroundEvent::CompactFinished(result));
+    });
+}
+
+fn handle_background_event(app: &mut App, event: BackgroundEvent) {
+    match event {
+        BackgroundEvent::CompactFinished(result) => {
+            app.finish_background_activity();
+            match result {
+                Ok(response) => {
+                    app.apply_compaction(
+                        response.session_id,
+                        response.compaction,
+                    );
+                }
+                Err(e) => {
+                    app.pending_auto_compact_send = false;
+                    app.suppress_auto_compact_for_latest_message();
+                    app.messages.push(self::state::DisplayMessage {
+                        role: crate::llm::Role::Assistant,
+                        content: format!("Compaction failed: {e:#}"),
+                        thinking: None,
+                        source: self::state::MessageSource::Error,
+                    });
+                }
+            }
         }
     }
 }
@@ -923,19 +958,19 @@ fn handle_action(
     // Quit and scroll work in any state
     // During agent running, Ctrl+C cancels immediately and Esc requires a double-tap
     match action {
-        Some(Action::Quit)
-            if app.state == AppState::AgentRunning
-                || app.state == AppState::WaitingResponse =>
-        {
+        Some(Action::Quit) if app.state == AppState::AgentRunning => {
             // Ctrl+C cancels immediately while running.
             app.pending_cancel = true;
             app.clear_esc_cancel_arm();
             return;
         }
+        Some(Action::Quit) if app.state == AppState::WaitingResponse => {
+            app.clear_esc_cancel_arm();
+            app.state = AppState::Quitting;
+            return;
+        }
         Some(Action::CancelAgent) => {
-            if app.state == AppState::AgentRunning
-                || app.state == AppState::WaitingResponse
-            {
+            if app.state == AppState::AgentRunning {
                 if app.esc_cancel_step() {
                     app.pending_cancel = true;
                     app.clear_esc_cancel_arm();
@@ -946,6 +981,12 @@ fn handle_action(
                             .into(),
                     ));
                 }
+            } else if app.state == AppState::WaitingResponse {
+                app.messages.push(self::state::DisplayMessage::command(
+                    crate::llm::Role::Assistant,
+                    "Still waiting for compaction to finish. Press Ctrl+C to quit the TUI immediately if needed."
+                        .into(),
+                ));
             }
             return;
         }
@@ -1513,6 +1554,75 @@ mod tests {
         );
 
         assert!(should_animate_loading(&app, true));
+    }
+
+    #[test]
+    fn test_handle_background_compact_success_applies_compaction() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.start_background_activity("compacting conversation");
+
+        handle_background_event(
+            &mut app,
+            BackgroundEvent::CompactFinished(Ok(
+                marshaling_protocol::CompactResponse {
+                    session_id: "sess-1".into(),
+                    compaction: marshaling_protocol::CompactionState {
+                        summary: "summary".into(),
+                        compacted_message_count: 2,
+                        model_provider: "deepseek".into(),
+                        model_id: "deepseek-chat".into(),
+                    },
+                },
+            )),
+        );
+
+        assert_eq!(app.state, AppState::Idle);
+        assert!(app.loading_progress.is_none());
+        assert_eq!(app.active_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            app.compaction_state.as_ref().map(|c| c.summary.as_str()),
+            Some("summary")
+        );
+    }
+
+    #[test]
+    fn test_handle_background_compact_failure_clears_pending_auto_send() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "latest".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+        app.pending_auto_compact_send = true;
+        app.start_background_activity("compacting conversation");
+
+        handle_background_event(
+            &mut app,
+            BackgroundEvent::CompactFinished(Err(anyhow::anyhow!("boom"))),
+        );
+
+        assert_eq!(app.state, AppState::Idle);
+        assert!(!app.pending_auto_compact_send);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Compaction failed"))
+        );
     }
 
     #[test]

@@ -499,6 +499,7 @@ fn persist_compacted_session(
 ) -> Result<String> {
     let mut session =
         session::Session::new(provider.to_string(), model_id.to_string());
+    let mut preserved_summary: Option<String> = None;
     for msg in history {
         let role = match msg.role.as_str() {
             "user" => llm::Role::User,
@@ -517,9 +518,10 @@ fn persist_compacted_session(
             let existing_path =
                 history_dir_for_session(history_base_dir, runtime_session_key)
                     .join(format!("{existing_id}.md"));
-            if let Ok((_meta, existing_messages)) =
+            if let Ok((meta, existing_messages)) =
                 history::parse_file(&existing_path)
             {
+                preserved_summary = meta.summary;
                 let mut merged_messages: Vec<session::Message> =
                     existing_messages.into_iter().take(prior_count).collect();
                 merged_messages.extend(session.messages);
@@ -527,6 +529,8 @@ fn persist_compacted_session(
             }
         }
     }
+    session.summary = preserved_summary
+        .or_else(|| session::Session::summary_from_messages(&session.messages));
     session.compaction = Some(compaction);
     apply_selected_session_id(&mut session, selected_session_id);
     let session_id = session.id.clone();
@@ -1598,15 +1602,17 @@ fn save_run_session(
         tokens_output,
         &chat_history,
     );
+    let mut preserved_summary: Option<String> = None;
     if let (Some(existing_id), Some(compaction_state)) =
         (selected_session_id.as_deref(), compaction.as_ref())
     {
         let existing_path =
             history_dir_for_session(&history_base_dir, &runtime_session_key)
                 .join(format!("{existing_id}.md"));
-        if let Ok((_meta, existing_messages)) =
+        if let Ok((meta, existing_messages)) =
             history::parse_file(&existing_path)
         {
+            preserved_summary = meta.summary;
             let mut merged_messages: Vec<session::Message> = existing_messages
                 .into_iter()
                 .take(compaction_state.compacted_message_count)
@@ -1615,6 +1621,8 @@ fn save_run_session(
             session.messages = merged_messages;
         }
     }
+    session.summary = preserved_summary
+        .or_else(|| session::Session::summary_from_messages(&session.messages));
     session.compaction = compaction;
     apply_selected_session_id(&mut session, selected_session_id.as_deref());
     let hist_dir =
@@ -2321,6 +2329,111 @@ base_url = "http://localhost:11434"
                 .unwrap()
                 .contains("not a system instruction")
         );
+    }
+
+    #[test]
+    fn test_persist_compacted_session_preserves_existing_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let history_dir = temp.path().join("history");
+        let runtime_session_key = "test-runtime";
+        let hist_dir =
+            history_dir_for_session(&history_dir, runtime_session_key);
+
+        let mut existing = session::Session::new(
+            "deepseek".into(),
+            "deepseek-v4-flash".into(),
+        );
+        existing.id = "chat-existing".into();
+        existing.summary = Some("Original session summary".into());
+        existing.messages.push(session::Message::new(
+            llm::Role::User,
+            "first request".into(),
+        ));
+        existing.messages.push(session::Message::new(
+            llm::Role::Assistant,
+            "first reply".into(),
+        ));
+        history::save_session(&hist_dir, &existing).unwrap();
+
+        let new_summary = marshaling_protocol::CompactionState {
+            summary: "compacted context".into(),
+            compacted_message_count: 2,
+            model_provider: "deepseek".into(),
+            model_id: "deepseek-v4-flash".into(),
+        };
+        persist_compacted_session(
+            &history_dir,
+            runtime_session_key,
+            Some("chat-existing"),
+            "deepseek",
+            "deepseek-v4-flash",
+            &[],
+            new_summary,
+        )
+        .unwrap();
+
+        let saved_path = hist_dir.join("chat-existing.md");
+        let (meta, _) = history::parse_file(&saved_path).unwrap();
+        assert_eq!(meta.summary.as_deref(), Some("Original session summary"));
+    }
+
+    #[tokio::test]
+    async fn test_save_run_session_preserves_summary_for_compacted_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let history_dir = temp.path().join("history");
+        let runtime_session_key = "test-runtime";
+        let hist_dir =
+            history_dir_for_session(&history_dir, runtime_session_key);
+
+        let mut existing = session::Session::new(
+            "deepseek".into(),
+            "deepseek-v4-flash".into(),
+        );
+        existing.id = "chat-existing".into();
+        existing.summary = Some("Original session summary".into());
+        existing.compaction = Some(marshaling_protocol::CompactionState {
+            summary: "old compacted context".into(),
+            compacted_message_count: 2,
+            model_provider: "deepseek".into(),
+            model_id: "deepseek-v4-flash".into(),
+        });
+        existing.messages.push(session::Message::new(
+            llm::Role::User,
+            "first request".into(),
+        ));
+        existing.messages.push(session::Message::new(
+            llm::Role::Assistant,
+            "first reply".into(),
+        ));
+        history::save_session(&hist_dir, &existing).unwrap();
+
+        save_run_session(
+            vec![
+                llm::ChatMessage::user("latest request"),
+                llm::ChatMessage::assistant_text("latest reply"),
+            ],
+            "deepseek-v4-flash".into(),
+            "deepseek".into(),
+            "default".into(),
+            1,
+            1,
+            Some("chat-existing".into()),
+            history_dir.clone(),
+            runtime_session_key.into(),
+            Some(marshaling_protocol::CompactionState {
+                summary: "new compacted context".into(),
+                compacted_message_count: 2,
+                model_provider: "deepseek".into(),
+                model_id: "deepseek-v4-flash".into(),
+            }),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saved_path = hist_dir.join("chat-existing.md");
+        let (meta, messages) = history::parse_file(&saved_path).unwrap();
+        assert_eq!(meta.summary.as_deref(), Some("Original session summary"));
+        assert_eq!(messages.len(), 4);
     }
 
     #[test]

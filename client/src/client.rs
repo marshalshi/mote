@@ -34,6 +34,7 @@ impl ChatStream {
 }
 
 /// Client for communicating with the mote-server.
+#[derive(Clone)]
 pub struct MoteClient {
     base_url: String,
     http: reqwest::Client,

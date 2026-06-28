@@ -99,6 +99,9 @@ pub struct App {
     /// Loading bar progress: Some(0.0..1.0) = active, None = idle.
     pub loading_progress: Option<f32>,
 
+    /// Short description of the current background activity.
+    pub loading_label: Option<String>,
+
     /// Server connection health.
     pub server_health: ServerHealth,
 
@@ -313,6 +316,7 @@ impl App {
             pending_slash: None,
             input_queue: VecDeque::new(),
             loading_progress: None,
+            loading_label: None,
             server_health: ServerHealth::Unknown,
             pending_permission: None,
             pending_permission_response: None,
@@ -1001,7 +1005,26 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.loading_progress = Some(0.0);
+        self.loading_label = None;
         self.current_skill = None;
+    }
+
+    pub fn start_background_activity(&mut self, label: impl Into<String>) {
+        self.state = AppState::WaitingResponse;
+        self.loading_progress = Some(0.0);
+        self.loading_label = Some(label.into());
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+    }
+
+    pub fn finish_background_activity(&mut self) {
+        if self.state == AppState::WaitingResponse {
+            self.state = AppState::Idle;
+        }
+        self.loading_progress = None;
+        self.loading_label = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
     }
 
     pub fn agent_text_delta(&mut self, chunk: &str) {
@@ -1102,6 +1125,8 @@ impl App {
             self.stream_buffer.clear();
             self.tool_calls.clear();
             self.state = AppState::Idle;
+            self.loading_progress = None;
+            self.loading_label = None;
             return;
         }
         if !content.is_empty() {
@@ -1122,6 +1147,8 @@ impl App {
         self.stream_buffer.clear();
         self.tool_calls.clear();
         self.state = AppState::Idle;
+        self.loading_progress = None;
+        self.loading_label = None;
     }
 
     /// Show an error message (used by start_agent on setup failure).
@@ -1144,6 +1171,8 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.state = AppState::Idle;
+        self.loading_progress = None;
+        self.loading_label = None;
     }
 
     /// Queue a message for later processing (when agent is running).
@@ -1385,6 +1414,7 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.loading_progress = None;
+        self.loading_label = None;
         self.pending_permission = None;
         self.pending_permission_response = None;
         self.pending_cancel = false;
@@ -1417,6 +1447,7 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.loading_progress = None;
+        self.loading_label = None;
         self.pending_permission = None;
         self.pending_permission_response = None;
         self.pending_cancel = false;
@@ -1673,6 +1704,36 @@ mod tests {
         assert_eq!(app.current_agent, "default");
         assert!(app.current_model_override().is_none());
         assert!(!app.selection_mode);
+    }
+
+    #[test]
+    fn test_start_background_activity_sets_waiting_spinner_context() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        app.start_background_activity("compacting conversation");
+
+        assert_eq!(app.state, AppState::WaitingResponse);
+        assert_eq!(app.loading_progress, Some(0.0));
+        assert_eq!(
+            app.loading_label.as_deref(),
+            Some("compacting conversation")
+        );
+    }
+
+    #[test]
+    fn test_finish_background_activity_clears_waiting_state() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.start_background_activity("compacting conversation");
+        app.pending_cancel = true;
+
+        app.finish_background_activity();
+
+        assert_eq!(app.state, AppState::Idle);
+        assert!(app.loading_progress.is_none());
+        assert!(app.loading_label.is_none());
+        assert!(!app.pending_cancel);
     }
 
     #[test]

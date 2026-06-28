@@ -165,19 +165,7 @@ impl Session {
         // Generate summary from the first user message (5-10 words style)
         let summary = chat_history.iter().find_map(|msg| {
             if matches!(msg.role, crate::llm::Role::User) {
-                msg.content.as_ref().map(|c| {
-                    let trimmed: String = c.trim().replace('\n', " ");
-                    let words: Vec<&str> = trimmed
-                        .split_whitespace()
-                        .filter(|w| !w.is_empty())
-                        .collect();
-                    let take_n = 8usize;
-                    if words.len() > take_n {
-                        format!("{}...", words[..take_n].join(" "))
-                    } else {
-                        words.join(" ")
-                    }
-                })
+                msg.content.as_deref().and_then(summary_from_user_content)
             } else {
                 None
             }
@@ -196,6 +184,14 @@ impl Session {
         }
     }
 
+    pub fn summary_from_messages(messages: &[Message]) -> Option<String> {
+        messages.iter().find_map(|msg| {
+            (msg.role == Role::User)
+                .then(|| summary_from_user_content(&msg.content))
+                .flatten()
+        })
+    }
+
     /// Build session metadata for the history file.
     pub fn meta(&self) -> SessionMeta {
         SessionMeta {
@@ -211,6 +207,23 @@ impl Session {
             compaction: self.compaction.clone(),
         }
     }
+}
+
+fn summary_from_user_content(content: &str) -> Option<String> {
+    let trimmed: String = content.trim().replace('\n', " ");
+    let words: Vec<&str> = trimmed
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let take_n = 8usize;
+    Some(if words.len() > take_n {
+        format!("{}...", words[..take_n].join(" "))
+    } else {
+        words.join(" ")
+    })
 }
 
 #[cfg(test)]
@@ -316,5 +329,24 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].content, "please read");
         assert_eq!(session.messages[1].content, "done");
+    }
+
+    #[test]
+    fn test_summary_from_messages_uses_first_user_message() {
+        let messages = vec![
+            Message::new(Role::Assistant, "hello".into()),
+            Message::new(
+                Role::User,
+                "first line\nsecond line words here".into(),
+            ),
+            Message::new(Role::User, "later user".into()),
+        ];
+
+        let summary = Session::summary_from_messages(&messages);
+
+        assert_eq!(
+            summary.as_deref(),
+            Some("first line second line words here")
+        );
     }
 }

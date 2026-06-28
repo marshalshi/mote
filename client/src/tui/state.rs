@@ -69,6 +69,8 @@ pub struct App {
     input_history_idx: Option<usize>,
 
     pub current_agent: String,
+    /// Agent name used when no agent is specified (from server config).
+    pub default_agent: String,
     pub agent_names: Vec<String>,
     /// Subagent names (agents available as subagent targets).
     pub subagent_names: Vec<String>,
@@ -324,8 +326,10 @@ impl App {
         let mut subagent_names: Vec<String> = ui_config.subagent_names.clone();
         subagent_names.sort();
         let mut agent_model_info = ui_config.agent_model_info.clone();
+        let default_agent = ui_config.default_agent.clone();
+        let input_accent = agent_accent_color(&default_agent);
         agent_model_info
-            .entry("default".into())
+            .entry(default_agent.clone())
             .or_insert_with(|| model_info.clone());
         Self {
             state: AppState::Idle,
@@ -335,7 +339,7 @@ impl App {
             scroll_offset: 0,
             auto_scroll: true,
             model_info: agent_model_info
-                .get("default")
+                .get(&default_agent)
                 .cloned()
                 .unwrap_or_else(|| model_info.clone()),
             default_model_info: model_info,
@@ -346,7 +350,7 @@ impl App {
             reasoning_buffer: String::new(),
             input_history: Vec::new(),
             input_history_idx: None,
-            current_agent: "default".into(),
+            current_agent: default_agent.clone(),
             agent_names,
             subagent_names,
             handled_slash_command: false,
@@ -355,7 +359,7 @@ impl App {
             tool_calls: Vec::new(),
             agent_model_overrides: HashMap::new(),
             models_cache: Vec::new(),
-            input_accent: agent_accent_color("default"),
+            input_accent,
             user_accent: parse_ui_color(&ui_config.user_accent),
             pending_slash: None,
             input_queue: VecDeque::new(),
@@ -370,6 +374,7 @@ impl App {
             current_subagent_index: None,
             pending_cancel: false,
             esc_cancel_deadline: None,
+            default_agent,
             workspace_root,
             repo_agents_md,
             runtime_session_key,
@@ -950,7 +955,8 @@ impl App {
     }
 
     fn handle_agent_command(&mut self, parts: &[&str]) {
-        let all_agents = all_agent_names(&self.agent_names);
+        let all_agents =
+            all_agent_names(&self.agent_names, &self.default_agent);
         if parts.len() < 2 {
             self.messages.push(DisplayMessage {
                 role: Role::Assistant,
@@ -965,7 +971,9 @@ impl App {
         }
 
         let name = parts[1];
-        if name == "default" || self.agent_names.contains(&name.to_string()) {
+        if name == self.default_agent.as_str()
+            || self.agent_names.contains(&name.to_string())
+        {
             self.current_agent = name.to_string();
             self.input_accent = agent_accent_color(&self.current_agent);
             self.sync_current_agent_model_info();
@@ -998,10 +1006,13 @@ impl App {
         }
 
         let name = parts[1];
-        if name == "default" {
+        if name == self.default_agent.as_str() {
             self.push_command_message(
                 Role::Assistant,
-                "`/model default` was removed. Use `/model` and choose from the provider list.",
+                format!(
+                    "`/model {}` was removed. Use `/model` and choose from the provider list.",
+                    self.default_agent
+                ),
             );
             return;
         }
@@ -1372,7 +1383,7 @@ impl App {
     }
 
     pub fn cycle_agent(&mut self) {
-        let names = all_agent_names(&self.agent_names);
+        let names = all_agent_names(&self.agent_names, &self.default_agent);
         if names.is_empty() {
             return;
         }
@@ -1672,7 +1683,9 @@ impl App {
         if let Some(cmd) = input.split_whitespace().next() {
             let after = input[cmd.len()..].trim_start();
             if !after.is_empty() && (cmd == "/agent" || cmd == "/a") {
-                for name in all_agent_names(&self.agent_names) {
+                for name in
+                    all_agent_names(&self.agent_names, &self.default_agent)
+                {
                     if name.starts_with(after) {
                         self.suggestions.push(format!("/agent {}", name));
                     }
@@ -1731,10 +1744,17 @@ fn shell_command_from_input(text: &str) -> Option<String> {
         .map(|cmd| cmd.trim_start().to_string())
 }
 
-/// Returns all agent names including the built-in "default".
-fn all_agent_names(configured: &[String]) -> Vec<String> {
-    let mut names = vec!["default".to_string()];
-    names.extend(configured.iter().cloned());
+/// Returns all agent names including the built-in default agent.
+fn all_agent_names(
+    configured: &[String],
+    default_agent: &str,
+) -> Vec<String> {
+    let mut names = vec![default_agent.to_string()];
+    for n in configured {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
     names
 }
 
@@ -1845,14 +1865,15 @@ mod tests {
 
     fn test_ui_config() -> marshaling_protocol::UiConfig {
         let mut agent_model_info = HashMap::new();
-        agent_model_info.insert("default".into(), "test/test-model".into());
+        agent_model_info.insert("build".into(), "test/test-model".into());
         marshaling_protocol::UiConfig {
             input_accent: "cyan".into(),
             user_accent: "cyan".into(),
-            agent_names: vec!["default".into()],
+            agent_names: vec!["build".into()],
             subagent_names: vec!["review".into()],
             model_info: "test/test-model".into(),
             agent_model_info,
+            default_agent: "build".into(),
         }
     }
 
@@ -1862,7 +1883,7 @@ mod tests {
         let app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.state, AppState::Idle);
         assert!(app.messages.is_empty());
-        assert_eq!(app.current_agent, "default");
+        assert_eq!(app.current_agent, "build");
         assert!(app.current_model_override().is_none());
         assert!(!app.selection_mode);
     }
@@ -2301,7 +2322,7 @@ mod tests {
     fn test_slash_model_default_is_removed() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.input = "/model default".into();
+        app.input = "/model build".into();
 
         app.submit_input();
 
@@ -2440,17 +2461,17 @@ mod tests {
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.input = "/agent".into();
         app.submit_input();
-        assert!(app.messages[0].content.contains("default"));
+        assert!(app.messages[0].content.contains("build"));
     }
 
     #[test]
     fn test_slash_agent_switch() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.input = "/agent default".into();
+        app.input = "/agent build".into();
         app.submit_input();
-        assert_eq!(app.current_agent, "default");
-        assert_eq!(app.input_accent, agent_accent_color("default"));
+        assert_eq!(app.current_agent, "build");
+        assert_eq!(app.input_accent, agent_accent_color("build"));
     }
 
     #[test]
@@ -2462,14 +2483,15 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
                 ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
 
-        assert_eq!(app.input_accent, agent_accent_color("default"));
+        assert_eq!(app.input_accent, agent_accent_color("build"));
 
         app.cycle_agent();
         assert_eq!(app.current_agent, "plan");
@@ -2610,13 +2632,14 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
                 ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        assert_eq!(app.current_agent, "default");
+        assert_eq!(app.current_agent, "build");
         app.cycle_agent();
         assert_eq!(app.current_agent, "plan");
         assert!(app.messages.is_empty());
@@ -2656,10 +2679,11 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
                 ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.model_info, "test/test-model");
@@ -2680,10 +2704,11 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
                 ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.cycle_agent();
@@ -2698,7 +2723,7 @@ mod tests {
         assert_eq!(app.model_info, "kimi/review-model");
 
         app.cycle_agent();
-        assert_eq!(app.current_agent, "default");
+        assert_eq!(app.current_agent, "build");
         assert_eq!(app.model_info, "test/test-model");
 
         app.cycle_agent();
@@ -2736,8 +2761,8 @@ mod tests {
     #[test]
     fn test_all_agent_names() {
         let configured = vec!["plan".into(), "review".into()];
-        let names = all_agent_names(&configured);
-        assert_eq!(names, vec!["default", "plan", "review"]);
+        let names = all_agent_names(&configured, "build");
+        assert_eq!(names, vec!["build", "plan", "review"]);
     }
 
     #[test]

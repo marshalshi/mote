@@ -379,14 +379,19 @@ Terminal 2 (client)              Terminal 1 (server)
 
 The client never calls LLM providers directly — all agent logic runs server-side.
 
-### Prompt assembly (6 layers)
+### Prompt assembly
+
+Assembled system layers:
 
 1. **Environment** — model name, working directory, platform, date
-2. **Provider prompt** — `prompts/<provider>.txt`, falls back to `prompts/default.txt`
-3. **Agent instructions** — from agent TOML's `instructions` field
-4. **User AGENTS.md** — `~/.config/mote/AGENTS.md` (optional)
-5. **Skills** — `~/.config/mote/skills/` (optional)
-6. **Dynamic system reminder** — generated fresh each turn with time, progress, tool results, and guidance
+2. **Shared system prompt** — `prompts/system/mote.md` by default
+3. **User AGENTS.md** — `~/.config/mote/AGENTS.md` (optional)
+4. **Workspace AGENTS.md** — repo policy sent by the client (optional)
+5. **Agent instructions** — from agent TOML's `instructions` field
+6. **Skills** — `~/.config/mote/skills/` names + descriptions (optional)
+
+Per turn, the agent loop also injects a dynamic system reminder with time,
+progress, tool results, and guidance.
 
 ## Tests
 

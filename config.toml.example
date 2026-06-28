@@ -45,6 +45,7 @@ default_max_tokens = 65536
 # --- Server bind ---
 [server]
 port = 9847                    # port to listen on (default: 9847)
+default_agent = "build"        # agent used when no agent is specified
 
 # --- UI accent colors ---
 [ui]
@@ -62,8 +63,7 @@ dir = "logs/"                  # with ~/.config/mote/config.toml this resolves t
 
 # --- Prompt files ---
 [prompts]
-default = "prompts/default.txt"
-instructions = ["prompts/instructions/"]
+default = "prompts/system/mote.md"
 
 # --- Optional: named agents with custom models/prompts ---
 # [agents.plan]

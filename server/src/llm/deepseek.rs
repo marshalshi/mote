@@ -281,6 +281,10 @@ fn find_event_separator(buf: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+fn finish_reason_signals_completion(reason: &str) -> bool {
+    matches!(reason, "stop" | "length" | "content_filter" | "tool_calls")
+}
+
 // ── Trait impl ────────────────────────────────────────────
 
 #[async_trait]
@@ -433,6 +437,7 @@ impl LlmProvider for DeepSeekProvider {
         let mut reasoning_content: Option<String> = None;
         let mut tool_call_acc: HashMap<usize, PendingToolCall> = HashMap::new();
         let mut usage = Usage::default();
+        let mut saw_completion = false;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -520,11 +525,10 @@ impl LlmProvider for DeepSeekProvider {
                                 }
                                 // Handle finish_reason
                                 if let Some(ref reason) = choice.finish_reason {
-                                    if reason == "tool_calls"
-                                        || reason == "stop"
-                                    {
-                                        // We'll finalize after the loop
-                                    }
+                                    saw_completion |=
+                                        finish_reason_signals_completion(
+                                            reason,
+                                        );
                                 }
                                 if let Some(u) = choice.usage {
                                     usage = Usage {
@@ -545,6 +549,17 @@ impl LlmProvider for DeepSeekProvider {
                     }
                 }
             }
+        }
+
+        if saw_completion {
+            let result = finalize(
+                &mut text_content,
+                &mut tool_call_acc,
+                usage,
+                &mut reasoning_content,
+            );
+            let _ = sender.send(Ok(StreamEvent::Done(result)));
+            return;
         }
 
         let _ = sender.send(Err(anyhow::anyhow!(
@@ -852,6 +867,15 @@ mod tests {
             provider.build_request(&[ChatMessage::user("hi")], &options, false);
 
         assert_eq!(body["temperature"], serde_json::json!(0.12));
+    }
+
+    #[test]
+    fn test_finish_reason_signals_completion_for_terminal_stream_chunks() {
+        assert!(finish_reason_signals_completion("stop"));
+        assert!(finish_reason_signals_completion("length"));
+        assert!(finish_reason_signals_completion("content_filter"));
+        assert!(finish_reason_signals_completion("tool_calls"));
+        assert!(!finish_reason_signals_completion("unknown"));
     }
 }
 

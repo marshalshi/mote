@@ -1290,6 +1290,12 @@ fn centered_text(content: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(padding), content)
 }
 
+fn is_helper_context(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("<system-reminder>")
+        || trimmed.starts_with("<reminder>")
+}
+
 fn is_welcome_empty_state(app: &App) -> bool {
     app.messages.is_empty()
         && app.stream_buffer.is_empty()
@@ -1439,6 +1445,8 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
         let content_style = if msg.source == super::state::MessageSource::Error
         {
             Style::default().fg(Color::Red)
+        } else if is_helper_context(&msg.content) {
+            grey_content
         } else {
             Style::default()
         };
@@ -1523,13 +1531,18 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
 
     // Streaming content (assistant — blank side bar)
     if !app.stream_buffer.is_empty() {
+        let stream_style = if is_helper_context(&app.stream_buffer) {
+            grey_content
+        } else {
+            Style::default()
+        };
         push_accent_lines(
             &mut lines,
             &app.stream_buffer,
             content_width,
             "    ",
             Style::default(),
-            Style::default(),
+            stream_style,
         );
         lines.push(Line::from(""));
     }
@@ -1669,13 +1682,18 @@ fn build_subagent_lines(
 
     // Stream buffer (in-progress text) — blank side bar for assistant
     if !sv.stream_buffer.is_empty() {
+        let stream_style = if is_helper_context(&sv.stream_buffer) {
+            grey_content
+        } else {
+            Style::default()
+        };
         push_accent_lines(
             &mut lines,
             &sv.stream_buffer,
             content_width,
             "    ",
             Style::default(),
-            Style::default(),
+            stream_style,
         );
     }
 
@@ -2184,6 +2202,22 @@ fn render_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn test_ui_config() -> marshaling_protocol::UiConfig {
+        marshaling_protocol::UiConfig {
+            input_accent: "cyan".into(),
+            user_accent: "cyan".into(),
+            model_info: "deepseek/deepseek-chat".into(),
+            agent_names: vec!["build".into()],
+            subagent_names: vec![],
+            agent_model_info: HashMap::from([(
+                "build".into(),
+                "deepseek/deepseek-chat".into(),
+            )]),
+            default_agent: "build".into(),
+        }
+    }
 
     #[test]
     fn test_word_wrap_short_line_no_wrap() {
@@ -2474,5 +2508,31 @@ mod tests {
         let result = md_text("first paragraph\n\nsecond paragraph");
         let blank_count = result.iter().filter(|l| l.is_empty()).count();
         assert!(blank_count >= 1);
+    }
+
+    #[test]
+    fn test_helper_context_renders_in_grey() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.stream_buffer =
+            "<system-reminder>\nhelper\n</system-reminder>".into();
+
+        let lines = build_lines(&app, 80);
+        let helper_span = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref().contains("helper"))
+            .unwrap();
+
+        assert_eq!(helper_span.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn test_helper_context_detection() {
+        assert!(is_helper_context(
+            "<system-reminder>\nYour operational mode changed\n</system-reminder>"
+        ));
+        assert!(is_helper_context("<reminder>note</reminder>"));
+        assert!(!is_helper_context("normal assistant reply"));
     }
 }

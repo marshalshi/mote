@@ -150,7 +150,9 @@ fn default_prompt_file() -> PathBuf {
 }
 impl Default for PromptConfig {
     fn default() -> Self {
-        Self { default: default_prompt_file() }
+        Self {
+            default: default_prompt_file(),
+        }
     }
 }
 
@@ -638,10 +640,7 @@ pub fn load_file_agents() -> HashMap<String, AgentConfig> {
 }
 
 /// Read `*.toml` agent files from `dir` into `agents`, overwriting on collision.
-fn load_agents_from_dir(
-    dir: &Path,
-    agents: &mut HashMap<String, AgentConfig>,
-) {
+fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
     if !dir.is_dir() {
         return;
     }

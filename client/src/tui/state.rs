@@ -1745,10 +1745,7 @@ fn shell_command_from_input(text: &str) -> Option<String> {
 }
 
 /// Returns all agent names including the built-in default agent.
-fn all_agent_names(
-    configured: &[String],
-    default_agent: &str,
-) -> Vec<String> {
+fn all_agent_names(configured: &[String], default_agent: &str) -> Vec<String> {
     let mut names = vec![default_agent.to_string()];
     for n in configured {
         if !names.contains(n) {

@@ -104,7 +104,8 @@ impl PromptAssembler {
         &self,
         _model_provider: &str,
     ) -> Result<Option<String>> {
-        let prompt = self.load_file_or_default(&self.config.prompts.default, "")?;
+        let prompt =
+            self.load_file_or_default(&self.config.prompts.default, "")?;
         Ok((!prompt.is_empty()).then_some(prompt))
     }
 
@@ -509,8 +510,7 @@ default = "/nonexistent/mote.md"
         let dir = tempfile::tempdir().unwrap();
         let prompts_dir = dir.path().join("prompts").join("system");
         std::fs::create_dir_all(&prompts_dir).unwrap();
-        std::fs::write(prompts_dir.join("mote.md"), "MOTE PROMPT")
-            .unwrap();
+        std::fs::write(prompts_dir.join("mote.md"), "MOTE PROMPT").unwrap();
 
         let toml = format!(
             r#"

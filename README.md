@@ -5,7 +5,7 @@ A Rust AI coding assistant with a local server and a terminal UI.
 ## Highlights
 
 - Build the client/server once, then run the compiled binaries directly.
-- Works with local Ollama models or remote providers like DeepSeek and GitHub Models.
+- Works with local Ollama models or remote providers like DeepSeek, GLM/Z.ai, Kimi, and MiniMax.
 - Supports agents, subagents, skills, session history, and rollback.
 - Each agent gets a stable, distinct terminal color within the current app session.
 - Keeps the terminal workflow lightweight and keyboard-driven.
@@ -15,7 +15,7 @@ A Rust AI coding assistant with a local server and a terminal UI.
 ### Requirements
 - Rust 1.75+
 - [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) — preferred by the built-in `grep` tool when available; otherwise falls back to `grep`
-- [Ollama](https://ollama.com) with a model, or a DeepSeek API key
+- [Ollama](https://ollama.com) with a model, or an API key for DeepSeek, GLM/Z.ai, Kimi, or MiniMax
 
 ### First run
 
@@ -57,17 +57,22 @@ cp auth.json.example ~/.config/mote/auth.json
 Or use the `--login` CLI flag to set them interactively:
 
 ```bash
-# DeepSeek — enter your API key (debug build)
+# Choose a provider interactively (debug build)
+./target/debug/mote-client --login
+
+# Choose a provider interactively (release build)
+./target/release/mote-client --login
+
+# Or specify one directly
 ./target/debug/mote-client --login deepseek
+./target/debug/mote-client --login glm
+./target/debug/mote-client --login kimi
+./target/debug/mote-client --login minimax
 
-# DeepSeek — enter your API key (release build)
 ./target/release/mote-client --login deepseek
-
-# GitHub — enter a Personal Access Token with models:read scope (debug build)
-./target/debug/mote-client --login github
-
-# GitHub — enter a Personal Access Token with models:read scope (release build)
-./target/release/mote-client --login github
+./target/release/mote-client --login glm
+./target/release/mote-client --login kimi
+./target/release/mote-client --login minimax
 ```
 
 ### Run
@@ -152,8 +157,8 @@ agent_command = "ctrl+space"
 | `/tokens` | Show token usage |
 | `/new` | Start a fresh chat session |
 | `/sessions` | Open session picker (↑/↓, Enter, Esc) |
-| `/login github` | GitHub OAuth device flow |
-| `/login deepseek <key>` | Save DeepSeek API key |
+| `/login` | Show login provider choices |
+| `/login <provider> <key>` | Save provider API key (`deepseek`, `glm`, `kimi`, `minimax`) |
 | `/subagents` | List active subagents |
 | `/rollback last` | Roll back latest tracked file changes |
 | `! <command>` | Run a local shell command in the current workspace |
@@ -332,9 +337,8 @@ mote/
 │   ├── history.rs          # markdown history writer
 │   └── llm/                # provider implementations
 │       ├── mod.rs          # provider factory
-│       ├── deepseek.rs     # DeepSeek API
-│       ├── ollama.rs       # Ollama (local)
-│       └── github.rs       # GitHub Models
+│       ├── deepseek.rs     # DeepSeek + OpenAI-compatible remote providers
+│       └── ollama.rs       # Ollama (local)
 └── client/                 # TUI + CLI
     ├── main.rs             # entry point
     ├── client.rs           # WebSocket client + chat stream

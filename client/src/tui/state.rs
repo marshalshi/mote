@@ -152,6 +152,11 @@ pub struct App {
     pub model_picker_items: Vec<ModelChoice>,
     pub model_picker_index: usize,
 
+    /// Login provider picker popup state.
+    pub login_picker_open: bool,
+    pub login_picker_items: Vec<LoginProviderChoice>,
+    pub login_picker_index: usize,
+
     /// Active session id to continue on next turns.
     pub active_session_id: Option<String>,
 
@@ -172,6 +177,9 @@ pub struct App {
 
     /// True when terminal-native text selection/copy mode is active.
     pub selection_mode: bool,
+
+    /// Pending secure API-key entry after selecting a login provider.
+    pending_secret_login: Option<PendingSecretLogin>,
 }
 
 /// Tracks a running subagent's output for the multi-agent TUI.
@@ -197,8 +205,21 @@ pub struct PendingPermission {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSecretLogin {
+    provider: String,
+    display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelChoice {
     Model { provider: String, model_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginProviderChoice {
+    pub provider: String,
+    pub display_name: String,
+    pub key_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,9 +253,32 @@ pub enum AppState {
 
 const AUTO_COMPACT_CHAR_THRESHOLD: usize = 50_000;
 
+const LOGIN_PROVIDERS: &[(&str, &str, &str)] = &[
+    (
+        "deepseek",
+        "DeepSeek",
+        "https://platform.deepseek.com/api_keys",
+    ),
+    (
+        "glm",
+        "GLM (Z.ai)",
+        "https://z.ai/manage-apikey/apikey-list",
+    ),
+    (
+        "kimi",
+        "Kimi (Moonshot)",
+        "https://platform.kimi.ai/console/api-keys",
+    ),
+    (
+        "minimax",
+        "MiniMax",
+        "https://platform.minimax.io/user-center/basic-information/interface-key",
+    ),
+];
+
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
-    ("/login", "Login to a provider (github)"),
+    ("/login", "Login to a provider"),
     ("/agent", "List or switch agents"),
     ("/tokens", "Show token usage"),
     ("/new", "Start a new session"),
@@ -336,6 +380,9 @@ impl App {
             model_picker_open: false,
             model_picker_items: Vec::new(),
             model_picker_index: 0,
+            login_picker_open: false,
+            login_picker_items: Vec::new(),
+            login_picker_index: 0,
             active_session_id: None,
             compaction_state: None,
             pending_compact_confirmation: false,
@@ -343,6 +390,7 @@ impl App {
             compact_declined_for_message: None,
             mouse_position: None,
             selection_mode: false,
+            pending_secret_login: None,
         }
     }
 
@@ -366,6 +414,7 @@ impl App {
         self.pending_compact_confirmation
             || self.session_picker_open
             || self.model_picker_open
+            || self.login_picker_open
             || self.pending_permission.is_some()
     }
 
@@ -376,6 +425,8 @@ impl App {
             Some("Close the session picker before entering selection mode.")
         } else if self.model_picker_open {
             Some("Close the model picker before entering selection mode.")
+        } else if self.login_picker_open {
+            Some("Close the login picker before entering selection mode.")
         } else if self.pending_permission.is_some() {
             Some(
                 "Resolve the permission prompt before entering selection mode.",
@@ -435,6 +486,14 @@ impl App {
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.auto_scroll = true;
+
+        if self.pending_secret_login.is_some() {
+            self.reset_suggestions();
+            self.handled_slash_command = true;
+            self.handle_secret_login_input(text);
+            return String::new();
+        }
+
         self.remember_input(&text);
 
         if self.handle_shell_input(&text) {
@@ -508,6 +567,33 @@ impl App {
         self.stream_buffer.clear();
         self.reasoning_buffer.clear();
         transformed
+    }
+
+    fn handle_secret_login_input(&mut self, text: String) {
+        let Some(secret) =
+            (!text.trim().is_empty()).then_some(text.trim().to_string())
+        else {
+            self.push_command_message(
+                Role::Assistant,
+                "No API key entered. Login cancelled.",
+            );
+            self.pending_secret_login = None;
+            return;
+        };
+
+        let Some(pending) = self.pending_secret_login.take() else {
+            return;
+        };
+
+        self.push_command_message(
+            Role::Assistant,
+            format!("Saving {} API key...", pending.display_name),
+        );
+        self.pending_slash = Some(SlashAction::SaveCredential(
+            pending.provider,
+            "api_key".into(),
+            secret,
+        ));
     }
 
     fn reset_suggestions(&mut self) {
@@ -649,6 +735,12 @@ impl App {
             .sum()
     }
 
+    pub fn secret_input_prompt(&self) -> Option<&str> {
+        self.pending_secret_login
+            .as_ref()
+            .map(|p| p.display_name.as_str())
+    }
+
     /// Transform `@name` mentions in the message into text the LLM will understand as subagent calls.
     /// E.g., `@review check this` → `[use subagent "review"] check this`
     fn transform_mentions(&self, text: &str) -> String {
@@ -714,8 +806,8 @@ impl App {
                 "- `/compact` — Compact older conversation context",
                 "- `/subagents` — List active subagents",
                 "- `/rollback last` — Rollback latest file changes",
-                "- `/login github <token>` — Save GitHub token",
-                "- `/login deepseek <key>` — Save DeepSeek API key",
+                "- `/login` — Show login providers",
+                "- `/login <provider> <key>` — Save provider API key",
                 "- `! <command>` — Run local shell command",
                 "",
                 "## Keybindings",
@@ -762,58 +854,54 @@ impl App {
 
     fn handle_login_command(&mut self, parts: &[&str]) {
         let Some(provider) = parts.get(1).copied() else {
-            self.push_command_message(
-                Role::Assistant,
-                "Usage: /login github <token>  or  /login deepseek <api_key>",
-            );
+            self.open_login_picker();
             return;
         };
 
-        match provider {
-            "github" => self.handle_github_login_command(parts),
-            "deepseek" => self.handle_deepseek_login_command(parts),
-            _ => self.push_command_message(
+        if let Some((_, display_name, key_url)) = LOGIN_PROVIDERS
+            .iter()
+            .find(|(name, _, _)| *name == provider)
+        {
+            self.handle_api_key_login_command(
+                parts,
+                provider,
+                display_name,
+                key_url,
+            );
+        } else {
+            self.push_command_message(
                 Role::Assistant,
                 format!(
-                    "Unknown provider: {}. Supported: github, deepseek",
-                    provider
+                    "Unknown provider: {provider}.\n\n{}",
+                    login_provider_help()
                 ),
-            ),
+            );
         }
     }
 
-    fn handle_github_login_command(&mut self, parts: &[&str]) {
-        let Some(token) = parts.get(2) else {
-            self.push_command_message(
-                Role::Assistant,
-                "Usage: /login github <token>\nCreate a PAT at: https://github.com/settings/tokens?type=beta\nScope: models:read",
-            );
-            return;
-        };
-
-        self.push_command_message(Role::Assistant, "Saving GitHub token...");
-        self.pending_slash = Some(SlashAction::SaveCredential(
-            "github".into(),
-            "token".into(),
-            (*token).to_string(),
-        ));
-    }
-
-    fn handle_deepseek_login_command(&mut self, parts: &[&str]) {
+    fn handle_api_key_login_command(
+        &mut self,
+        parts: &[&str],
+        provider: &str,
+        display_name: &str,
+        key_url: &str,
+    ) {
         let Some(key) = parts.get(2) else {
             self.push_command_message(
                 Role::Assistant,
-                "Usage: /login deepseek <api_key>\nGet your key at: https://platform.deepseek.com/api_keys",
+                format!(
+                    "Usage: /login {provider} <api_key>\nGet your key at: {key_url}"
+                ),
             );
             return;
         };
 
         self.push_command_message(
             Role::Assistant,
-            "Saving DeepSeek API key...",
+            format!("Saving {display_name} API key..."),
         );
         self.pending_slash = Some(SlashAction::SaveCredential(
-            "deepseek".into(),
+            provider.into(),
             "api_key".into(),
             (*key).to_string(),
         ));
@@ -1341,6 +1429,65 @@ impl App {
         self.model_picker_open = false;
     }
 
+    pub fn open_login_picker(&mut self) {
+        self.login_picker_open = true;
+        self.login_picker_items = LOGIN_PROVIDERS
+            .iter()
+            .map(|(provider, display_name, key_url)| LoginProviderChoice {
+                provider: (*provider).to_string(),
+                display_name: (*display_name).to_string(),
+                key_url: (*key_url).to_string(),
+            })
+            .collect();
+        self.login_picker_index = 0;
+    }
+
+    pub fn close_login_picker(&mut self) {
+        self.login_picker_open = false;
+    }
+
+    pub fn login_picker_up(&mut self) {
+        if self.login_picker_items.is_empty() {
+            return;
+        }
+        if self.login_picker_index == 0 {
+            self.login_picker_index = self.login_picker_items.len() - 1;
+        } else {
+            self.login_picker_index -= 1;
+        }
+    }
+
+    pub fn login_picker_down(&mut self) {
+        if self.login_picker_items.is_empty() {
+            return;
+        }
+        self.login_picker_index =
+            (self.login_picker_index + 1) % self.login_picker_items.len();
+    }
+
+    pub fn selected_login_choice(&self) -> Option<LoginProviderChoice> {
+        self.login_picker_items
+            .get(self.login_picker_index)
+            .cloned()
+    }
+
+    pub fn apply_login_choice(&mut self, choice: LoginProviderChoice) {
+        self.pending_secret_login = Some(PendingSecretLogin {
+            provider: choice.provider.clone(),
+            display_name: choice.display_name.clone(),
+        });
+        self.input.clear();
+        self.input_cursor = 0;
+        self.reset_suggestions();
+        self.push_command_message(
+            Role::Assistant,
+            format!(
+                "Selected {}. Enter the API key securely, then press Enter.\nGet your key at: {}",
+                choice.display_name, choice.key_url
+            ),
+        );
+    }
+
     pub fn model_picker_up(&mut self) {
         if self.model_picker_items.is_empty() {
             return;
@@ -1430,6 +1577,8 @@ impl App {
         self.handled_slash_command = false;
         self.close_session_picker();
         self.close_model_picker();
+        self.close_login_picker();
+        self.pending_secret_login = None;
         self.scroll_to_bottom();
         self.tokens_input = 0;
         self.tokens_output = 0;
@@ -1463,6 +1612,8 @@ impl App {
         self.handled_slash_command = false;
         self.close_session_picker();
         self.close_model_picker();
+        self.close_login_picker();
+        self.pending_secret_login = None;
         self.active_session_id = None;
         self.active_run_id = None;
         self.compaction_state = None;
@@ -1585,6 +1736,16 @@ fn all_agent_names(configured: &[String]) -> Vec<String> {
     let mut names = vec!["default".to_string()];
     names.extend(configured.iter().cloned());
     names
+}
+
+fn login_provider_help() -> String {
+    let mut lines = vec!["Select a provider to login:".to_string()];
+    for (name, display_name, key_url) in LOGIN_PROVIDERS {
+        lines.push(format!(
+            "- `/login {name} <api_key>` — {display_name} ({key_url})"
+        ));
+    }
+    lines.join("\n")
 }
 
 fn agent_accent_color(name: &str) -> Color {
@@ -1953,8 +2114,8 @@ mod tests {
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.open_model_picker(vec![
             marshaling_protocol::ModelInfo {
-                provider: "github".into(),
-                model_id: "gpt-4o".into(),
+                provider: "kimi".into(),
+                model_id: "kimi-k2.6".into(),
             },
             marshaling_protocol::ModelInfo {
                 provider: "deepseek".into(),
@@ -2017,19 +2178,82 @@ mod tests {
     }
 
     #[test]
-    fn test_slash_login_github_saves_token() {
+    fn test_slash_login_kimi_saves_api_key() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.input = "/login github ghp_test".into();
+        app.input = "/login kimi sk_test".into();
 
         app.submit_input();
 
         assert!(matches!(
             app.pending_slash,
             Some(SlashAction::SaveCredential(ref provider, ref field, ref value))
-                if provider == "github" && field == "token" && value == "ghp_test"
+                if provider == "kimi" && field == "api_key" && value == "sk_test"
         ));
-        assert!(app.messages[0].content.contains("Saving GitHub token"));
+        assert!(app.messages[0].content.contains("Saving Kimi"));
+    }
+
+    #[test]
+    fn test_slash_login_without_provider_opens_picker() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "/login".into();
+
+        app.submit_input();
+
+        assert!(app.login_picker_open);
+        assert_eq!(app.login_picker_items.len(), LOGIN_PROVIDERS.len());
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn test_apply_login_choice_prefills_input() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        app.apply_login_choice(LoginProviderChoice {
+            provider: "glm".into(),
+            display_name: "GLM (Z.ai)".into(),
+            key_url: "https://z.ai/manage-apikey/apikey-list".into(),
+        });
+
+        assert_eq!(app.input, "");
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(app.secret_input_prompt(), Some("GLM (Z.ai)"));
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selected GLM"))
+        );
+    }
+
+    #[test]
+    fn test_secure_login_input_saves_without_echoing_secret() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.apply_login_choice(LoginProviderChoice {
+            provider: "kimi".into(),
+            display_name: "Kimi (Moonshot)".into(),
+            key_url: "https://platform.kimi.ai/console/api-keys".into(),
+        });
+        app.input = "sk_secret_value".into();
+        app.input_cursor = app.input.len();
+
+        let result = app.submit_input();
+
+        assert!(result.is_empty());
+        assert!(matches!(
+            app.pending_slash,
+            Some(SlashAction::SaveCredential(ref provider, ref field, ref value))
+                if provider == "kimi" && field == "api_key" && value == "sk_secret_value"
+        ));
+        assert!(app.input_history.is_empty());
+        assert!(app.secret_input_prompt().is_none());
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("sk_secret_value"))
+        );
     }
 
     #[test]
@@ -2062,15 +2286,15 @@ mod tests {
     fn test_slash_model_bare_name_uses_cached_provider() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.models_cache = vec![("github".into(), "gpt-4o".into())];
-        app.input = "/model gpt-4o".into();
+        app.models_cache = vec![("kimi".into(), "kimi-k2.6".into())];
+        app.input = "/model kimi-k2.6".into();
 
         app.submit_input();
 
         let ov = app.current_model_override().unwrap();
-        assert_eq!(ov.provider.as_deref(), Some("github"));
-        assert_eq!(ov.model_id, "gpt-4o");
-        assert_eq!(app.model_info, "github/gpt-4o");
+        assert_eq!(ov.provider.as_deref(), Some("kimi"));
+        assert_eq!(ov.model_id, "kimi-k2.6");
+        assert_eq!(app.model_info, "kimi/kimi-k2.6");
     }
 
     #[test]
@@ -2240,7 +2464,7 @@ mod tests {
             agent_model_info: HashMap::from([
                 ("default".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -2388,7 +2612,7 @@ mod tests {
             agent_model_info: HashMap::from([
                 ("default".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -2434,7 +2658,7 @@ mod tests {
             agent_model_info: HashMap::from([
                 ("default".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -2444,7 +2668,7 @@ mod tests {
         assert_eq!(app.model_info, "deepseek/plan-model");
         app.cycle_agent();
         assert_eq!(app.current_agent, "review");
-        assert_eq!(app.model_info, "github/review-model");
+        assert_eq!(app.model_info, "kimi/review-model");
     }
 
     #[test]
@@ -2458,7 +2682,7 @@ mod tests {
             agent_model_info: HashMap::from([
                 ("default".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -2471,7 +2695,7 @@ mod tests {
 
         app.cycle_agent();
         assert_eq!(app.current_agent, "review");
-        assert_eq!(app.model_info, "github/review-model");
+        assert_eq!(app.model_info, "kimi/review-model");
 
         app.cycle_agent();
         assert_eq!(app.current_agent, "default");

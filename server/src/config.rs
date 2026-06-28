@@ -74,7 +74,9 @@ fn default_max_tokens() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvidersConfig {
     pub deepseek: Option<ProviderDeepSeek>,
-    pub github: Option<ProviderGitHub>,
+    pub glm: Option<ProviderApiKey>,
+    pub kimi: Option<ProviderApiKey>,
+    pub minimax: Option<ProviderApiKey>,
     pub ollama: Option<ProviderOllama>,
 }
 
@@ -93,17 +95,26 @@ fn default_deepseek_base_url() -> String {
     "https://api.deepseek.com/v1".to_string()
 }
 
+fn default_glm_base_url() -> &'static str {
+    "https://api.z.ai/api"
+}
+
+fn default_kimi_base_url() -> &'static str {
+    "https://api.moonshot.ai"
+}
+
+fn default_minimax_base_url() -> &'static str {
+    "https://api.minimax.io"
+}
+
 #[derive(Debug, Clone, Deserialize)]
-pub struct ProviderGitHub {
-    /// GitHub Models base URL.
-    #[serde(default = "default_github_base_url")]
+pub struct ProviderApiKey {
+    /// API key (deprecated in config.toml — use auth.json instead).
+    /// When both are set, the secret is resolved from auth.json preferentially.
+    pub api_key: Option<String>,
     pub base_url: String,
     pub default_model: Option<String>,
     pub default_max_tokens: Option<u32>,
-}
-
-fn default_github_base_url() -> String {
-    "https://models.github.ai/inference".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -316,9 +327,19 @@ impl Config {
                 .deepseek
                 .as_ref()
                 .and_then(|p| p.default_model.clone()),
-            "github" => self
+            "glm" => self
                 .providers
-                .github
+                .glm
+                .as_ref()
+                .and_then(|p| p.default_model.clone()),
+            "kimi" => self
+                .providers
+                .kimi
+                .as_ref()
+                .and_then(|p| p.default_model.clone()),
+            "minimax" => self
+                .providers
+                .minimax
                 .as_ref()
                 .and_then(|p| p.default_model.clone()),
             "ollama" => self
@@ -354,6 +375,21 @@ impl Config {
             "deepseek" => self
                 .providers
                 .deepseek
+                .as_ref()
+                .and_then(|p| p.default_max_tokens),
+            "glm" => self
+                .providers
+                .glm
+                .as_ref()
+                .and_then(|p| p.default_max_tokens),
+            "kimi" => self
+                .providers
+                .kimi
+                .as_ref()
+                .and_then(|p| p.default_max_tokens),
+            "minimax" => self
+                .providers
+                .minimax
                 .as_ref()
                 .and_then(|p| p.default_max_tokens),
             "ollama" => self
@@ -456,30 +492,111 @@ impl Config {
         .to_string())
     }
 
-    /// Get the GitHub token from auth.json.
-    pub fn resolve_github_token(
+    pub fn resolve_provider_api_key(
         &self,
         auth: &crate::auth::Auth,
+        provider: &str,
     ) -> Result<String> {
-        if let Some(token) = auth.token("github") {
-            return Ok(Self::expand(token));
+        if let Some(key) = auth.api_key(provider) {
+            return Ok(Self::expand(key));
+        }
+        if let Some(key) =
+            self.provider_api_key_config(provider)?.api_key.as_deref()
+        {
+            tracing::warn!(
+                "Deprecation: {provider}.api_key in config.toml is deprecated. Move it to auth.json (~/.config/mote/auth.json)"
+            );
+            return Ok(Self::expand(key));
         }
         anyhow::bail!(
-            "No GitHub token found in auth.json. Run --login github first."
+            "No {provider} API key found. Run --login {provider} or add it to ~/.config/mote/auth.json."
         );
     }
 
-    pub fn github_base_url(&self) -> Result<String> {
-        Ok(Self::expand(match &self.providers.github {
-            Some(cfg) => &cfg.base_url,
-            None => "https://models.github.ai/inference",
-        })
-        .trim_end_matches('/')
-        .to_string())
+    pub fn provider_base_url(&self, provider: &str) -> Result<String> {
+        let base_url = match provider {
+            "glm" => self
+                .providers
+                .glm
+                .as_ref()
+                .map(|cfg| cfg.base_url.as_str())
+                .unwrap_or(default_glm_base_url()),
+            "kimi" => self
+                .providers
+                .kimi
+                .as_ref()
+                .map(|cfg| cfg.base_url.as_str())
+                .unwrap_or(default_kimi_base_url()),
+            "minimax" => self
+                .providers
+                .minimax
+                .as_ref()
+                .map(|cfg| cfg.base_url.as_str())
+                .unwrap_or(default_minimax_base_url()),
+            _ => {
+                return Ok(Self::expand(
+                    &self.provider_api_key_config(provider)?.base_url,
+                )
+                .trim_end_matches('/')
+                .to_string());
+            }
+        };
+        Ok(Self::expand(base_url).trim_end_matches('/').to_string())
     }
 
-    pub fn github_default_model(&self) -> Option<&str> {
-        self.providers.github.as_ref()?.default_model.as_deref()
+    pub fn has_provider_api_key_source(
+        &self,
+        auth: &crate::auth::Auth,
+        provider: &str,
+    ) -> bool {
+        if auth.api_key(provider).is_some() {
+            return true;
+        }
+        match provider {
+            "deepseek" => self
+                .providers
+                .deepseek
+                .as_ref()
+                .and_then(|p| p.api_key.as_deref())
+                .is_some(),
+            "glm" => self
+                .providers
+                .glm
+                .as_ref()
+                .and_then(|p| p.api_key.as_deref())
+                .is_some(),
+            "kimi" => self
+                .providers
+                .kimi
+                .as_ref()
+                .and_then(|p| p.api_key.as_deref())
+                .is_some(),
+            "minimax" => self
+                .providers
+                .minimax
+                .as_ref()
+                .and_then(|p| p.api_key.as_deref())
+                .is_some(),
+            _ => false,
+        }
+    }
+
+    fn provider_api_key_config(
+        &self,
+        provider: &str,
+    ) -> Result<&ProviderApiKey> {
+        match provider {
+            "glm" => self.providers.glm.as_ref().context("GLM not configured"),
+            "kimi" => {
+                self.providers.kimi.as_ref().context("Kimi not configured")
+            }
+            "minimax" => self
+                .providers
+                .minimax
+                .as_ref()
+                .context("MiniMax not configured"),
+            _ => anyhow::bail!("Unsupported API-key provider: {provider}"),
+        }
     }
 
     /// Resolve the effective permission for a tool, given the current agent name.
@@ -684,6 +801,82 @@ default_max_tokens = 16384
         )
         .unwrap();
         assert_eq!(config.effective_max_tokens(None, "deepseek"), 16384);
+    }
+
+    #[test]
+    fn test_new_api_key_provider_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "glm"
+model_id = "fallback"
+max_tokens = 4096
+
+[providers.glm]
+base_url = "https://api.z.ai/api"
+default_model = "glm-5.2"
+default_max_tokens = 65536
+
+[providers.kimi]
+base_url = "https://api.moonshot.ai"
+default_model = "kimi-k2.6"
+default_max_tokens = 32768
+
+[providers.minimax]
+base_url = "https://api.minimax.io"
+default_model = "MiniMax-M3"
+default_max_tokens = 131072
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.effective_model_id(None), "glm-5.2");
+        assert_eq!(config.effective_max_tokens(None, "glm"), 65536);
+        assert_eq!(config.effective_max_tokens(None, "kimi"), 32768);
+        assert_eq!(config.effective_max_tokens(None, "minimax"), 131072);
+        assert_eq!(
+            config.provider_base_url("glm").unwrap(),
+            "https://api.z.ai/api"
+        );
+        assert_eq!(
+            config.provider_base_url("kimi").unwrap(),
+            "https://api.moonshot.ai"
+        );
+        assert_eq!(
+            config.provider_base_url("minimax").unwrap(),
+            "https://api.minimax.io"
+        );
+    }
+
+    #[test]
+    fn test_provider_api_key_prefers_auth_json() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "kimi"
+model_id = "kimi-k2.6"
+
+[providers.kimi]
+api_key = "config-key"
+base_url = "https://api.moonshot.ai"
+"#,
+        )
+        .unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "kimi".into(),
+            crate::auth::ProviderAuth {
+                api_key: Some("auth-key".into()),
+                token: None,
+                extra: HashMap::new(),
+            },
+        );
+        let auth = crate::auth::Auth { providers };
+
+        assert_eq!(
+            config.resolve_provider_api_key(&auth, "kimi").unwrap(),
+            "auth-key"
+        );
     }
 
     #[test]

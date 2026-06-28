@@ -13,7 +13,6 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{get, post},
 };
-use serde::Serialize;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info};
@@ -27,42 +26,7 @@ mod prompt;
 mod session;
 mod tools;
 
-// ── GitHub OAuth Device Flow ───────────────────────────
-
-/// Get the GitHub OAuth client ID from environment variable.
-/// Users must register an OAuth App and set MOTE_GITHUB_CLIENT_ID.
-fn github_client_id() -> String {
-    std::env::var("MOTE_GITHUB_CLIENT_ID").unwrap_or_else(|_| {
-        tracing::warn!(
-            "MOTE_GITHUB_CLIENT_ID not set. GitHub login will fail."
-        );
-        "Iv1.placeholder".to_string()
-    })
-}
-
-/// OAuth scopes for GitHub Models access.
-const GITHUB_SCOPES: &str = "models:read";
-
-/// GitHub device authorization endpoint.
-const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
-
-/// GitHub OAuth token endpoint.
-const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-
 const COMPACTION_CONTEXT_MARKER: &str = "[mote compacted conversation context]";
-
-/// Status of an active device login flow.
-#[derive(Debug, Clone)]
-enum FlowStatus {
-    Pending,
-    Completed,
-    Failed(String), // error message
-}
-
-/// An active device login flow tracked by the server.
-struct DeviceFlow {
-    status: Arc<tokio::sync::Mutex<FlowStatus>>,
-}
 
 // ── App state shared across all handlers ─────────────────
 
@@ -72,8 +36,6 @@ struct AppState {
     auth: RwLock<auth::Auth>,
     /// Merged agents from config.toml + separate files (file agents lower priority).
     merged_agents: HashMap<String, config::AgentConfig>,
-    /// Active GitHub OAuth device flows (keyed by device_code).
-    device_flows: tokio::sync::Mutex<HashMap<String, DeviceFlow>>,
     /// Runtime state partitioned by client-provided session key.
     runtime_states: tokio::sync::Mutex<HashMap<String, RuntimeSessionState>>,
     /// Long-running agent tasks that outlive websocket subscribers.
@@ -315,22 +277,31 @@ async fn delete_session(
 /// GET /models — list available models from all configured providers.
 async fn list_models_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> impl IntoResponse {
+) -> Json<Vec<marshaling_protocol::ModelInfo>> {
     let mut all = Vec::new();
-    let provider_names = ["deepseek", "github", "ollama"];
+    let auth_guard = state.auth.read().await;
+    let provider_names = ["deepseek", "glm", "kimi", "minimax", "ollama"];
     for name in &provider_names {
-        if let Ok(provider) = llm::build_provider_for(
-            &state.config,
-            &*state.auth.read().await,
-            name,
-        ) {
-            if let Ok(models) = provider.list_models().await {
-                for m in models {
-                    all.push(marshaling_protocol::ModelInfo {
-                        provider: name.to_string(),
-                        model_id: m,
-                    });
+        match llm::build_provider_for(&state.config, &auth_guard, name) {
+            Ok(provider) => match provider.list_models().await {
+                Ok(models) => {
+                    for m in models {
+                        all.push(marshaling_protocol::ModelInfo {
+                            provider: name.to_string(),
+                            model_id: m,
+                        });
+                    }
                 }
+                Err(e) => {
+                    tracing::warn!(
+                        "model listing failed for provider {name}: {e:#}"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "provider {name} unavailable for model listing: {e:#}"
+                );
             }
         }
     }
@@ -560,269 +531,12 @@ fn is_compaction_context_message(message: &llm::ChatMessage) -> bool {
         })
 }
 
-// ── GitHub OAuth Device Flow routes ─────────────────────
-
-/// Response for polling a device login flow.
-#[derive(Debug, Serialize)]
-struct GithubPollResponse {
-    status: String, // "pending", "completed", "failed", "expired"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-/// POST /auth/github/start — initiate a GitHub OAuth device flow.
-async fn github_login_start(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let client = reqwest::Client::new();
-    let client_id = github_client_id();
-    let resp = match client
-        .post(GITHUB_DEVICE_CODE_URL)
-        .form(&[("client_id", &*client_id), ("scope", GITHUB_SCOPES)])
-        .header("Accept", "application/json")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!("Failed to contact GitHub: {e}")
-                })),
-            );
-        }
-    };
-
-    let body: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!("Failed to parse GitHub response: {e}")
-                })),
-            );
-        }
-    };
-
-    let device_code = match body["device_code"].as_str() {
-        Some(c) => c.to_string(),
-        None => {
-            let err = body["error_description"]
-                .as_str()
-                .unwrap_or("unknown error");
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": err
-                })),
-            );
-        }
-    };
-    let user_code = body["user_code"]
-        .as_str()
-        .unwrap_or("????-????")
-        .to_string();
-    let verification_uri = body["verification_uri"]
-        .as_str()
-        .unwrap_or("https://github.com/login/device")
-        .to_string();
-    // Clamp GitHub API values to reasonable bounds
-    let interval = body["interval"].as_u64().unwrap_or(5).clamp(1, 60);
-    let expires_in = body["expires_in"].as_u64().unwrap_or(900).clamp(60, 1800);
-
-    let status: Arc<tokio::sync::Mutex<FlowStatus>> =
-        Arc::new(tokio::sync::Mutex::new(FlowStatus::Pending));
-    let status_clone = Arc::clone(&status);
-    let dc = device_code.clone();
-    let expires_at =
-        std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
-    let poll_interval = std::time::Duration::from_secs(interval);
-
-    // Spawn background task to poll GitHub
-    tokio::spawn(async move {
-        let http = reqwest::Client::new();
-        let mut poll_interval = poll_interval;
-        let client_id = github_client_id();
-
-        loop {
-            tokio::time::sleep(poll_interval).await;
-
-            if std::time::Instant::now() > expires_at {
-                let mut s = status_clone.lock().await;
-                *s = FlowStatus::Failed("Authentication timed out".into());
-                // Don't remove from device_flows — let the client poll get the expired status
-                return;
-            }
-
-            let poll_resp = match http
-                .post(GITHUB_TOKEN_URL)
-                .form(&[
-                    ("client_id", &*client_id),
-                    ("device_code", &dc),
-                    (
-                        "grant_type",
-                        "urn:ietf:params:oauth:grant-type:device_code",
-                    ),
-                ])
-                .header("Accept", "application/json")
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let mut s = status_clone.lock().await;
-                    *s = FlowStatus::Failed(format!("Network error: {e}"));
-                    return;
-                }
-            };
-
-            let poll_body: serde_json::Value = match poll_resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    let mut s = status_clone.lock().await;
-                    *s = FlowStatus::Failed(format!("Parse error: {e}"));
-                    return;
-                }
-            };
-
-            if let Some(token) =
-                poll_body.get("access_token").and_then(|t| t.as_str())
-            {
-                // Success! Save token to auth.json (blocking I/O)
-                let token_str = token.to_string();
-                let save_result = tokio::task::spawn_blocking(move || {
-                    auth::save_token_to_auth("github", &token_str)
-                })
-                .await;
-                match save_result {
-                    Ok(Ok(())) => {
-                        let mut s = status_clone.lock().await;
-                        *s = FlowStatus::Completed;
-                    }
-                    Ok(Err(e)) => {
-                        let mut s = status_clone.lock().await;
-                        *s = FlowStatus::Failed(format!("Failed to save: {e}"));
-                    }
-                    Err(e) => {
-                        let mut s = status_clone.lock().await;
-                        *s = FlowStatus::Failed(format!("Task error: {e}"));
-                    }
-                }
-                return;
-            }
-
-            if let Some(err) = poll_body.get("error").and_then(|e| e.as_str()) {
-                match err {
-                    "authorization_pending" => continue,
-                    "slow_down" => {
-                        // GitHub asks us to slow down — increase interval by 5s
-                        poll_interval += std::time::Duration::from_secs(5);
-                        continue;
-                    }
-                    _ => {
-                        let mut s = status_clone.lock().await;
-                        *s = FlowStatus::Failed(err.to_string());
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    // Store the flow (tokio::sync::Mutex — safe in async context)
-    state
-        .device_flows
-        .lock()
-        .await
-        .insert(device_code.clone(), DeviceFlow { status });
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "user_code": user_code,
-            "verification_uri": verification_uri,
-            "device_code": device_code,
-            "interval": interval,
-        })),
-    )
-}
-
-/// POST /auth/github/poll — poll the status of an active device flow.
-async fn github_login_poll(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    axum::extract::Json(body): axum::extract::Json<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let device_code = match body.get("device_code") {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(GithubPollResponse {
-                    status: "failed".into(),
-                    error: Some("Missing device_code".into()),
-                }),
-            );
-        }
-    };
-
-    let flows = state.device_flows.lock().await;
-    match flows.get(device_code) {
-        Some(flow) => {
-            let status_guard = flow.status.lock().await;
-            match &*status_guard {
-                FlowStatus::Pending => (
-                    StatusCode::OK,
-                    Json(GithubPollResponse {
-                        status: "pending".into(),
-                        error: None,
-                    }),
-                ),
-                FlowStatus::Completed => (
-                    StatusCode::OK,
-                    Json(GithubPollResponse {
-                        status: "completed".into(),
-                        error: None,
-                    }),
-                ),
-                FlowStatus::Failed(err) => {
-                    // Map timeout message to "expired" status for the client
-                    let (status_str, error_str) =
-                        if err == "Authentication timed out" {
-                            ("expired", err.as_str())
-                        } else {
-                            ("failed", err.as_str())
-                        };
-                    (
-                        StatusCode::OK,
-                        Json(GithubPollResponse {
-                            status: status_str.into(),
-                            error: Some(error_str.into()),
-                        }),
-                    )
-                }
-            }
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(GithubPollResponse {
-                status: "failed".into(),
-                error: Some(
-                    "Unknown device_code. Start a new login flow.".into(),
-                ),
-            }),
-        ),
-    }
-}
-
 // ── Generic credential save (DeepSeek, etc.) ────────────
 
 /// POST /auth/save — save a credential to auth.json.
 ///
 /// Request body:
 ///   { "provider": "deepseek", "api_key": "sk-..." }
-///   { "provider": "github",   "token": "ghp_..." }
 async fn auth_save(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
@@ -2225,7 +1939,6 @@ async fn main() -> Result<()> {
         merged_agents: config::all_agents(&config.agents),
         auth: RwLock::new(auth),
         config,
-        device_flows: tokio::sync::Mutex::new(HashMap::new()),
         runtime_states: tokio::sync::Mutex::new(HashMap::new()),
         runs: tokio::sync::Mutex::new(HashMap::new()),
     });
@@ -2242,8 +1955,6 @@ async fn main() -> Result<()> {
         .route("/compact", post(compact_handler))
         .route("/rollback/last", post(rollback_last_handler))
         .route("/chat", get(ws_handler))
-        .route("/auth/github/start", post(github_login_start))
-        .route("/auth/github/poll", post(github_login_poll))
         .route("/auth/save", post(auth_save))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -2520,7 +2231,6 @@ read = "allow"
             config: test_config(dir.path().join("history")),
             auth: RwLock::new(auth::Auth::default()),
             merged_agents: HashMap::new(),
-            device_flows: tokio::sync::Mutex::new(HashMap::new()),
             runtime_states: tokio::sync::Mutex::new(HashMap::from([(
                 "sess".to_string(),
                 RuntimeSessionState {

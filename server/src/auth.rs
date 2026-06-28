@@ -9,7 +9,7 @@ use std::path::Path;
 /// ```json5
 /// {
 ///   "deepseek": { "api_key": "sk-..." },
-///   "github":   { "token": "ghp_..." },
+///   "glm":      { "api_key": "..." },
 ///   // Providers without auth can be omitted or set to {}
 ///   "ollama": {}
 /// }
@@ -17,7 +17,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Auth {
     /// Per-provider auth credentials.
-    /// Keys are provider names (lowercase, e.g. "deepseek", "ollama", "github").
+    /// Keys are provider names (lowercase, e.g. "deepseek", "glm", "ollama").
     #[serde(flatten)]
     pub providers: HashMap<String, ProviderAuth>,
 }
@@ -27,7 +27,7 @@ pub struct Auth {
 pub struct ProviderAuth {
     /// API key (used by DeepSeek, OpenAI, etc.)
     pub api_key: Option<String>,
-    /// Bearer token (used by GitHub Models, etc.)
+    /// Bearer token (kept for custom providers or future integrations)
     pub token: Option<String>,
     /// Generic extra fields for provider-specific auth needs.
     #[serde(flatten)]
@@ -71,9 +71,18 @@ impl Auth {
     fn load_from(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        let auth: Auth = json5::from_str(&raw).with_context(|| {
-            format!("Failed to parse JSON5 in {}", path.display())
-        })?;
+        let auth: Auth = match json5::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(primary_err) => {
+                let repaired = repair_missing_commas_between_fields(&raw);
+                json5::from_str(&repaired).with_context(|| {
+                    format!(
+                        "Failed to parse JSON5 in {}: {primary_err}",
+                        path.display()
+                    )
+                })?
+            }
+        };
         Ok(auth)
     }
 
@@ -91,6 +100,51 @@ impl Auth {
     pub fn token(&self, provider: &str) -> Option<&str> {
         self.for_provider(provider)?.token()
     }
+}
+
+/// Best-effort repair for a common editing mistake in auth.json:
+/// missing trailing commas between object fields.
+///
+/// Example repaired:
+///   "api_key": "..."
+///   "token": null
+/// becomes:
+///   "api_key": "...",
+///   "token": null
+fn repair_missing_commas_between_fields(input: &str) -> String {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let mut updated = (*line).to_string();
+
+        // Only consider likely "key: value" lines that are missing a comma.
+        let is_candidate = trimmed.contains(':')
+            && !trimmed.ends_with(',')
+            && !trimmed.ends_with('{')
+            && !trimmed.ends_with('[')
+            && !trimmed.ends_with('}')
+            && !trimmed.ends_with(']');
+
+        if is_candidate {
+            let next_significant = lines
+                .iter()
+                .skip(idx + 1)
+                .map(|l| l.trim())
+                .find(|t| !t.is_empty() && !t.starts_with("//"));
+
+            // If the next significant line starts another field,
+            // this line should end with a comma.
+            if next_significant.is_some_and(|next| next.starts_with('"')) {
+                updated.push(',');
+            }
+        }
+
+        out.push(updated);
+    }
+
+    out.join("\n")
 }
 
 /// Get the path to the auth file.
@@ -158,11 +212,6 @@ pub fn save_credential(provider: &str, field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Convenience wrapper — save a token credential.
-pub fn save_token_to_auth(provider: &str, token: &str) -> Result<()> {
-    save_credential(provider, "token", token)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +221,7 @@ mod tests {
         let auth = Auth::default();
         assert!(auth.providers.is_empty());
         assert!(auth.api_key("deepseek").is_none());
-        assert!(auth.token("github").is_none());
+        assert!(auth.token("custom").is_none());
     }
 
     #[test]
@@ -181,16 +230,32 @@ mod tests {
         {
             // DeepSeek API key
             "deepseek": { "api_key": "sk-test-key" },
-            "github": { "token": "ghp_test_token" },
+            "custom": { "token": "test_token" },
             "ollama": {}
         }
         "#;
         let auth: Auth = json5::from_str(json5_str).unwrap();
         assert_eq!(auth.api_key("deepseek").unwrap(), "sk-test-key");
-        assert_eq!(auth.token("github").unwrap(), "ghp_test_token");
+        assert_eq!(auth.token("custom").unwrap(), "test_token");
         assert!(auth.for_provider("ollama").is_some());
         // Non-existent provider
         assert!(auth.for_provider("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_parse_json5_recovers_missing_field_comma() {
+        let broken = r#"
+        {
+          "glm": {
+            "api_key": "abc123"
+            "token": null
+          }
+        }
+        "#;
+
+        let repaired = repair_missing_commas_between_fields(broken);
+        let auth: Auth = json5::from_str(&repaired).unwrap();
+        assert_eq!(auth.api_key("glm"), Some("abc123"));
     }
 
     #[test]
@@ -256,7 +321,7 @@ mod tests {
         // Instead test the underlying serialization directly.
         let mut auth = Auth::default();
         auth.providers
-            .entry("github".into())
+            .entry("custom".into())
             .or_insert_with(ProviderAuth::default)
             .token = Some("ghp_test_token".into());
 
@@ -266,20 +331,20 @@ mod tests {
         let read: Auth =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
                 .unwrap();
-        assert_eq!(read.token("github").unwrap(), "ghp_test_token");
-        assert!(read.api_key("github").is_none());
+        assert_eq!(read.token("custom").unwrap(), "ghp_test_token");
+        assert!(read.api_key("custom").is_none());
     }
 
     #[test]
     fn test_save_token_adds_to_empty_auth() {
         let _dir = tempfile::tempdir().unwrap();
         let mut auth = Auth::default();
-        assert!(auth.token("github").is_none());
+        assert!(auth.token("custom").is_none());
         auth.providers
-            .entry("github".into())
+            .entry("custom".into())
             .or_insert_with(ProviderAuth::default)
             .token = Some("ghp_new".into());
-        assert_eq!(auth.token("github").unwrap(), "ghp_new");
+        assert_eq!(auth.token("custom").unwrap(), "ghp_new");
     }
 
     #[test]
@@ -309,10 +374,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test_auth_token.json");
 
-        // Simulate save_credential for token (like GitHub)
+        // Simulate save_credential for token fields.
         let mut auth = Auth::default();
         auth.providers
-            .entry("github".into())
+            .entry("custom".into())
             .or_insert_with(ProviderAuth::default)
             .token = Some("ghp-test".into());
         let json = serde_json::to_string_pretty(&auth).unwrap();
@@ -322,8 +387,8 @@ mod tests {
         let read: Auth =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
                 .unwrap();
-        assert_eq!(read.token("github").unwrap(), "ghp-test");
-        assert!(read.api_key("github").is_none());
+        assert_eq!(read.token("custom").unwrap(), "ghp-test");
+        assert!(read.api_key("custom").is_none());
     }
 
     #[test]

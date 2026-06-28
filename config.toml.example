@@ -1,5 +1,5 @@
 [model]
-provider = "deepseek"            # "deepseek" or "ollama"
+provider = "deepseek"            # "deepseek", "glm", "kimi", "minimax", or "ollama"
 model_id = "deepseek-r4-flash"    # model to use by default
 temperature = 0.3              # 0.0 - 1.0
 max_tokens = 65536              # max response tokens (fallback)
@@ -18,13 +18,28 @@ base_url = "http://localhost:11434"
 default_model = "deepseek-r1:8b"
 default_max_tokens = 32000
 
-# --- Provider: GitHub Models ---
-# Token goes in ~/.config/mote/auth.json:
-#   { "github": { "token": "ghp_..." } }
-# Get token via: --login github  (requires MOTE_GITHUB_CLIENT_ID env var)
-[providers.github]
-base_url = "https://models.github.ai/inference"
-default_model = "gpt-4o"
+# --- Provider: GLM / Z.ai (OpenAI-compatible) ---
+# API key goes in ~/.config/mote/auth.json:
+#   { "glm": { "api_key": "..." } }
+[providers.glm]
+base_url = "https://api.z.ai/api"
+default_model = "glm-5.2"
+default_max_tokens = 65536
+
+# --- Provider: Kimi / Moonshot (OpenAI-compatible) ---
+# API key goes in ~/.config/mote/auth.json:
+#   { "kimi": { "api_key": "..." } }
+[providers.kimi]
+base_url = "https://api.moonshot.ai"
+default_model = "kimi-k2.6"
+default_max_tokens = 65536
+
+# --- Provider: MiniMax (OpenAI-compatible) ---
+# API key goes in ~/.config/mote/auth.json:
+#   { "minimax": { "api_key": "..." } }
+[providers.minimax]
+base_url = "https://api.minimax.io"
+default_model = "MiniMax-M3"
 default_max_tokens = 65536
 
 # --- Server bind ---

@@ -151,7 +151,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                             app.messages.push(
                                 self::state::DisplayMessage::command(
                                     crate::llm::Role::Assistant,
-                                    "No models available.".into(),
+                                    "No models available from currently configured/reachable providers.".into(),
                                 ),
                             );
                         } else {
@@ -843,6 +843,21 @@ fn handle_key_event(
                 }
                 return;
             }
+            if app.login_picker_open {
+                match key.code {
+                    crossterm::event::KeyCode::Up => app.login_picker_up(),
+                    crossterm::event::KeyCode::Down => app.login_picker_down(),
+                    crossterm::event::KeyCode::Esc => app.close_login_picker(),
+                    crossterm::event::KeyCode::Enter => {
+                        if let Some(choice) = app.selected_login_choice() {
+                            app.apply_login_choice(choice);
+                        }
+                        app.close_login_picker();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             let action = keys.lookup(key.code, key.modifiers);
             handle_action(app, action, key.code, key.modifiers);
         }
@@ -854,6 +869,9 @@ fn handle_key_event(
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if handle_permission_mouse_click(app, m.column, m.row) {
+                        return;
+                    }
+                    if handle_picker_mouse_click(app, m.column, m.row) {
                         return;
                     }
                 }
@@ -1250,6 +1268,71 @@ fn handle_permission_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
     true
 }
 
+fn handle_picker_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
+    if app.login_picker_open {
+        let Some(index) = login_picker_index_at(app, column, row) else {
+            return false;
+        };
+        app.login_picker_index = index;
+        if let Some(choice) = app.selected_login_choice() {
+            app.apply_login_choice(choice);
+        }
+        app.close_login_picker();
+        return true;
+    }
+    false
+}
+
+fn login_picker_index_at(app: &App, column: u16, row: u16) -> Option<usize> {
+    if !app.login_picker_open || app.login_picker_items.is_empty() {
+        return None;
+    }
+    let (term_width, term_height) = crossterm::terminal::size().ok()?;
+    let area = Rect::new(0, 0, term_width, term_height);
+    let rect = centered_rect_local(
+        area,
+        area.width.min(92).max(44),
+        area.height.min(22).max(9),
+    );
+    let inner = inset_local(rect, 2, 1);
+    let available_rows = inner.height.saturating_sub(4) as usize;
+    let visible_items = (available_rows / 2).max(1);
+    let (start, end) = picker_window(
+        app.login_picker_items.len(),
+        app.login_picker_index,
+        visible_items,
+    );
+
+    for (visible_idx, actual_idx) in (start..end).enumerate() {
+        let first_row = inner.y + 2 + (visible_idx as u16 * 2);
+        let second_row = first_row + 1;
+        let row_hit = row == first_row || row == second_row;
+        let column_hit = column >= inner.x && column < inner.x + inner.width;
+        if row_hit && column_hit {
+            return Some(actual_idx);
+        }
+    }
+    None
+}
+
+fn picker_window(
+    total_items: usize,
+    selected: usize,
+    visible: usize,
+) -> (usize, usize) {
+    if total_items == 0 {
+        return (0, 0);
+    }
+    let visible = visible.max(1).min(total_items);
+    let selected = selected.min(total_items - 1);
+    let half = visible / 2;
+    let mut start = selected.saturating_sub(half);
+    if start + visible > total_items {
+        start = total_items.saturating_sub(visible);
+    }
+    (start, start + visible)
+}
+
 fn permission_popup_action_at(
     perm: &self::state::PendingPermission,
     column: u16,
@@ -1415,7 +1498,7 @@ mod tests {
             subagent_names: vec![],
             agent_model_info: HashMap::from([
                 ("default".into(), "deepseek/deepseek-chat".into()),
-                ("review".into(), "github/gpt-4o".into()),
+                ("review".into(), "kimi/kimi-k2.6".into()),
             ]),
         }
     }
@@ -1645,16 +1728,16 @@ mod tests {
         app.agent_model_overrides.insert(
             "review".into(),
             super::state::AgentModelOverride {
-                provider: Some("github".into()),
-                model_id: "gpt-4.1".into(),
+                provider: Some("kimi".into()),
+                model_id: "kimi-k2.6".into(),
             },
         );
 
         app.current_agent = "review".into();
         let req = build_chat_request(&app, "hello".into());
         assert_eq!(req.agent, "review");
-        assert_eq!(req.model_override.as_deref(), Some("gpt-4.1"));
-        assert_eq!(req.provider_override.as_deref(), Some("github"));
+        assert_eq!(req.model_override.as_deref(), Some("kimi-k2.6"));
+        assert_eq!(req.provider_override.as_deref(), Some("kimi"));
     }
 
     #[test]

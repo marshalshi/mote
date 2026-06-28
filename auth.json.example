@@ -15,11 +15,19 @@
     "api_key": "sk-..."
   },
 
-  // GitHub Models / GitHub Copilot token (required if using github provider)
-  // Create a PAT at: GitHub → Settings → Developer settings → Personal access tokens
-  // Scope needed: models:read
-  "github": {
-    "token": "ghp_..."
+  // GLM / Z.ai API key (required if using glm provider)
+  "glm": {
+    "api_key": "..."
+  },
+
+  // Kimi / Moonshot API key (required if using kimi provider)
+  "kimi": {
+    "api_key": "..."
+  },
+
+  // MiniMax API key (required if using minimax provider)
+  "minimax": {
+    "api_key": "..."
   },
 
   // Ollama (local) — no auth needed, can be empty or omitted

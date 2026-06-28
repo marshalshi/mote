@@ -71,6 +71,11 @@ impl MoteClient {
             .get(format!("{}/models", self.base_url))
             .send()
             .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server returned {status}: {body}");
+        }
         Ok(resp.json().await?)
     }
 

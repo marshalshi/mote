@@ -88,7 +88,7 @@ defaults to `build` via `marshaling_protocol::DEFAULT_AGENT_NAME`.
 ## Testing
 
 - `cargo test -p mote-server` — config, prompt, session, tools, llm tests
-- `cargo test -p mote-client` — state machine, keybindings, suggestions tests
+- `cargo test -p mote-tui` — state machine, keybindings, suggestions tests
 - Tests that spawn external tools (`rg`, `bash`) require those tools to be on `$PATH`.
 
 ## Config

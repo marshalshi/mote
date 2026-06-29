@@ -5,7 +5,7 @@
 # Usage:
 #   ./docker/run.sh                    # mount CWD as workspace
 #   ./docker/run.sh /path/to/project   # mount specific directory
-#   ./docker/run.sh . --server         # pass extra args to mote-client
+#   ./docker/run.sh . --server         # pass extra args to mote-tui
 #
 # Environment:
 #   MOTE_IMAGE   Docker image tag (default: mote:latest)

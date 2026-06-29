@@ -38,7 +38,7 @@ RUN cargo fetch
 COPY protocol protocol
 COPY server server
 COPY client client
-RUN cargo build --release -p mote-server -p mote-client
+RUN cargo build --release -p mote-server -p mote-tui
 
 # ── Runtime stage ─────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -54,7 +54,7 @@ RUN mkdir -p /root/.config/mote
 
 # Copy server and client binaries from the builder stage.
 COPY --from=builder /build/target/release/mote-server /usr/local/bin/
-COPY --from=builder /build/target/release/mote-client /usr/local/bin/
+COPY --from=builder /build/target/release/mote-tui /usr/local/bin/
 
 # Default config files so the container is usable out of the box.
 # Users can override by mounting their own ~/.config/mote/.
@@ -70,4 +70,4 @@ WORKDIR /workspace
 EXPOSE 9847
 
 # Default entrypoint: start the TUI (which spawns the server automatically).
-ENTRYPOINT ["mote-client"]
+ENTRYPOINT ["mote-tui"]

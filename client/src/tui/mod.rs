@@ -316,6 +316,31 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     });
                     app.scroll_to_bottom();
                 }
+                SlashAction::RunCustomCommand(invocation) => {
+                    let workspace_root =
+                        std::path::PathBuf::from(&app.workspace_root);
+                    match crate::slash_command::expand_custom_command(
+                        &invocation,
+                        &workspace_root,
+                    )
+                    .await
+                    {
+                        Ok(prompt) => {
+                            app.submit_expanded_custom_command(prompt)
+                        }
+                        Err(e) => {
+                            app.clear_pending_command_overrides();
+                            app.messages.push(self::state::DisplayMessage {
+                                role: crate::llm::Role::Assistant,
+                                content: format!(
+                                    "Custom command failed: {e:#}"
+                                ),
+                                thinking: None,
+                                source: self::state::MessageSource::Error,
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -433,7 +458,7 @@ fn start_compaction(
     let (model_override, provider_override) =
         app.current_model_override_parts();
     let request = marshaling_protocol::CompactRequest {
-        agent: app.current_agent.clone(),
+        agent: app.request_agent().to_string(),
         model_override,
         provider_override,
         history,
@@ -494,7 +519,7 @@ fn build_chat_request(
 
     marshaling_protocol::ChatRequest {
         message: user_msg,
-        agent: app.current_agent.clone(),
+        agent: app.request_agent().to_string(),
         model_override,
         provider_override,
         session_id: app.active_session_id.clone(),
@@ -712,6 +737,7 @@ fn handle_server_event(
             app.tokens_input += tokens_input;
             app.tokens_output += tokens_output;
             app.loading_progress = None;
+            app.clear_pending_command_overrides();
             *chat_stream = None;
             // Auto-dequeue: if there are queued messages, add one as a user message
             if !app.input_queue.is_empty() {
@@ -757,6 +783,7 @@ fn handle_server_event(
         ServerEvent::Error { message } => {
             app.pending_permission = None;
             app.clear_esc_cancel_arm();
+            app.clear_pending_command_overrides();
             app.set_error(&message);
             *chat_stream = None;
         }
@@ -1739,6 +1766,52 @@ mod tests {
         assert_eq!(req.agent, "review");
         assert_eq!(req.model_override.as_deref(), Some("kimi-k2.6"));
         assert_eq!(req.provider_override.as_deref(), Some("kimi"));
+    }
+
+    #[test]
+    fn test_build_chat_request_uses_pending_custom_command_overrides() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.pending_command_agent = Some("review".into());
+        app.pending_command_model = Some(super::state::AgentModelOverride {
+            provider: Some("kimi".into()),
+            model_id: "kimi-k2.6".into(),
+        });
+
+        let req = build_chat_request(&app, "hello".into());
+
+        assert_eq!(req.agent, "review");
+        assert_eq!(req.model_override.as_deref(), Some("kimi-k2.6"));
+        assert_eq!(req.provider_override.as_deref(), Some("kimi"));
+    }
+
+    #[test]
+    fn test_compact_request_uses_pending_custom_command_overrides() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.pending_command_agent = Some("review".into());
+        app.pending_command_model = Some(super::state::AgentModelOverride {
+            provider: Some("kimi".into()),
+            model_id: "kimi-k2.6".into(),
+        });
+        let (model_override, provider_override) =
+            app.current_model_override_parts();
+
+        assert_eq!(app.request_agent(), "review");
+        assert_eq!(model_override.as_deref(), Some("kimi-k2.6"));
+        assert_eq!(provider_override.as_deref(), Some("kimi"));
     }
 
     #[test]

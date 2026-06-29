@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod llm;
+mod slash_command;
 mod tui;
 mod workspace;
 
@@ -187,6 +188,12 @@ async fn main() -> Result<()> {
         workspace_ctx.repo_agents_md.clone(),
         workspace_ctx.runtime_session_key.clone(),
     );
+    let custom_commands =
+        slash_command::load_custom_commands(&workspace_ctx.root);
+    app.set_custom_commands(custom_commands.commands);
+    for warning in custom_commands.warnings {
+        tracing::warn!("{warning}");
+    }
 
     // Resume a saved session if requested
     if let Some(session_id) = &cli.resume {

@@ -1312,12 +1312,12 @@ fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
 fn welcome_logo_lines() -> Vec<String> {
     vec![
         "".to_string(),
-        ".S~S*S~S.    %SP~YS%    YSSS~S%SSP   d%SRs  ".to_string(),
+        ".S~S*S~S.    mSP~YSm    YSSS~S%SSP   d%SRs  ".to_string(),
         "SS `Y' SS  dS'     `Sb      SS       dS'    ".to_string(),
         "SS  Y  SS  SS       SS      SS       SS_Yz  ".to_string(),
         "SS     SS  SS       SS      SS       SS~ZY  ".to_string(),
         "SS     SS  SS.     .SS      SS       SS.    ".to_string(),
-        "SS     SS    Sbs_sdS        SS       SSbRs  ".to_string(),
+        "SS     SS    mSs_sSm        SS       SSbRs  ".to_string(),
         "       SP                   SP                ".to_string(),
         "       Y                    Y                 ".to_string(),
         "".to_string(),

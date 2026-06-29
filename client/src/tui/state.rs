@@ -1,4 +1,5 @@
 use crate::llm::Role;
+use crate::slash_command::{CustomCommandInvocation, CustomSlashCommand};
 use marshaling_protocol::{ModelInfo, ToolCallDisplay, ToolStatus};
 use ratatui::style::Color;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -77,12 +78,17 @@ pub struct App {
     pub handled_slash_command: bool,
     pub suggestions: Vec<String>,
     pub suggestion_index: usize,
+    pub custom_commands: Vec<CustomSlashCommand>,
 
     /// Tool calls currently being executed (during agent loop).
     pub tool_calls: Vec<ToolCallDisplay>,
 
     /// Per-agent model overrides selected by the user.
     pub agent_model_overrides: HashMap<String, AgentModelOverride>,
+    /// One-shot agent override for a custom slash command turn.
+    pub pending_command_agent: Option<String>,
+    /// One-shot model override for a custom slash command turn.
+    pub pending_command_model: Option<AgentModelOverride>,
 
     /// Cached (provider, model_id) pairs from the last /model fetch.
     pub models_cache: Vec<(String, String)>,
@@ -241,6 +247,7 @@ pub enum SlashAction {
     SaveCredential(String, String, String), // provider, key, value
     RollbackLast,
     RunShell(String),
+    RunCustomCommand(CustomCommandInvocation),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -356,8 +363,11 @@ impl App {
             handled_slash_command: false,
             suggestions: Vec::new(),
             suggestion_index: 0,
+            custom_commands: Vec::new(),
             tool_calls: Vec::new(),
             agent_model_overrides: HashMap::new(),
+            pending_command_agent: None,
+            pending_command_model: None,
             models_cache: Vec::new(),
             input_accent,
             user_accent: parse_ui_color(&ui_config.user_accent),
@@ -448,10 +458,24 @@ impl App {
     pub fn current_model_override_parts(
         &self,
     ) -> (Option<String>, Option<String>) {
+        if let Some(ov) = &self.pending_command_model {
+            return (Some(ov.model_id.clone()), ov.provider.clone());
+        }
         let Some(ov) = self.current_model_override() else {
             return (None, None);
         };
         (Some(ov.model_id.clone()), ov.provider.clone())
+    }
+
+    pub fn request_agent(&self) -> &str {
+        self.pending_command_agent
+            .as_deref()
+            .unwrap_or(&self.current_agent)
+    }
+
+    pub fn clear_pending_command_overrides(&mut self) {
+        self.pending_command_agent = None;
+        self.pending_command_model = None;
     }
 
     fn default_model_info_for_agent(&self, agent: &str) -> String {
@@ -574,6 +598,26 @@ impl App {
         transformed
     }
 
+    pub fn submit_expanded_custom_command(&mut self, text: String) {
+        if text.trim().is_empty() {
+            self.clear_pending_command_overrides();
+            self.push_command_message(
+                Role::Assistant,
+                "Custom command expanded to an empty prompt.",
+            );
+            return;
+        }
+        let transformed = self.transform_mentions(&text);
+        self.messages.push(DisplayMessage {
+            role: Role::User,
+            content: transformed,
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        self.stream_buffer.clear();
+        self.reasoning_buffer.clear();
+    }
+
     fn handle_secret_login_input(&mut self, text: String) {
         let Some(secret) =
             (!text.trim().is_empty()).then_some(text.trim().to_string())
@@ -609,6 +653,15 @@ impl App {
     fn push_command_message(&mut self, role: Role, content: impl Into<String>) {
         self.messages
             .push(DisplayMessage::command(role, content.into()));
+    }
+
+    pub fn set_custom_commands(
+        &mut self,
+        mut commands: Vec<CustomSlashCommand>,
+    ) {
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+        self.custom_commands = commands;
+        self.update_suggestions();
     }
 
     pub fn compact_history_messages(
@@ -781,6 +834,14 @@ impl App {
 
     fn handle_slash_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if parts.is_empty() {
+            return;
+        }
+        if let Some(invocation) = self.custom_command_invocation(cmd, parts[0])
+        {
+            self.handle_custom_command(invocation);
+            return;
+        }
         match parts[0] {
             "/agent" => self.handle_agent_command(&parts),
             "/help" => self.handle_help_command(),
@@ -798,42 +859,93 @@ impl App {
     }
 
     fn handle_help_command(&mut self) {
+        let mut lines = vec![
+            "## Commands".to_string(),
+            "- `/agent <name>` — Switch agent".to_string(),
+            "- `/help` — Show this help".to_string(),
+            "- `/tokens` — Show token usage".to_string(),
+            "- `/new` — Start a new session".to_string(),
+            "- `/sessions` — Open session picker".to_string(),
+            "- `/model` — Show / switch model".to_string(),
+            "- `/compact` — Compact older conversation context".to_string(),
+            "- `/subagents` — List active subagents".to_string(),
+            "- `/rollback last` — Rollback latest file changes".to_string(),
+            "- `/login` — Show login providers".to_string(),
+            "- `/login <provider> <key>` — Save provider API key".to_string(),
+            "- `! <command>` — Run local shell command".to_string(),
+            String::new(),
+            "## Keybindings".to_string(),
+            "- `Enter` — Send message".to_string(),
+            "- `Alt+Enter` — Newline".to_string(),
+            "- `F6` — Toggle selection mode for native terminal copy"
+                .to_string(),
+            "- `Ctrl+A / Ctrl+E` — Line start / end".to_string(),
+            "- `Ctrl+D` — Delete current char".to_string(),
+            "- `Ctrl+K` — Clear current line".to_string(),
+            "- `Esc` — Press twice within 2s to stop running agent".to_string(),
+            "- `Ctrl+C` — Quit / cancel immediately".to_string(),
+            "- `Tab` — Cycle agent".to_string(),
+            "- `Up/Down` — Input history".to_string(),
+            "- `PgUp/PgDn, Ctrl+↑/↓` — Scroll".to_string(),
+            "- `Ctrl+P` — Agent command".to_string(),
+            "- `F5` — Cycle subagent views".to_string(),
+        ];
+        if !self.custom_commands.is_empty() {
+            lines.push(String::new());
+            lines.push("## Custom Commands".to_string());
+            lines.extend(self.custom_commands.iter().map(|command| {
+                let description =
+                    command.description.as_deref().unwrap_or("Custom prompt");
+                format!("- `/{}` — {}", command.name, description)
+            }));
+        }
         self.messages.push(DisplayMessage {
             role: Role::Assistant,
-            content: [
-                "## Commands",
-                "- `/agent <name>` — Switch agent",
-                "- `/help` — Show this help",
-                "- `/tokens` — Show token usage",
-                "- `/new` — Start a new session",
-                "- `/sessions` — Open session picker",
-                "- `/model` — Show / switch model",
-                "- `/compact` — Compact older conversation context",
-                "- `/subagents` — List active subagents",
-                "- `/rollback last` — Rollback latest file changes",
-                "- `/login` — Show login providers",
-                "- `/login <provider> <key>` — Save provider API key",
-                "- `! <command>` — Run local shell command",
-                "",
-                "## Keybindings",
-                "- `Enter` — Send message",
-                "- `Alt+Enter` — Newline",
-                "- `F6` — Toggle selection mode for native terminal copy",
-                "- `Ctrl+A / Ctrl+E` — Line start / end",
-                "- `Ctrl+D` — Delete current char",
-                "- `Ctrl+K` — Clear current line",
-                "- `Esc` — Press twice within 2s to stop running agent",
-                "- `Ctrl+C` — Quit / cancel immediately",
-                "- `Tab` — Cycle agent",
-                "- `Up/Down` — Input history",
-                "- `PgUp/PgDn, Ctrl+↑/↓` — Scroll",
-                "- `Ctrl+P` — Agent command",
-                "- `F5` — Cycle subagent views",
-            ]
-            .join("\n"),
+            content: lines.join("\n"),
             thinking: None,
             source: MessageSource::Command,
         });
+    }
+
+    fn custom_command_invocation(
+        &self,
+        full_input: &str,
+        command_token: &str,
+    ) -> Option<CustomCommandInvocation> {
+        let name = command_token.strip_prefix('/')?;
+        let command = self
+            .custom_commands
+            .iter()
+            .find(|command| command.name == name)?
+            .clone();
+        let arguments =
+            full_input[command_token.len()..].trim_start().to_string();
+        Some(CustomCommandInvocation { command, arguments })
+    }
+
+    fn handle_custom_command(&mut self, invocation: CustomCommandInvocation) {
+        if self.state != AppState::Idle {
+            self.push_command_message(
+                Role::Assistant,
+                "Cannot run a custom command while agent is running.",
+            );
+            return;
+        }
+        if let Some(agent) = invocation.command.agent.clone() {
+            self.pending_command_agent = Some(agent);
+        }
+        if let Some(model) = invocation.command.model.as_deref() {
+            let (model_id, provider) = self.resolve_model_selection(model);
+            self.pending_command_model =
+                Some(AgentModelOverride { provider, model_id });
+        }
+        self.push_command_message(
+            Role::User,
+            format!("/{} {}", invocation.command.name, invocation.arguments)
+                .trim_end()
+                .to_string(),
+        );
+        self.pending_slash = Some(SlashAction::RunCustomCommand(invocation));
     }
 
     fn handle_tokens_command(&mut self) {
@@ -1252,6 +1364,7 @@ impl App {
 
     /// Show an error message (used by start_agent on setup failure).
     pub fn set_error(&mut self, error: &str) {
+        self.clear_pending_command_overrides();
         if !self.stream_buffer.is_empty() {
             self.messages.push(DisplayMessage {
                 role: Role::Assistant,
@@ -1578,6 +1691,7 @@ impl App {
         self.pending_cancel = false;
         self.clear_esc_cancel_arm();
         self.current_skill = None;
+        self.clear_pending_command_overrides();
         self.subagent_views.clear();
         self.current_subagent_index = None;
         self.input_queue.clear();
@@ -1613,6 +1727,7 @@ impl App {
         self.pending_cancel = false;
         self.clear_esc_cancel_arm();
         self.current_skill = None;
+        self.clear_pending_command_overrides();
         self.subagent_views.clear();
         self.current_subagent_index = None;
         self.input_queue.clear();
@@ -1698,6 +1813,14 @@ impl App {
         }
 
         let lower = input.to_lowercase();
+        for command in &self.custom_commands {
+            let cmd = format!("/{}", command.name);
+            if cmd.starts_with(&lower) {
+                let desc =
+                    command.description.as_deref().unwrap_or("Custom prompt");
+                self.suggestions.push(format!("{}  — {}", cmd, desc));
+            }
+        }
         for &(cmd, desc) in SLASH_COMMANDS {
             if cmd.starts_with(&lower) {
                 self.suggestions.push(format!("{}  — {}", cmd, desc));
@@ -2511,6 +2634,75 @@ mod tests {
         app.input = "/xyz".into();
         app.submit_input();
         assert!(app.messages[0].content.contains("Unknown"));
+    }
+
+    #[test]
+    fn test_custom_slash_command_sets_pending_action_and_overrides() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.set_custom_commands(vec![CustomSlashCommand {
+            name: "test".into(),
+            template: "Run $ARGUMENTS".into(),
+            description: Some("Run tests".into()),
+            agent: Some("review".into()),
+            model: Some("kimi/kimi-k2.6".into()),
+        }]);
+        app.input = "/test unit".into();
+
+        app.submit_input();
+
+        assert!(matches!(
+            app.pending_slash,
+            Some(SlashAction::RunCustomCommand(_))
+        ));
+        assert_eq!(app.pending_command_agent.as_deref(), Some("review"));
+        assert_eq!(
+            app.pending_command_model
+                .as_ref()
+                .unwrap()
+                .provider
+                .as_deref(),
+            Some("kimi")
+        );
+        assert_eq!(
+            app.pending_command_model.as_ref().unwrap().model_id,
+            "kimi-k2.6"
+        );
+        assert!(app.messages[0].content.contains("/test unit"));
+    }
+
+    #[test]
+    fn test_custom_command_suggestions_precede_builtin() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.set_custom_commands(vec![CustomSlashCommand {
+            name: "help".into(),
+            template: "Custom help".into(),
+            description: Some("Custom override".into()),
+            agent: None,
+            model: None,
+        }]);
+        app.input = "/he".into();
+
+        app.update_suggestions();
+
+        assert!(app.suggestions[0].contains("Custom override"));
+    }
+
+    #[test]
+    fn test_submit_expanded_custom_command_adds_conversation_message() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        app.submit_expanded_custom_command("Ask @review to check".into());
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].source, MessageSource::Conversation);
+        assert!(
+            app.messages[0]
+                .content
+                .contains("[use subagent \"review\"]")
+        );
     }
 
     #[test]

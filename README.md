@@ -161,6 +161,7 @@ agent_command = "ctrl+space"
 | `/login <provider> <key>` | Save provider API key (`deepseek`, `glm`, `kimi`, `minimax`) |
 | `/subagents` | List active subagents |
 | `/rollback last` | Roll back latest tracked file changes |
+| `/<custom>` | Run a user-defined custom prompt command |
 | `! <command>` | Run a local shell command in the current workspace |
 
 Notes:
@@ -171,6 +172,45 @@ Notes:
 - When the local conversation context gets large, mote asks before auto-compacting. If you decline, mote continues and warns that the model may lose older context or hit token limits.
 - Compaction state is saved with sessions and restored when a session is resumed.
 - `!` commands are local TUI commands; their output is shown in the transcript but is not sent to the LLM as conversation history.
+
+### Custom slash commands
+
+Like opencode, mote can load custom slash commands from Markdown files. Put command files in:
+
+- Global: `~/.config/mote/commands/`
+
+The Markdown file name becomes the slash command name. For example, `~/.config/mote/commands/test.md` creates `/test`:
+
+```markdown
+---
+description: Run tests with coverage
+agent: build
+model: deepseek/deepseek-v4-flash
+---
+
+Run the full test suite with coverage. Focus on failures and suggest fixes.
+```
+
+Nested folders become slash subcommands. For example:
+
+```text
+~/.config/mote/commands/review/staged.md
+```
+
+becomes:
+
+```text
+/review/staged
+```
+
+Supported prompt placeholders mirror opencode's common command behavior:
+
+- `$ARGUMENTS` expands to everything after the command, e.g. `/component Button` → `Button`.
+- `$1`, `$2`, ... expand to positional arguments; quoted strings stay grouped.
+- `` !`command` `` runs a shell command from the workspace root and inserts stdout/stderr.
+- `@path/to/file` inserts file contents for files inside the workspace.
+
+If a custom command has the same name as a built-in command, the custom command wins.
 
 ### Agents
 

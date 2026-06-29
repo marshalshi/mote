@@ -235,7 +235,7 @@ impl Default for LoggingConfig {
 }
 
 /// Per-agent override within the `[agents]` section.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
     #[allow(dead_code)]
     pub model: Option<String>,
@@ -257,6 +257,19 @@ pub struct AgentConfig {
 
 fn default_agent_mode() -> String {
     "primary".into()
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            temperature: None,
+            max_tokens: None,
+            permissions: HashMap::new(),
+            instructions: None,
+            mode: default_agent_mode(),
+        }
+    }
 }
 
 impl AgentConfig {
@@ -621,11 +634,11 @@ impl Config {
     }
 }
 
-/// Load agent definitions from TOML files.
+/// Load agent definitions from Markdown files.
 ///
 /// Reads from two locations, with later sources overriding earlier ones:
-/// 1. Built-in agents shipped in the repo: `prompts/agents/*.toml`
-/// 2. User agents: `~/.config/mote/agents/*.toml` (falls back to `./agents`)
+/// 1. Built-in agents shipped in the repo: `prompts/agents/*.md`
+/// 2. User agents: `~/.config/mote/agents/*.md` (falls back to `./agents`)
 pub fn load_file_agents() -> HashMap<String, AgentConfig> {
     let mut agents = HashMap::new();
 
@@ -639,7 +652,7 @@ pub fn load_file_agents() -> HashMap<String, AgentConfig> {
     agents
 }
 
-/// Read `*.toml` agent files from `dir` into `agents`, overwriting on collision.
+/// Read `*.md` agent files from `dir` into `agents`, overwriting on collision.
 fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
     if !dir.is_dir() {
         return;
@@ -648,13 +661,13 @@ fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "toml") {
+                if path.extension().map_or(false, |e| e == "md") {
                     if let Some(stem) =
                         path.file_stem().and_then(|s| s.to_str())
                     {
                         match std::fs::read_to_string(&path) {
                             Ok(content) => {
-                                match toml::from_str::<AgentConfig>(&content) {
+                                match parse_agent_markdown(&content) {
                                     Ok(mut cfg) => {
                                         // Validate mode
                                         let mode = cfg.mode.clone();
@@ -696,6 +709,33 @@ fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
             );
         }
     }
+}
+
+fn parse_agent_markdown(content: &str) -> Result<AgentConfig> {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim();
+
+    let (mut cfg, body) = match split_markdown_frontmatter(trimmed) {
+        Some((frontmatter, body)) => (
+            serde_yaml::from_str::<AgentConfig>(frontmatter)
+                .context("Failed to parse YAML frontmatter")?,
+            body,
+        ),
+        None => (AgentConfig::default(), trimmed),
+    };
+
+    let instructions = body.trim();
+    if !instructions.is_empty() {
+        cfg.instructions = Some(instructions.to_string());
+    }
+
+    Ok(cfg)
+}
+
+fn split_markdown_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let rest = content.strip_prefix("---\n")?;
+    let (frontmatter, body) = rest.split_once("\n---")?;
+    Some((frontmatter, body.trim_start_matches('\n')))
 }
 
 /// Get all agents: merged from config.toml `[agents]` and file-based agents.
@@ -1027,57 +1067,131 @@ base_url = "http://localhost:11434"
     }
 
     #[test]
-    fn test_load_file_agents_reads_toml_files() {
+    fn test_parse_agent_markdown_with_frontmatter_and_body() {
+        let cfg = parse_agent_markdown(
+            r#"---
+model: ollama/qwen
+temperature: 0.2
+max_tokens: 2048
+mode: all
+permissions:
+  bash: deny
+---
+
+# Review
+
+You are a review agent.
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.model.as_deref(), Some("ollama/qwen"));
+        assert_eq!(cfg.temperature, Some(0.2));
+        assert_eq!(cfg.max_tokens, Some(2048));
+        assert_eq!(cfg.mode, "all");
+        assert_eq!(
+            cfg.permissions.get("bash").copied(),
+            Some(Permission::Deny)
+        );
+        assert_eq!(
+            cfg.instructions.as_deref(),
+            Some("# Review\n\nYou are a review agent.")
+        );
+    }
+
+    #[test]
+    fn test_parse_agent_markdown_without_frontmatter_uses_defaults() {
+        let cfg = parse_agent_markdown("# Build\n\nUse defaults.").unwrap();
+
+        assert_eq!(cfg.mode, "primary");
+        assert_eq!(
+            cfg.instructions.as_deref(),
+            Some("# Build\n\nUse defaults.")
+        );
+    }
+
+    #[test]
+    fn test_parse_agent_markdown_supports_crlf_frontmatter() {
+        let cfg = parse_agent_markdown(
+            "---\r\nmodel: ollama/qwen\r\nmode: subagent\r\n---\r\n\r\nRun checks.\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.model.as_deref(), Some("ollama/qwen"));
+        assert_eq!(cfg.mode, "subagent");
+        assert_eq!(cfg.instructions.as_deref(), Some("Run checks."));
+    }
+
+    #[test]
+    fn test_load_file_agents_reads_markdown_files() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().join("agents");
         std::fs::create_dir(&agent_dir).unwrap();
         std::fs::write(
-            agent_dir.join("review.toml"),
-            r#"
-model = "ollama/qwen"
-temperature = 0.2
-max_tokens = 2048
+            agent_dir.join("review.md"),
+            r#"---
+model: ollama/qwen
+temperature: 0.2
+max_tokens: 2048
+---
+
+Review instructions.
 "#,
         )
         .unwrap();
         std::fs::write(
-            agent_dir.join("plan.toml"),
-            r#"
-model = "ollama/deepseek"
-permissions = { bash = "deny" }
+            agent_dir.join("plan.md"),
+            r#"---
+model: ollama/deepseek
+permissions:
+  bash: deny
+---
+
+Plan instructions.
 "#,
         )
         .unwrap();
 
-        // Temporarily override resolve_config_path to use our temp dir
-        // Since resolve_config_path is a module function, we test via the public API
-        // by checking that the function can be called (we can't mock the home dir easily).
-        // For now, we verify the parsing logic by calling it directly with the file content.
         let content =
-            std::fs::read_to_string(agent_dir.join("review.toml")).unwrap();
-        let cfg: AgentConfig = toml::from_str(&content).unwrap();
+            std::fs::read_to_string(agent_dir.join("review.md")).unwrap();
+        let cfg = parse_agent_markdown(&content).unwrap();
         assert_eq!(cfg.model.as_deref(), Some("ollama/qwen"));
         assert_eq!(cfg.temperature, Some(0.2));
+        assert_eq!(cfg.instructions.as_deref(), Some("Review instructions."));
 
         let content2 =
-            std::fs::read_to_string(agent_dir.join("plan.toml")).unwrap();
-        let cfg2: AgentConfig = toml::from_str(&content2).unwrap();
+            std::fs::read_to_string(agent_dir.join("plan.md")).unwrap();
+        let cfg2 = parse_agent_markdown(&content2).unwrap();
         assert_eq!(cfg2.model.as_deref(), Some("ollama/deepseek"));
         assert_eq!(
             cfg2.permissions.get("bash").copied(),
             Some(Permission::Deny)
         );
+        assert_eq!(cfg2.instructions.as_deref(), Some("Plan instructions."));
     }
 
     #[test]
     fn test_all_agents_empty_when_no_config_agents() {
         let merged = all_agents(&HashMap::new());
         // File agents depend on the user's ~/.config/mote/agents/ directory.
-        // If the directory exists, ensure at least some are loaded.
+        // If markdown agent files exist, ensure at least some are loaded.
         let agent_dir = dirs::home_dir()
             .map(|h| h.join(".config").join("mote").join("agents"));
-        let has_agent_dir = agent_dir.as_ref().map_or(false, |d| d.is_dir());
-        if has_agent_dir {
+        let has_markdown_agents = agent_dir.as_ref().map_or(false, |d| {
+            d.is_dir()
+                && std::fs::read_dir(d)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .map_or(false, |ext| ext == "md")
+                    })
+        });
+        if has_markdown_agents {
             assert!(!merged.is_empty(), "expected file agents to be loaded");
         }
         // The function should never crash regardless
@@ -1139,22 +1253,25 @@ subagent = "deny"
     }
 
     #[test]
-    fn test_agent_mode_serialized_from_toml_file() {
+    fn test_agent_mode_serialized_from_markdown_file() {
         let dir = tempfile::tempdir().unwrap();
-        let agent_file = dir.path().join("test_agent.toml");
+        let agent_file = dir.path().join("test_agent.md");
         std::fs::write(
             &agent_file,
-            r#"
-model = "deepseek/deepseek-v4-flash"
-mode = "all"
-temperature = 0.2
-[permissions]
-bash = "deny"
+            r#"---
+model: deepseek/deepseek-v4-flash
+mode: all
+temperature: 0.2
+permissions:
+  bash: deny
+---
+
+Use markdown instructions.
 "#,
         )
         .unwrap();
         let content = std::fs::read_to_string(&agent_file).unwrap();
-        let cfg: AgentConfig = toml::from_str(&content).unwrap();
+        let cfg = parse_agent_markdown(&content).unwrap();
         assert_eq!(cfg.mode, "all");
         assert!(cfg.is_user_selectable());
         assert!(cfg.is_subagent_callable());
@@ -1162,6 +1279,10 @@ bash = "deny"
         assert_eq!(
             cfg.permissions.get("bash").copied(),
             Some(Permission::Deny)
+        );
+        assert_eq!(
+            cfg.instructions.as_deref(),
+            Some("Use markdown instructions.")
         );
     }
 

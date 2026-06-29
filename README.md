@@ -214,23 +214,24 @@ If a custom command has the same name as a built-in command, the custom command 
 
 ### Agents
 
-Define agents as TOML files in `~/.config/mote/agents/`:
+Define agents as Markdown files in `~/.config/mote/agents/`:
 
-```toml
-# ~/.config/mote/agents/plan.toml
-model = "deepseek/deepseek-v4-flash"
-mode = "primary"
-temperature = 0.1
-instructions = "You are a planning agent."
+```markdown
+---
+model: deepseek/deepseek-v4-flash
+mode: primary
+temperature: 0.1
+permissions:
+  read: allow
+  glob: allow
+  grep: allow
+  write: ask
+  edit: ask
+  delete: ask
+  bash: deny
+---
 
-[permissions]
-read = "allow"
-glob = "allow"
-grep = "allow"
-write = "ask"
-edit = "ask"
-delete = "ask"
-bash = "deny"
+You are a planning agent.
 ```
 
 Agent modes control visibility:
@@ -262,7 +263,7 @@ Skills are injected into the system prompt. Use the `use_skill` tool to activate
 
 ### Permission system
 
-Global permissions live in `config.toml` and default to `ask` when omitted. Each agent can override per-tool permissions in its agent TOML:
+Global permissions live in `config.toml` and default to `ask` when omitted. Each agent can override per-tool permissions in its agent Markdown frontmatter:
 
 | Level | Behavior |
 |-------|----------|
@@ -427,7 +428,7 @@ Assembled system layers:
 2. **Shared system prompt** — `prompts/system/mote.md` by default
 3. **User AGENTS.md** — `~/.config/mote/AGENTS.md` (optional)
 4. **Workspace AGENTS.md** — repo policy sent by the client (optional)
-5. **Agent instructions** — from agent TOML's `instructions` field
+5. **Agent instructions** — from the agent Markdown body (or config.toml override)
 6. **Skills** — `~/.config/mote/skills/` names + descriptions (optional)
 
 Per turn, the agent loop also injects a dynamic system reminder with time,

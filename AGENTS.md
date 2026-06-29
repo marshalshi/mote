@@ -44,7 +44,7 @@ The `prompts/` directory is organized into two subfolders:
 ```
 prompts/
   system/    # shared system prompt files (.md)
-  agents/    # built-in agent definitions shipped with the repo (.toml)
+  agents/    # built-in agent definitions shipped with the repo (.md)
 ```
 
 The system prompt is assembled by `PromptAssembler` (`server/src/prompt.rs`) into
@@ -57,8 +57,8 @@ Layers (in order):
    configurable via `[prompts].default`.
 3. Global `~/.config/mote/AGENTS.md` if present (user's personal policy)
 4. Workspace `AGENTS.md` — the repo's `AGENTS.md`, sent by the client
-5. Agent-specific instructions — the `instructions` string field on
-   `[agents.<name>]`, injected for that agent only
+5. Agent-specific instructions — from the file agent's Markdown body or the
+   `instructions` string on `[agents.<name>]`, injected for that agent only
 6. Skills — names + descriptions from `~/.config/mote/skills/*/SKILL.md`
 
 A 7th dynamic layer is **not** part of the assembled system prompt: the agent
@@ -68,20 +68,20 @@ recent user message.
 
 ## Agents
 
-Agents are TOML files (`<name>.toml`) containing an `AgentConfig`: `mode`,
-`temperature`, `instructions`, `permissions`, and optional `model` /
-`max_tokens` overrides. When `model` is omitted, the agent uses the default
-model from `[model]` in `config.toml`.
+Agents are Markdown files (`<name>.md`) with optional YAML frontmatter for
+`mode`, `temperature`, `permissions`, and optional `model` / `max_tokens`
+overrides. The Markdown body becomes that agent's instructions. When `model`
+is omitted, the agent uses the default model from `[model]` in `config.toml`.
 
 Agent files are loaded from two locations (later sources override earlier on
 name collision):
-1. Built-in agents shipped in the repo: `prompts/agents/*.toml`
-2. User agents: `~/.config/mote/agents/*.toml`
+1. Built-in agents shipped in the repo: `prompts/agents/*.md`
+2. User agents: `~/.config/mote/agents/*.md`
 
 Config.toml `[agents.<name>]` entries override file-based agents on collision.
 
 The default agent (used when no agent is specified) is `build` by default,
-defined in the repo by `prompts/agents/build.toml`. The fallback agent name is
+defined in the repo by `prompts/agents/build.md`. The fallback agent name is
 configurable via `server.default_agent` in `config.toml`; when omitted it
 defaults to `build` via `marshaling_protocol::DEFAULT_AGENT_NAME`.
 

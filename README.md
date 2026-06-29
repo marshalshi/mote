@@ -35,7 +35,7 @@ cargo build --workspace --release
 
 Compiled binaries:
 
-- Client: `./target/debug/mote-client` or `./target/release/mote-client`
+- TUI: `./target/debug/mote-tui` or `./target/release/mote-tui`
 - Server: `./target/debug/mote-server` or `./target/release/mote-server`
 
 Config files live in `~/.config/mote/`:
@@ -58,21 +58,21 @@ Or use the `--login` CLI flag to set them interactively:
 
 ```bash
 # Choose a provider interactively (debug build)
-./target/debug/mote-client --login
+./target/debug/mote-tui --login
 
 # Choose a provider interactively (release build)
-./target/release/mote-client --login
+./target/release/mote-tui --login
 
 # Or specify one directly
-./target/debug/mote-client --login deepseek
-./target/debug/mote-client --login glm
-./target/debug/mote-client --login kimi
-./target/debug/mote-client --login minimax
+./target/debug/mote-tui --login deepseek
+./target/debug/mote-tui --login glm
+./target/debug/mote-tui --login kimi
+./target/debug/mote-tui --login minimax
 
-./target/release/mote-client --login deepseek
-./target/release/mote-client --login glm
-./target/release/mote-client --login kimi
-./target/release/mote-client --login minimax
+./target/release/mote-tui --login deepseek
+./target/release/mote-tui --login glm
+./target/release/mote-tui --login kimi
+./target/release/mote-tui --login minimax
 ```
 
 ### Run
@@ -81,10 +81,10 @@ Start Mote with the compiled client binary:
 
 ```bash
 # Starts a local server in the background, then shows the TUI (debug build)
-./target/debug/mote-client
+./target/debug/mote-tui
 
 # Starts a local server in the background, then shows the TUI (release build)
-./target/release/mote-client
+./target/release/mote-tui
 
 # Standalone server (debug build)
 ./target/debug/mote-server
@@ -93,19 +93,19 @@ Start Mote with the compiled client binary:
 ./target/release/mote-server
 
 # TUI-only mode, connecting to an existing server (debug build)
-./target/debug/mote-client --tui --server-url http://127.0.0.1:9847
+./target/debug/mote-tui --tui --server-url http://127.0.0.1:9847
 
 # TUI-only mode, connecting to an existing server (release build)
-./target/release/mote-client --tui --server-url http://127.0.0.1:9847
+./target/release/mote-tui --tui --server-url http://127.0.0.1:9847
 
 # Optional: force a specific session key namespace (debug build)
-./target/debug/mote-client --session-key team-a
+./target/debug/mote-tui --session-key team-a
 
 # Optional: force a specific session key namespace (release build)
-./target/release/mote-client --session-key team-a
+./target/release/mote-tui --session-key team-a
 ```
 
-`mote-client` starts a local server on a free localhost port by default and shows the TUI frontend. Use `mote-server` when you want to run the server separately, and `mote-client --tui --server-url http://127.0.0.1:<port>` to connect a frontend to an already-running server.
+`mote-tui` starts a local server on a free localhost port by default and shows the TUI frontend. Use `mote-server` when you want to run the server separately, and `mote-tui --tui --server-url http://127.0.0.1:<port>` to connect the TUI to an already-running server.
 
 ### Runtime folders
 
@@ -326,7 +326,7 @@ Recursion is limited to 3 levels.
 RUST_LOG=debug ./target/debug/mote-server
 
 # Client: use -v or RUST_LOG=debug
-./target/debug/mote-client -v
+./target/debug/mote-tui -v
 ```
 
 Verbose logs are saved to `~/.config/mote/logs/mote.log`.
@@ -438,7 +438,7 @@ progress, tool results, and guidance.
 ```bash
 cargo test                     # all crates
 cargo test -p mote-server
-cargo test -p mote-client
+cargo test -p mote-tui
 ```
 
 Target: **zero warnings** across the workspace.

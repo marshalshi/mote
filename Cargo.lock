@@ -1282,34 +1282,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mote-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "crossterm",
- "dirs",
- "futures",
- "mote-protocol",
- "pulldown-cmark",
- "ratatui",
- "reqwest",
- "rpassword",
- "serde",
- "serde_json",
- "syntect",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "unicode-width 0.2.0",
-]
-
-[[package]]
 name = "mote-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1343,6 +1315,34 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mote-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "futures",
+ "mote-protocol",
+ "pulldown-cmark",
+ "ratatui",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

@@ -61,6 +61,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.model_picker_open {
         render_model_picker(frame, full_area, app);
     }
+    if app.login_picker_open {
+        render_login_picker(frame, full_area, app);
+    }
 
     if app.pending_permission.is_some() {
         render_permission_popup(frame, full_area, app);
@@ -180,6 +183,58 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑/↓ select • Enter apply • Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn render_login_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let rect =
+        render_picker_popup(frame, area, app.input_accent, " Login Provider ");
+    let inner = inset(rect, 2, 1);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Select a provider, then paste its API key.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    if app.login_picker_items.is_empty() {
+        lines.push(Line::from("No login providers available."));
+    } else {
+        let available_rows = inner.height.saturating_sub(4) as usize;
+        let visible_items = (available_rows / 2).max(1);
+        let (start, end) = session_picker_window(
+            app.login_picker_items.len(),
+            app.login_picker_index,
+            visible_items,
+        );
+        for (i, item) in app.login_picker_items[start..end].iter().enumerate() {
+            let i = start + i;
+            let selected = i == app.login_picker_index;
+            let marker = if selected { "›" } else { " " };
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} {}", marker, item.display_name),
+                picker_item_style(selected),
+            )]));
+            lines.push(Line::from(Span::styled(
+                format!("   {} · {}", item.provider, item.key_url),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if end < app.login_picker_items.len() {
+            lines.push(Line::from(Span::styled(
+                format!("... {} more", app.login_picker_items.len() - end),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select • Enter apply • Click item • Esc close",
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -1235,6 +1290,12 @@ fn centered_text(content: &str, width: usize) -> String {
     format!("{}{}", " ".repeat(padding), content)
 }
 
+fn is_helper_context(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("<system-reminder>")
+        || trimmed.starts_with("<reminder>")
+}
+
 fn is_welcome_empty_state(app: &App) -> bool {
     app.messages.is_empty()
         && app.stream_buffer.is_empty()
@@ -1253,8 +1314,8 @@ fn welcome_logo_lines() -> Vec<String> {
         "".to_string(),
         ".S~S*S~S.    %SP~YS%    YSSS~S%SSP   d%SRs  ".to_string(),
         "SS `Y' SS  dS'     `Sb      SS       dS'    ".to_string(),
-        "SS  Y  SS  SS       SS      SS       SS_Ss  ".to_string(),
-        "SS     SS  SS       SS      SS       SS~SP  ".to_string(),
+        "SS  Y  SS  SS       SS      SS       SS_Yz  ".to_string(),
+        "SS     SS  SS       SS      SS       SS~ZY  ".to_string(),
         "SS     SS  SS.     .SS      SS       SS.    ".to_string(),
         "SS     SS    Sbs_sdS        SS       SSbRs  ".to_string(),
         "       SP                   SP                ".to_string(),
@@ -1384,6 +1445,8 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
         let content_style = if msg.source == super::state::MessageSource::Error
         {
             Style::default().fg(Color::Red)
+        } else if is_helper_context(&msg.content) {
+            grey_content
         } else {
             Style::default()
         };
@@ -1468,13 +1531,18 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
 
     // Streaming content (assistant — blank side bar)
     if !app.stream_buffer.is_empty() {
+        let stream_style = if is_helper_context(&app.stream_buffer) {
+            grey_content
+        } else {
+            Style::default()
+        };
         push_accent_lines(
             &mut lines,
             &app.stream_buffer,
             content_width,
             "    ",
             Style::default(),
-            Style::default(),
+            stream_style,
         );
         lines.push(Line::from(""));
     }
@@ -1614,13 +1682,18 @@ fn build_subagent_lines(
 
     // Stream buffer (in-progress text) — blank side bar for assistant
     if !sv.stream_buffer.is_empty() {
+        let stream_style = if is_helper_context(&sv.stream_buffer) {
+            grey_content
+        } else {
+            Style::default()
+        };
         push_accent_lines(
             &mut lines,
             &sv.stream_buffer,
             content_width,
             "    ",
             Style::default(),
-            Style::default(),
+            stream_style,
         );
     }
 
@@ -1771,6 +1844,16 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     let shell_mode = app.input.starts_with('!');
     let (prompt, display_input, display_cursor) =
         shell_input_display(&app.input, app.input_cursor);
+    let display_input = if let Some(provider_name) = app.secret_input_prompt() {
+        let masked = "•".repeat(display_input.chars().count());
+        if masked.is_empty() {
+            format!("[secure {} API key entry]", provider_name)
+        } else {
+            masked
+        }
+    } else {
+        display_input
+    };
     let is_placeholder =
         display_input.is_empty() && app.state == AppState::Idle;
     let display_text = if is_placeholder {
@@ -1954,9 +2037,17 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
         app.state,
         AppState::AgentRunning | AppState::WaitingResponse
     ) {
-        " Esc Esc stop · Ctrl+C quit · /help "
+        if app.selection_mode {
+            " Selection mode · drag select/copy · Esc/F6 exit "
+        } else {
+            " Esc Esc stop · Ctrl+C quit · /help "
+        }
     } else {
-        " Ctrl+C quit · /help "
+        if app.selection_mode {
+            " Selection mode · drag select/copy · Esc/F6 exit "
+        } else {
+            " Ctrl+C quit · /help "
+        }
     };
     let right = if total > left.len() + right_info.len() {
         right_info
@@ -2047,6 +2138,7 @@ fn render_loading_bar(frame: &mut Frame, area: Rect, app: &App) {
             matches!(tc.status, marshaling_protocol::ToolStatus::Running)
         })
         .map(|tc| format!("running {}", tc.name))
+        .or_else(|| app.loading_label.clone())
         .unwrap_or_else(|| "thinking".into());
 
     let style = Style::default().fg(Color::DarkGray);
@@ -2110,6 +2202,22 @@ fn render_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn test_ui_config() -> marshaling_protocol::UiConfig {
+        marshaling_protocol::UiConfig {
+            input_accent: "cyan".into(),
+            user_accent: "cyan".into(),
+            model_info: "deepseek/deepseek-chat".into(),
+            agent_names: vec!["build".into()],
+            subagent_names: vec![],
+            agent_model_info: HashMap::from([(
+                "build".into(),
+                "deepseek/deepseek-chat".into(),
+            )]),
+            default_agent: "build".into(),
+        }
+    }
 
     #[test]
     fn test_word_wrap_short_line_no_wrap() {
@@ -2400,5 +2508,31 @@ mod tests {
         let result = md_text("first paragraph\n\nsecond paragraph");
         let blank_count = result.iter().filter(|l| l.is_empty()).count();
         assert!(blank_count >= 1);
+    }
+
+    #[test]
+    fn test_helper_context_renders_in_grey() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.stream_buffer =
+            "<system-reminder>\nhelper\n</system-reminder>".into();
+
+        let lines = build_lines(&app, 80);
+        let helper_span = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref().contains("helper"))
+            .unwrap();
+
+        assert_eq!(helper_span.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn test_helper_context_detection() {
+        assert!(is_helper_context(
+            "<system-reminder>\nYour operational mode changed\n</system-reminder>"
+        ));
+        assert!(is_helper_context("<reminder>note</reminder>"));
+        assert!(!is_helper_context("normal assistant reply"));
     }
 }

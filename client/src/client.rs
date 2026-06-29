@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use marshaling_protocol::{
-    ChatRequest, ModelInfo, RollbackResultPayload, ServerEvent, SessionInfo,
-    UiConfig,
+    ChatRequest, CompactRequest, CompactResponse, ModelInfo,
+    RollbackResultPayload, ServerEvent, SessionInfo, UiConfig,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -28,12 +28,27 @@ impl ChatStream {
         event: marshaling_protocol::ClientEvent,
     ) -> Result<()> {
         let json = serde_json::to_string(&event)?;
-        self._write.send(Message::Text(json.into())).await?;
+        self._write.send(Message::Text(json)).await?;
         Ok(())
     }
 }
 
+fn websocket_url_from_base(base_url: &str) -> Result<String> {
+    let url = reqwest::Url::parse(base_url)
+        .with_context(|| format!("Invalid server URL: {base_url}"))?;
+    if url.scheme() != "http" {
+        anyhow::bail!(
+            "Only http:// server URLs are supported (got: {})",
+            url.scheme()
+        );
+    }
+    // Convert http://host:port → ws://host:port
+    let ws = format!("ws://{}/chat", url.authority());
+    Ok(ws)
+}
+
 /// Client for communicating with the mote-server.
+#[derive(Clone)]
 pub struct MoteClient {
     base_url: String,
     http: reqwest::Client,
@@ -48,11 +63,15 @@ impl MoteClient {
     }
 
     pub async fn health(&self) -> bool {
-        self.http
+        match self
+            .http
             .get(format!("{}/health", self.base_url))
             .send()
             .await
-            .is_ok()
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 
     pub async fn get_config(&self) -> Result<UiConfig> {
@@ -70,6 +89,11 @@ impl MoteClient {
             .get(format!("{}/models", self.base_url))
             .send()
             .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server returned {status}: {body}");
+        }
         Ok(resp.json().await?)
     }
 
@@ -123,6 +147,24 @@ impl MoteClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn compact(
+        &self,
+        request: &CompactRequest,
+    ) -> Result<CompactResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/compact", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Server returned {status}: {body}");
+        }
+        Ok(resp.json().await?)
+    }
+
     // ── Credential save ───────────────────────────────────
 
     /// Save a credential (api_key, token) to the server's auth.json.
@@ -163,12 +205,7 @@ impl MoteClient {
         &self,
         request: ChatRequest,
     ) -> Result<ChatStream> {
-        let ws_url = format!(
-            "ws://{}/chat",
-            self.base_url
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-        );
+        let ws_url = websocket_url_from_base(&self.base_url)?;
 
         let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
             .await
@@ -180,7 +217,7 @@ impl MoteClient {
         let req_json = serde_json::to_string(&request)
             .context("Failed to serialize ChatRequest")?;
         let mut write = write;
-        if let Err(e) = write.send(Message::Text(req_json.into())).await {
+        if let Err(e) = write.send(Message::Text(req_json)).await {
             anyhow::bail!("Failed to send chat request: {e}");
         }
 
@@ -226,5 +263,36 @@ impl MoteClient {
         });
 
         Ok(ChatStream { rx, _write: write })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::websocket_url_from_base;
+
+    #[test]
+    fn websocket_url_from_http_base() {
+        let ws = websocket_url_from_base("http://127.0.0.1:9847").unwrap();
+        assert_eq!(ws, "ws://127.0.0.1:9847/chat");
+    }
+
+    #[test]
+    fn websocket_url_rejects_https() {
+        let err = websocket_url_from_base("https://example.com").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Only http:// server URLs are supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn websocket_url_rejects_other_schemes() {
+        let err = websocket_url_from_base("ftp://example.com").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Only http:// server URLs are supported"),
+            "got: {err}"
+        );
     }
 }

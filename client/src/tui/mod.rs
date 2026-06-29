@@ -18,6 +18,10 @@ use self::keybinding::{Action, Keybindings};
 use self::state::{App, AppState, ServerHealth, SlashAction};
 use crate::client::{ChatStream, MoteClient};
 
+enum BackgroundEvent {
+    CompactFinished(anyhow::Result<marshaling_protocol::CompactResponse>),
+}
+
 /// Run the TUI event loop. Returns when the user quits.
 pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
     // Setup terminal
@@ -40,6 +44,8 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
     // Agent / WS chat channels
     let mut chat_stream: Option<ChatStream> = None;
+    let (background_tx, mut background_rx) =
+        tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
 
     // Health check ticker
     let mut health_interval = tokio::time::interval(Duration::from_secs(5));
@@ -128,6 +134,11 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                         // Just update the status bar.
                     }
                 }
+                background = background_rx.recv() => {
+                    if let Some(event) = background {
+                        handle_background_event(&mut app, event);
+                    }
+                }
             }
         }
 
@@ -140,7 +151,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                             app.messages.push(
                                 self::state::DisplayMessage::command(
                                     crate::llm::Role::Assistant,
-                                    "No models available.".into(),
+                                    "No models available from currently configured/reachable providers.".into(),
                                 ),
                             );
                         } else {
@@ -210,6 +221,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                                     source: self::state::MessageSource::Conversation,
                                 });
                             }
+                            app.compaction_state = session.compaction;
                             app.active_session_id = Some(id.clone());
                             app.scroll_to_bottom();
                             app.messages.push(
@@ -230,6 +242,16 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                             })
                         }
                     }
+                }
+                SlashAction::Compact {
+                    include_latest_user,
+                } => {
+                    start_compaction(
+                        client,
+                        &mut app,
+                        include_latest_user,
+                        &background_tx,
+                    );
                 }
                 SlashAction::SaveCredential(provider, key, value) => {
                     let result = match client
@@ -328,12 +350,16 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
         // After idle + no active chat: check if user sent a message → start chat
         if chat_stream.is_none() && app.state == AppState::Idle {
-            if let Some(last) = app.messages.last() {
-                if last.role == crate::llm::Role::User
-                    && last.source == self::state::MessageSource::Conversation
-                {
-                    start_chat(client, &mut app, &mut chat_stream).await;
+            let latest_message_is_user = app.messages.last().is_some_and(|m| {
+                m.role == crate::llm::Role::User
+                    && m.source == self::state::MessageSource::Conversation
+            });
+            if latest_message_is_user || app.pending_auto_compact_send {
+                if app.needs_auto_compact() {
+                    app.request_auto_compact_confirmation();
+                    continue;
                 }
+                start_chat(client, &mut app, &mut chat_stream).await;
             }
         }
     }
@@ -356,11 +382,12 @@ async fn start_chat(
     app: &mut App,
     chat_stream: &mut Option<ChatStream>,
 ) {
-    let user_msg = match app.messages.last() {
-        Some(m) if m.role == crate::llm::Role::User => m.content.clone(),
-        _ => return,
+    let user_msg = match app.pending_user_message_content() {
+        Some(content) => content.to_string(),
+        None => return,
     };
 
+    app.pending_auto_compact_send = false;
     app.start_agent();
 
     let request = build_chat_request(app, user_msg.clone());
@@ -388,6 +415,71 @@ async fn start_chat(
     }
 }
 
+fn start_compaction(
+    client: &MoteClient,
+    app: &mut App,
+    include_latest_user: bool,
+    background_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
+) {
+    let history = app.compact_history_messages(include_latest_user);
+    if history.is_empty() && app.compaction_state.is_none() {
+        app.messages.push(self::state::DisplayMessage::command(
+            crate::llm::Role::Assistant,
+            "Nothing new to compact.".into(),
+        ));
+        return;
+    }
+
+    let (model_override, provider_override) =
+        app.current_model_override_parts();
+    let request = marshaling_protocol::CompactRequest {
+        agent: app.current_agent.clone(),
+        model_override,
+        provider_override,
+        history,
+        prior_compaction: app.compaction_state.clone(),
+        session_id: app.active_session_id.clone(),
+        workspace_root: Some(app.workspace_root.clone()),
+        repo_agents_md: app.repo_agents_md.clone(),
+        runtime_session_key: Some(app.runtime_session_key.clone()),
+    };
+
+    app.start_background_activity("compacting conversation");
+
+    let compact_client = client.clone();
+    let tx = background_tx.clone();
+    tokio::spawn(async move {
+        let result = compact_client.compact(&request).await;
+        let _ = tx.send(BackgroundEvent::CompactFinished(result));
+    });
+}
+
+fn handle_background_event(app: &mut App, event: BackgroundEvent) {
+    match event {
+        BackgroundEvent::CompactFinished(result) => {
+            app.finish_background_activity();
+            match result {
+                Ok(response) => {
+                    app.apply_compaction(
+                        response.session_id,
+                        response.compaction,
+                    );
+                }
+                Err(e) => {
+                    app.pending_auto_compact_send = false;
+                    app.suppress_auto_compact_for_latest_message();
+                    app.messages.push(self::state::DisplayMessage {
+                        role: crate::llm::Role::Assistant,
+                        content: format!("Compaction failed: {e:#}"),
+                        thinking: None,
+                        source: self::state::MessageSource::Error,
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn should_animate_loading(app: &App, chat_stream_active: bool) -> bool {
     app.loading_progress.is_some() || chat_stream_active
 }
@@ -398,20 +490,7 @@ fn build_chat_request(
 ) -> marshaling_protocol::ChatRequest {
     let (model_override, provider_override) =
         app.current_model_override_parts();
-    // Build conversation history from prior display messages (excluding the latest user message).
-    // Only include Conversation-sourced messages — skip command outputs and errors.
-    let history: Vec<marshaling_protocol::HistoryMessage> = app.messages
-        [..app.messages.len().saturating_sub(1)]
-        .iter()
-        .filter(|m| m.source == self::state::MessageSource::Conversation)
-        .map(|m| marshaling_protocol::HistoryMessage {
-            role: match m.role {
-                crate::llm::Role::User => "user".into(),
-                crate::llm::Role::Assistant => "assistant".into(),
-            },
-            content: m.content.clone(),
-        })
-        .collect();
+    let history = app.compact_history_messages(false);
 
     marshaling_protocol::ChatRequest {
         message: user_msg,
@@ -424,6 +503,7 @@ fn build_chat_request(
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
         run_id: None,
+        compaction: app.compaction_state.clone(),
     }
 }
 
@@ -444,6 +524,7 @@ fn build_attach_request(
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
         run_id: Some(run_id),
+        compaction: app.compaction_state.clone(),
     }
 }
 
@@ -694,6 +775,35 @@ fn handle_key_event(
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if app.selection_mode {
+                let action = keys.lookup(key.code, key.modifiers);
+                if key.code == crossterm::event::KeyCode::Esc {
+                    set_selection_mode(app, false);
+                    return;
+                }
+                if action == Some(Action::ToggleSelectionMode) {
+                    set_selection_mode(app, false);
+                } else if action == Some(Action::Quit) {
+                    app.clear_esc_cancel_arm();
+                    app.state = AppState::Quitting;
+                }
+                return;
+            }
+            if app.pending_compact_confirmation {
+                match key.code {
+                    crossterm::event::KeyCode::Char('y')
+                    | crossterm::event::KeyCode::Char('Y') => {
+                        app.accept_auto_compact();
+                    }
+                    crossterm::event::KeyCode::Char('n')
+                    | crossterm::event::KeyCode::Char('N')
+                    | crossterm::event::KeyCode::Esc => {
+                        app.deny_auto_compact();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if app.session_picker_open {
                 match key.code {
                     crossterm::event::KeyCode::Up => app.session_picker_up(),
@@ -733,14 +843,35 @@ fn handle_key_event(
                 }
                 return;
             }
+            if app.login_picker_open {
+                match key.code {
+                    crossterm::event::KeyCode::Up => app.login_picker_up(),
+                    crossterm::event::KeyCode::Down => app.login_picker_down(),
+                    crossterm::event::KeyCode::Esc => app.close_login_picker(),
+                    crossterm::event::KeyCode::Enter => {
+                        if let Some(choice) = app.selected_login_choice() {
+                            app.apply_login_choice(choice);
+                        }
+                        app.close_login_picker();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             let action = keys.lookup(key.code, key.modifiers);
             handle_action(app, action, key.code, key.modifiers);
         }
         Event::Mouse(m) => {
+            if app.selection_mode {
+                return;
+            }
             app.mouse_position = Some((m.column, m.row));
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if handle_permission_mouse_click(app, m.column, m.row) {
+                        return;
+                    }
+                    if handle_picker_mouse_click(app, m.column, m.row) {
                         return;
                     }
                 }
@@ -845,19 +976,19 @@ fn handle_action(
     // Quit and scroll work in any state
     // During agent running, Ctrl+C cancels immediately and Esc requires a double-tap
     match action {
-        Some(Action::Quit)
-            if app.state == AppState::AgentRunning
-                || app.state == AppState::WaitingResponse =>
-        {
+        Some(Action::Quit) if app.state == AppState::AgentRunning => {
             // Ctrl+C cancels immediately while running.
             app.pending_cancel = true;
             app.clear_esc_cancel_arm();
             return;
         }
+        Some(Action::Quit) if app.state == AppState::WaitingResponse => {
+            app.clear_esc_cancel_arm();
+            app.state = AppState::Quitting;
+            return;
+        }
         Some(Action::CancelAgent) => {
-            if app.state == AppState::AgentRunning
-                || app.state == AppState::WaitingResponse
-            {
+            if app.state == AppState::AgentRunning {
                 if app.esc_cancel_step() {
                     app.pending_cancel = true;
                     app.clear_esc_cancel_arm();
@@ -868,6 +999,12 @@ fn handle_action(
                             .into(),
                     ));
                 }
+            } else if app.state == AppState::WaitingResponse {
+                app.messages.push(self::state::DisplayMessage::command(
+                    crate::llm::Role::Assistant,
+                    "Still waiting for compaction to finish. Press Ctrl+C to quit the TUI immediately if needed."
+                        .into(),
+                ));
             }
             return;
         }
@@ -903,6 +1040,19 @@ fn handle_action(
             // Reset scroll so each view starts at the bottom
             app.scroll_offset = 0;
             app.auto_scroll = true;
+            return;
+        }
+        Some(Action::ToggleSelectionMode) => {
+            if app.selection_mode_blocked() {
+                if let Some(reason) = app.selection_mode_block_reason() {
+                    app.messages.push(self::state::DisplayMessage::command(
+                        crate::llm::Role::Assistant,
+                        reason.into(),
+                    ));
+                }
+                return;
+            }
+            set_selection_mode(app, !app.selection_mode);
             return;
         }
         _ => {}
@@ -979,6 +1129,48 @@ fn handle_action(
     }
 
     normal_action(app, action, code, modifiers);
+}
+
+fn set_selection_mode(app: &mut App, enabled: bool) {
+    if app.selection_mode == enabled {
+        return;
+    }
+    if update_mouse_capture(!enabled).is_ok() {
+        apply_selection_mode_state(app, enabled);
+    } else {
+        app.messages.push(self::state::DisplayMessage {
+            role: crate::llm::Role::Assistant,
+            content: format!(
+                "Failed to {} selection mode.",
+                if enabled { "enable" } else { "disable" }
+            ),
+            thinking: None,
+            source: self::state::MessageSource::Error,
+        });
+    }
+}
+
+fn apply_selection_mode_state(app: &mut App, enabled: bool) {
+    app.selection_mode = enabled;
+    app.mouse_position = None;
+    app.messages.push(self::state::DisplayMessage::command(
+        crate::llm::Role::Assistant,
+        if enabled {
+            "Selection mode enabled. Drag to select in your terminal, then copy normally. Press Esc or F6 to return.".into()
+        } else {
+            "Selection mode disabled. Mouse scrolling and clicks restored.".into()
+        },
+    ));
+}
+
+fn update_mouse_capture(enabled: bool) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    if enabled {
+        crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)?;
+    } else {
+        crossterm::execute!(stdout, crossterm::event::DisableMouseCapture)?;
+    }
+    Ok(())
 }
 
 fn normal_action(
@@ -1074,6 +1266,71 @@ fn handle_permission_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
         }
     }
     true
+}
+
+fn handle_picker_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
+    if app.login_picker_open {
+        let Some(index) = login_picker_index_at(app, column, row) else {
+            return false;
+        };
+        app.login_picker_index = index;
+        if let Some(choice) = app.selected_login_choice() {
+            app.apply_login_choice(choice);
+        }
+        app.close_login_picker();
+        return true;
+    }
+    false
+}
+
+fn login_picker_index_at(app: &App, column: u16, row: u16) -> Option<usize> {
+    if !app.login_picker_open || app.login_picker_items.is_empty() {
+        return None;
+    }
+    let (term_width, term_height) = crossterm::terminal::size().ok()?;
+    let area = Rect::new(0, 0, term_width, term_height);
+    let rect = centered_rect_local(
+        area,
+        area.width.min(92).max(44),
+        area.height.min(22).max(9),
+    );
+    let inner = inset_local(rect, 2, 1);
+    let available_rows = inner.height.saturating_sub(4) as usize;
+    let visible_items = (available_rows / 2).max(1);
+    let (start, end) = picker_window(
+        app.login_picker_items.len(),
+        app.login_picker_index,
+        visible_items,
+    );
+
+    for (visible_idx, actual_idx) in (start..end).enumerate() {
+        let first_row = inner.y + 2 + (visible_idx as u16 * 2);
+        let second_row = first_row + 1;
+        let row_hit = row == first_row || row == second_row;
+        let column_hit = column >= inner.x && column < inner.x + inner.width;
+        if row_hit && column_hit {
+            return Some(actual_idx);
+        }
+    }
+    None
+}
+
+fn picker_window(
+    total_items: usize,
+    selected: usize,
+    visible: usize,
+) -> (usize, usize) {
+    if total_items == 0 {
+        return (0, 0);
+    }
+    let visible = visible.max(1).min(total_items);
+    let selected = selected.min(total_items - 1);
+    let half = visible / 2;
+    let mut start = selected.saturating_sub(half);
+    if start + visible > total_items {
+        start = total_items.saturating_sub(visible);
+    }
+    (start, start + visible)
 }
 
 fn permission_popup_action_at(
@@ -1240,9 +1497,10 @@ mod tests {
             agent_names: vec!["review".into()],
             subagent_names: vec![],
             agent_model_info: HashMap::from([
-                ("default".into(), "deepseek/deepseek-chat".into()),
-                ("review".into(), "github/gpt-4o".into()),
+                ("build".into(), "deepseek/deepseek-chat".into()),
+                ("review".into(), "kimi/kimi-k2.6".into()),
             ]),
+            default_agent: "build".into(),
         }
     }
 
@@ -1270,6 +1528,27 @@ mod tests {
     }
 
     #[test]
+    fn test_set_selection_mode_state_changes() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        apply_selection_mode_state(&mut app, true);
+        assert!(app.selection_mode);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selection mode enabled"))
+        );
+
+        apply_selection_mode_state(&mut app, false);
+        assert!(!app.selection_mode);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selection mode disabled"))
+        );
+    }
+
+    #[test]
     fn test_build_chat_request_excludes_command_messages() {
         let cfg = test_ui_config();
         let mut app = App::new_with_workspace(
@@ -1293,6 +1572,42 @@ mod tests {
         let req = build_chat_request(&app, "hello".into());
 
         assert!(req.history.is_empty());
+    }
+
+    #[test]
+    fn test_build_chat_request_includes_compaction_and_skips_compacted_history()
+    {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        for (role, content) in [
+            (crate::llm::Role::User, "old user"),
+            (crate::llm::Role::Assistant, "old assistant"),
+            (crate::llm::Role::User, "latest"),
+        ] {
+            app.messages.push(super::state::DisplayMessage {
+                role,
+                content: content.into(),
+                thinking: None,
+                source: super::state::MessageSource::Conversation,
+            });
+        }
+        app.compaction_state = Some(marshaling_protocol::CompactionState {
+            summary: "old summary".into(),
+            compacted_message_count: 2,
+            model_provider: "deepseek".into(),
+            model_id: "deepseek-chat".into(),
+        });
+
+        let req = build_chat_request(&app, "latest".into());
+
+        assert!(req.history.is_empty());
+        assert_eq!(req.compaction.as_ref().unwrap().summary, "old summary");
     }
 
     #[test]
@@ -1326,6 +1641,75 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_background_compact_success_applies_compaction() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.start_background_activity("compacting conversation");
+
+        handle_background_event(
+            &mut app,
+            BackgroundEvent::CompactFinished(Ok(
+                marshaling_protocol::CompactResponse {
+                    session_id: "sess-1".into(),
+                    compaction: marshaling_protocol::CompactionState {
+                        summary: "summary".into(),
+                        compacted_message_count: 2,
+                        model_provider: "deepseek".into(),
+                        model_id: "deepseek-chat".into(),
+                    },
+                },
+            )),
+        );
+
+        assert_eq!(app.state, AppState::Idle);
+        assert!(app.loading_progress.is_none());
+        assert_eq!(app.active_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            app.compaction_state.as_ref().map(|c| c.summary.as_str()),
+            Some("summary")
+        );
+    }
+
+    #[test]
+    fn test_handle_background_compact_failure_clears_pending_auto_send() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "latest".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+        app.pending_auto_compact_send = true;
+        app.start_background_activity("compacting conversation");
+
+        handle_background_event(
+            &mut app,
+            BackgroundEvent::CompactFinished(Err(anyhow::anyhow!("boom"))),
+        );
+
+        assert_eq!(app.state, AppState::Idle);
+        assert!(!app.pending_auto_compact_send);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Compaction failed"))
+        );
+    }
+
+    #[test]
     fn test_build_chat_request_uses_active_agent_override_only() {
         let cfg = test_ui_config();
         let mut app = App::new_with_workspace(
@@ -1336,7 +1720,7 @@ mod tests {
             "runtime-key".into(),
         );
         app.agent_model_overrides.insert(
-            "default".into(),
+            "build".into(),
             super::state::AgentModelOverride {
                 provider: Some("deepseek".into()),
                 model_id: "deepseek-reasoner".into(),
@@ -1345,16 +1729,16 @@ mod tests {
         app.agent_model_overrides.insert(
             "review".into(),
             super::state::AgentModelOverride {
-                provider: Some("github".into()),
-                model_id: "gpt-4.1".into(),
+                provider: Some("kimi".into()),
+                model_id: "kimi-k2.6".into(),
             },
         );
 
         app.current_agent = "review".into();
         let req = build_chat_request(&app, "hello".into());
         assert_eq!(req.agent, "review");
-        assert_eq!(req.model_override.as_deref(), Some("gpt-4.1"));
-        assert_eq!(req.provider_override.as_deref(), Some("github"));
+        assert_eq!(req.model_override.as_deref(), Some("kimi-k2.6"));
+        assert_eq!(req.provider_override.as_deref(), Some("kimi"));
     }
 
     #[test]

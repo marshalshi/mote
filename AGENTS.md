@@ -39,17 +39,56 @@ The client never imports from the server crate or calls LLM providers directly.
 
 ## Prompt system
 
+The `prompts/` directory is organized into two subfolders:
+
+```
+prompts/
+  system/    # shared system prompt files (.md)
+  agents/    # built-in agent definitions shipped with the repo (.toml)
+```
+
+The system prompt is assembled by `PromptAssembler` (`server/src/prompt.rs`) into
+ordered layers, each a separate `ChatMessage::system(...)`. Both the primary
+agent and subagents build their layers via `PromptAssembler::for_agent()`.
+
 Layers (in order):
-1. Environment block (model, working dir, platform, date)
-2. Default prompt (`prompts/default.txt`)
-3. Model-specific prompt (`prompts/<provider>.txt`)
-4. User instructions from `prompts/instructions/` (markdown files)
-5. `~/.config/mote/AGENTS.md` if present (user's personal policy)
+1. Environment block (model id, working dir, git status, platform, date)
+2. Shared system prompt (`prompts/system/mote.md` by default). The path is
+   configurable via `[prompts].default`.
+3. Global `~/.config/mote/AGENTS.md` if present (user's personal policy)
+4. Workspace `AGENTS.md` — the repo's `AGENTS.md`, sent by the client
+5. Agent-specific instructions — the `instructions` string field on
+   `[agents.<name>]`, injected for that agent only
+6. Skills — names + descriptions from `~/.config/mote/skills/*/SKILL.md`
+
+A 7th dynamic layer is **not** part of the assembled system prompt: the agent
+loop rebuilds a `<system-reminder>` block every turn (`build_system_reminder`)
+with the current step, available tools, last turn's tool results, and the most
+recent user message.
+
+## Agents
+
+Agents are TOML files (`<name>.toml`) containing an `AgentConfig`: `mode`,
+`temperature`, `instructions`, `permissions`, and optional `model` /
+`max_tokens` overrides. When `model` is omitted, the agent uses the default
+model from `[model]` in `config.toml`.
+
+Agent files are loaded from two locations (later sources override earlier on
+name collision):
+1. Built-in agents shipped in the repo: `prompts/agents/*.toml`
+2. User agents: `~/.config/mote/agents/*.toml`
+
+Config.toml `[agents.<name>]` entries override file-based agents on collision.
+
+The default agent (used when no agent is specified) is `build` by default,
+defined in the repo by `prompts/agents/build.toml`. The fallback agent name is
+configurable via `server.default_agent` in `config.toml`; when omitted it
+defaults to `build` via `marshaling_protocol::DEFAULT_AGENT_NAME`.
 
 ## Testing
 
-- `cargo test -p mote-server` — 49 tests (config, prompt, session, tools, llm)
-- `cargo test -p mote-client` — 33 tests (state machine, keybindings, suggestions)
+- `cargo test -p mote-server` — config, prompt, session, tools, llm tests
+- `cargo test -p mote-client` — state machine, keybindings, suggestions tests
 - Tests that spawn external tools (`rg`, `bash`) require those tools to be on `$PATH`.
 
 ## Config
@@ -57,6 +96,9 @@ Layers (in order):
 - `config.toml` and `keybindings.toml` live in `~/.config/mote/`. Templates are at the repo root.
 - The server loads `config.toml` for providers, prompts, and history.
 - The client loads `keybindings.toml` locally and fetches UI settings from the server via `GET /config`.
+- System prompts live in `prompts/system/`; built-in agent definitions live in `prompts/agents/`.
+- `[prompts].default` points to the single shared system prompt file, which defaults to `prompts/system/mote.md`.
+- `server.default_agent` controls which agent is used when a request omits an agent name, and which `/model <default-agent>` alias is reserved.
 
 ## Dependencies
 

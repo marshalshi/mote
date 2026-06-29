@@ -69,6 +69,8 @@ pub struct App {
     input_history_idx: Option<usize>,
 
     pub current_agent: String,
+    /// Agent name used when no agent is specified (from server config).
+    pub default_agent: String,
     pub agent_names: Vec<String>,
     /// Subagent names (agents available as subagent targets).
     pub subagent_names: Vec<String>,
@@ -98,6 +100,9 @@ pub struct App {
 
     /// Loading bar progress: Some(0.0..1.0) = active, None = idle.
     pub loading_progress: Option<f32>,
+
+    /// Short description of the current background activity.
+    pub loading_label: Option<String>,
 
     /// Server connection health.
     pub server_health: ServerHealth,
@@ -149,11 +154,34 @@ pub struct App {
     pub model_picker_items: Vec<ModelChoice>,
     pub model_picker_index: usize,
 
+    /// Login provider picker popup state.
+    pub login_picker_open: bool,
+    pub login_picker_items: Vec<LoginProviderChoice>,
+    pub login_picker_index: usize,
+
     /// Active session id to continue on next turns.
     pub active_session_id: Option<String>,
 
+    /// Persisted compacted context for older conversation turns.
+    pub compaction_state: Option<marshaling_protocol::CompactionState>,
+
+    /// Pending auto-compaction confirmation before sending the latest message.
+    pub pending_compact_confirmation: bool,
+
+    /// Resume sending the latest user message after auto-compaction confirmation.
+    pub pending_auto_compact_send: bool,
+
+    /// Latest message for which auto-compaction was declined.
+    compact_declined_for_message: Option<String>,
+
     /// Latest mouse position in terminal coordinates.
     pub mouse_position: Option<(u16, u16)>,
+
+    /// True when terminal-native text selection/copy mode is active.
+    pub selection_mode: bool,
+
+    /// Pending secure API-key entry after selecting a login provider.
+    pending_secret_login: Option<PendingSecretLogin>,
 }
 
 /// Tracks a running subagent's output for the multi-agent TUI.
@@ -179,8 +207,21 @@ pub struct PendingPermission {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSecretLogin {
+    provider: String,
+    display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelChoice {
     Model { provider: String, model_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginProviderChoice {
+    pub provider: String,
+    pub display_name: String,
+    pub key_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +237,7 @@ pub enum SlashAction {
     FetchModels,
     OpenSessions,
     LoadSession(String),
+    Compact { include_latest_user: bool },
     SaveCredential(String, String, String), // provider, key, value
     RollbackLast,
     RunShell(String),
@@ -211,14 +253,40 @@ pub enum AppState {
 
 // ── Built-in commands ─────────────────────────────────────
 
+const AUTO_COMPACT_CHAR_THRESHOLD: usize = 50_000;
+
+const LOGIN_PROVIDERS: &[(&str, &str, &str)] = &[
+    (
+        "deepseek",
+        "DeepSeek",
+        "https://platform.deepseek.com/api_keys",
+    ),
+    (
+        "glm",
+        "GLM (Z.ai)",
+        "https://z.ai/manage-apikey/apikey-list",
+    ),
+    (
+        "kimi",
+        "Kimi (Moonshot)",
+        "https://platform.kimi.ai/console/api-keys",
+    ),
+    (
+        "minimax",
+        "MiniMax",
+        "https://platform.minimax.io/user-center/basic-information/interface-key",
+    ),
+];
+
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help"),
-    ("/login", "Login to a provider (github)"),
+    ("/login", "Login to a provider"),
     ("/agent", "List or switch agents"),
     ("/tokens", "Show token usage"),
     ("/new", "Start a new session"),
     ("/sessions", "Open session picker"),
     ("/model", "Show / switch model"),
+    ("/compact", "Compact conversation context"),
     ("/subagents", "List active subagents"),
     ("/rollback", "Rollback last changes"),
 ];
@@ -258,8 +326,10 @@ impl App {
         let mut subagent_names: Vec<String> = ui_config.subagent_names.clone();
         subagent_names.sort();
         let mut agent_model_info = ui_config.agent_model_info.clone();
+        let default_agent = ui_config.default_agent.clone();
+        let input_accent = agent_accent_color(&default_agent);
         agent_model_info
-            .entry("default".into())
+            .entry(default_agent.clone())
             .or_insert_with(|| model_info.clone());
         Self {
             state: AppState::Idle,
@@ -269,7 +339,7 @@ impl App {
             scroll_offset: 0,
             auto_scroll: true,
             model_info: agent_model_info
-                .get("default")
+                .get(&default_agent)
                 .cloned()
                 .unwrap_or_else(|| model_info.clone()),
             default_model_info: model_info,
@@ -280,7 +350,7 @@ impl App {
             reasoning_buffer: String::new(),
             input_history: Vec::new(),
             input_history_idx: None,
-            current_agent: "default".into(),
+            current_agent: default_agent.clone(),
             agent_names,
             subagent_names,
             handled_slash_command: false,
@@ -289,11 +359,12 @@ impl App {
             tool_calls: Vec::new(),
             agent_model_overrides: HashMap::new(),
             models_cache: Vec::new(),
-            input_accent: agent_accent_color("default"),
+            input_accent,
             user_accent: parse_ui_color(&ui_config.user_accent),
             pending_slash: None,
             input_queue: VecDeque::new(),
             loading_progress: None,
+            loading_label: None,
             server_health: ServerHealth::Unknown,
             pending_permission: None,
             pending_permission_response: None,
@@ -303,6 +374,7 @@ impl App {
             current_subagent_index: None,
             pending_cancel: false,
             esc_cancel_deadline: None,
+            default_agent,
             workspace_root,
             repo_agents_md,
             runtime_session_key,
@@ -313,8 +385,17 @@ impl App {
             model_picker_open: false,
             model_picker_items: Vec::new(),
             model_picker_index: 0,
+            login_picker_open: false,
+            login_picker_items: Vec::new(),
+            login_picker_index: 0,
             active_session_id: None,
+            compaction_state: None,
+            pending_compact_confirmation: false,
+            pending_auto_compact_send: false,
+            compact_declined_for_message: None,
             mouse_position: None,
+            selection_mode: false,
+            pending_secret_login: None,
         }
     }
 
@@ -332,6 +413,32 @@ impl App {
 
     pub fn clear_esc_cancel_arm(&mut self) {
         self.esc_cancel_deadline = None;
+    }
+
+    pub fn selection_mode_blocked(&self) -> bool {
+        self.pending_compact_confirmation
+            || self.session_picker_open
+            || self.model_picker_open
+            || self.login_picker_open
+            || self.pending_permission.is_some()
+    }
+
+    pub fn selection_mode_block_reason(&self) -> Option<&'static str> {
+        if self.pending_compact_confirmation {
+            Some("Finish compact confirmation before entering selection mode.")
+        } else if self.session_picker_open {
+            Some("Close the session picker before entering selection mode.")
+        } else if self.model_picker_open {
+            Some("Close the model picker before entering selection mode.")
+        } else if self.login_picker_open {
+            Some("Close the login picker before entering selection mode.")
+        } else if self.pending_permission.is_some() {
+            Some(
+                "Resolve the permission prompt before entering selection mode.",
+            )
+        } else {
+            None
+        }
     }
 
     pub fn current_model_override(&self) -> Option<&AgentModelOverride> {
@@ -384,6 +491,14 @@ impl App {
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.auto_scroll = true;
+
+        if self.pending_secret_login.is_some() {
+            self.reset_suggestions();
+            self.handled_slash_command = true;
+            self.handle_secret_login_input(text);
+            return String::new();
+        }
+
         self.remember_input(&text);
 
         if self.handle_shell_input(&text) {
@@ -459,6 +574,33 @@ impl App {
         transformed
     }
 
+    fn handle_secret_login_input(&mut self, text: String) {
+        let Some(secret) =
+            (!text.trim().is_empty()).then_some(text.trim().to_string())
+        else {
+            self.push_command_message(
+                Role::Assistant,
+                "No API key entered. Login cancelled.",
+            );
+            self.pending_secret_login = None;
+            return;
+        };
+
+        let Some(pending) = self.pending_secret_login.take() else {
+            return;
+        };
+
+        self.push_command_message(
+            Role::Assistant,
+            format!("Saving {} API key...", pending.display_name),
+        );
+        self.pending_slash = Some(SlashAction::SaveCredential(
+            pending.provider,
+            "api_key".into(),
+            secret,
+        ));
+    }
+
     fn reset_suggestions(&mut self) {
         self.suggestions.clear();
         self.suggestion_index = 0;
@@ -467,6 +609,141 @@ impl App {
     fn push_command_message(&mut self, role: Role, content: impl Into<String>) {
         self.messages
             .push(DisplayMessage::command(role, content.into()));
+    }
+
+    pub fn compact_history_messages(
+        &self,
+        include_latest_user: bool,
+    ) -> Vec<marshaling_protocol::HistoryMessage> {
+        let compacted_count = self
+            .compaction_state
+            .as_ref()
+            .map(|c| c.compacted_message_count)
+            .unwrap_or(0);
+        let mut conversation_seen = 0usize;
+        self.messages
+            .iter()
+            .filter(|m| m.source == MessageSource::Conversation)
+            .filter_map(|m| {
+                conversation_seen += 1;
+                if conversation_seen <= compacted_count {
+                    return None;
+                }
+                if !include_latest_user
+                    && conversation_seen == self.conversation_message_count()
+                    && m.role == Role::User
+                {
+                    return None;
+                }
+                Some(marshaling_protocol::HistoryMessage {
+                    role: match m.role {
+                        Role::User => "user".into(),
+                        Role::Assistant => "assistant".into(),
+                    },
+                    content: m.content.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn apply_compaction(
+        &mut self,
+        session_id: String,
+        compaction: marshaling_protocol::CompactionState,
+    ) {
+        self.active_session_id = Some(session_id);
+        self.compaction_state = Some(compaction);
+        self.pending_compact_confirmation = false;
+        self.compact_declined_for_message = None;
+        self.push_command_message(
+            Role::Assistant,
+            "Conversation context compacted. Older turns will be sent as a summary.",
+        );
+    }
+
+    pub fn needs_auto_compact(&self) -> bool {
+        let Some(last_content) = self.pending_user_message_content() else {
+            return false;
+        };
+        if self.pending_compact_confirmation {
+            return false;
+        }
+        if self.compact_declined_for_message.as_deref() == Some(last_content) {
+            return false;
+        }
+        self.uncompacted_context_chars(false) > AUTO_COMPACT_CHAR_THRESHOLD
+    }
+
+    pub fn request_auto_compact_confirmation(&mut self) {
+        self.pending_compact_confirmation = true;
+        self.push_command_message(
+            Role::Assistant,
+            "Conversation context is getting large. Compact before sending? Press `Y` to compact and continue, or `N` to send without compacting. If you decline, the model may miss older details or exceed context limits.",
+        );
+    }
+
+    pub fn accept_auto_compact(&mut self) {
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = true;
+        self.pending_slash = Some(SlashAction::Compact {
+            include_latest_user: false,
+        });
+    }
+
+    pub fn deny_auto_compact(&mut self) {
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = true;
+        if let Some(content) = self.pending_user_message_content() {
+            self.compact_declined_for_message = Some(content.to_string());
+        }
+        self.push_command_message(
+            Role::Assistant,
+            "Continuing without compaction. Risk: the model may lose older context or hit token limits.",
+        );
+    }
+
+    pub fn suppress_auto_compact_for_latest_message(&mut self) {
+        if let Some(content) = self.pending_user_message_content() {
+            self.compact_declined_for_message = Some(content.to_string());
+        }
+    }
+
+    pub fn pending_user_message_content(&self) -> Option<&str> {
+        let latest_conversation = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.source == MessageSource::Conversation)?;
+
+        (latest_conversation.role == Role::User)
+            .then_some(latest_conversation.content.as_str())
+    }
+
+    fn conversation_message_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| m.source == MessageSource::Conversation)
+            .count()
+    }
+
+    fn uncompacted_conversation_message_count(
+        &self,
+        include_latest_user: bool,
+    ) -> usize {
+        self.compact_history_messages(include_latest_user).len()
+    }
+
+    fn uncompacted_context_chars(&self, include_latest_user: bool) -> usize {
+        self.compact_history_messages(include_latest_user)
+            .iter()
+            .map(|m| m.content.len())
+            .sum()
+    }
+
+    pub fn secret_input_prompt(&self) -> Option<&str> {
+        self.pending_secret_login
+            .as_ref()
+            .map(|p| p.display_name.as_str())
     }
 
     /// Transform `@name` mentions in the message into text the LLM will understand as subagent calls.
@@ -513,6 +790,7 @@ impl App {
             "/sessions" => self.handle_sessions_command(),
             "/models" => self.handle_models_command(),
             "/model" => self.handle_model_command(&parts),
+            "/compact" => self.handle_compact_command(),
             "/subagents" => self.handle_subagents_command(),
             "/rollback" => self.handle_rollback_command(&parts),
             _ => self.handle_unknown_command(cmd),
@@ -530,15 +808,17 @@ impl App {
                 "- `/new` — Start a new session",
                 "- `/sessions` — Open session picker",
                 "- `/model` — Show / switch model",
+                "- `/compact` — Compact older conversation context",
                 "- `/subagents` — List active subagents",
                 "- `/rollback last` — Rollback latest file changes",
-                "- `/login github <token>` — Save GitHub token",
-                "- `/login deepseek <key>` — Save DeepSeek API key",
+                "- `/login` — Show login providers",
+                "- `/login <provider> <key>` — Save provider API key",
                 "- `! <command>` — Run local shell command",
                 "",
                 "## Keybindings",
                 "- `Enter` — Send message",
                 "- `Alt+Enter` — Newline",
+                "- `F6` — Toggle selection mode for native terminal copy",
                 "- `Ctrl+A / Ctrl+E` — Line start / end",
                 "- `Ctrl+D` — Delete current char",
                 "- `Ctrl+K` — Clear current line",
@@ -579,58 +859,54 @@ impl App {
 
     fn handle_login_command(&mut self, parts: &[&str]) {
         let Some(provider) = parts.get(1).copied() else {
-            self.push_command_message(
-                Role::Assistant,
-                "Usage: /login github <token>  or  /login deepseek <api_key>",
-            );
+            self.open_login_picker();
             return;
         };
 
-        match provider {
-            "github" => self.handle_github_login_command(parts),
-            "deepseek" => self.handle_deepseek_login_command(parts),
-            _ => self.push_command_message(
+        if let Some((_, display_name, key_url)) = LOGIN_PROVIDERS
+            .iter()
+            .find(|(name, _, _)| *name == provider)
+        {
+            self.handle_api_key_login_command(
+                parts,
+                provider,
+                display_name,
+                key_url,
+            );
+        } else {
+            self.push_command_message(
                 Role::Assistant,
                 format!(
-                    "Unknown provider: {}. Supported: github, deepseek",
-                    provider
+                    "Unknown provider: {provider}.\n\n{}",
+                    login_provider_help()
                 ),
-            ),
+            );
         }
     }
 
-    fn handle_github_login_command(&mut self, parts: &[&str]) {
-        let Some(token) = parts.get(2) else {
-            self.push_command_message(
-                Role::Assistant,
-                "Usage: /login github <token>\nCreate a PAT at: https://github.com/settings/tokens?type=beta\nScope: models:read",
-            );
-            return;
-        };
-
-        self.push_command_message(Role::Assistant, "Saving GitHub token...");
-        self.pending_slash = Some(SlashAction::SaveCredential(
-            "github".into(),
-            "token".into(),
-            (*token).to_string(),
-        ));
-    }
-
-    fn handle_deepseek_login_command(&mut self, parts: &[&str]) {
+    fn handle_api_key_login_command(
+        &mut self,
+        parts: &[&str],
+        provider: &str,
+        display_name: &str,
+        key_url: &str,
+    ) {
         let Some(key) = parts.get(2) else {
             self.push_command_message(
                 Role::Assistant,
-                "Usage: /login deepseek <api_key>\nGet your key at: https://platform.deepseek.com/api_keys",
+                format!(
+                    "Usage: /login {provider} <api_key>\nGet your key at: {key_url}"
+                ),
             );
             return;
         };
 
         self.push_command_message(
             Role::Assistant,
-            "Saving DeepSeek API key...",
+            format!("Saving {display_name} API key..."),
         );
         self.pending_slash = Some(SlashAction::SaveCredential(
-            "deepseek".into(),
+            provider.into(),
             "api_key".into(),
             (*key).to_string(),
         ));
@@ -654,8 +930,33 @@ impl App {
         );
     }
 
+    fn handle_compact_command(&mut self) {
+        if self.state != AppState::Idle {
+            self.push_command_message(
+                Role::Assistant,
+                "Cannot compact while agent is running.",
+            );
+            return;
+        }
+        if self.uncompacted_conversation_message_count(true) == 0 {
+            self.push_command_message(
+                Role::Assistant,
+                "Nothing new to compact.",
+            );
+            return;
+        }
+        self.push_command_message(
+            Role::Assistant,
+            "Compacting older conversation context...",
+        );
+        self.pending_slash = Some(SlashAction::Compact {
+            include_latest_user: true,
+        });
+    }
+
     fn handle_agent_command(&mut self, parts: &[&str]) {
-        let all_agents = all_agent_names(&self.agent_names);
+        let all_agents =
+            all_agent_names(&self.agent_names, &self.default_agent);
         if parts.len() < 2 {
             self.messages.push(DisplayMessage {
                 role: Role::Assistant,
@@ -670,7 +971,9 @@ impl App {
         }
 
         let name = parts[1];
-        if name == "default" || self.agent_names.contains(&name.to_string()) {
+        if name == self.default_agent.as_str()
+            || self.agent_names.contains(&name.to_string())
+        {
             self.current_agent = name.to_string();
             self.input_accent = agent_accent_color(&self.current_agent);
             self.sync_current_agent_model_info();
@@ -703,10 +1006,13 @@ impl App {
         }
 
         let name = parts[1];
-        if name == "default" {
+        if name == self.default_agent.as_str() {
             self.push_command_message(
                 Role::Assistant,
-                "`/model default` was removed. Use `/model` and choose from the provider list.",
+                format!(
+                    "`/model {}` was removed. Use `/model` and choose from the provider list.",
+                    self.default_agent
+                ),
             );
             return;
         }
@@ -798,7 +1104,26 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.loading_progress = Some(0.0);
+        self.loading_label = None;
         self.current_skill = None;
+    }
+
+    pub fn start_background_activity(&mut self, label: impl Into<String>) {
+        self.state = AppState::WaitingResponse;
+        self.loading_progress = Some(0.0);
+        self.loading_label = Some(label.into());
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+    }
+
+    pub fn finish_background_activity(&mut self) {
+        if self.state == AppState::WaitingResponse {
+            self.state = AppState::Idle;
+        }
+        self.loading_progress = None;
+        self.loading_label = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
     }
 
     pub fn agent_text_delta(&mut self, chunk: &str) {
@@ -899,6 +1224,8 @@ impl App {
             self.stream_buffer.clear();
             self.tool_calls.clear();
             self.state = AppState::Idle;
+            self.loading_progress = None;
+            self.loading_label = None;
             return;
         }
         if !content.is_empty() {
@@ -919,6 +1246,8 @@ impl App {
         self.stream_buffer.clear();
         self.tool_calls.clear();
         self.state = AppState::Idle;
+        self.loading_progress = None;
+        self.loading_label = None;
     }
 
     /// Show an error message (used by start_agent on setup failure).
@@ -941,6 +1270,8 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.state = AppState::Idle;
+        self.loading_progress = None;
+        self.loading_label = None;
     }
 
     /// Queue a message for later processing (when agent is running).
@@ -1052,7 +1383,7 @@ impl App {
     }
 
     pub fn cycle_agent(&mut self) {
-        let names = all_agent_names(&self.agent_names);
+        let names = all_agent_names(&self.agent_names, &self.default_agent);
         if names.is_empty() {
             return;
         }
@@ -1107,6 +1438,65 @@ impl App {
 
     pub fn close_model_picker(&mut self) {
         self.model_picker_open = false;
+    }
+
+    pub fn open_login_picker(&mut self) {
+        self.login_picker_open = true;
+        self.login_picker_items = LOGIN_PROVIDERS
+            .iter()
+            .map(|(provider, display_name, key_url)| LoginProviderChoice {
+                provider: (*provider).to_string(),
+                display_name: (*display_name).to_string(),
+                key_url: (*key_url).to_string(),
+            })
+            .collect();
+        self.login_picker_index = 0;
+    }
+
+    pub fn close_login_picker(&mut self) {
+        self.login_picker_open = false;
+    }
+
+    pub fn login_picker_up(&mut self) {
+        if self.login_picker_items.is_empty() {
+            return;
+        }
+        if self.login_picker_index == 0 {
+            self.login_picker_index = self.login_picker_items.len() - 1;
+        } else {
+            self.login_picker_index -= 1;
+        }
+    }
+
+    pub fn login_picker_down(&mut self) {
+        if self.login_picker_items.is_empty() {
+            return;
+        }
+        self.login_picker_index =
+            (self.login_picker_index + 1) % self.login_picker_items.len();
+    }
+
+    pub fn selected_login_choice(&self) -> Option<LoginProviderChoice> {
+        self.login_picker_items
+            .get(self.login_picker_index)
+            .cloned()
+    }
+
+    pub fn apply_login_choice(&mut self, choice: LoginProviderChoice) {
+        self.pending_secret_login = Some(PendingSecretLogin {
+            provider: choice.provider.clone(),
+            display_name: choice.display_name.clone(),
+        });
+        self.input.clear();
+        self.input_cursor = 0;
+        self.reset_suggestions();
+        self.push_command_message(
+            Role::Assistant,
+            format!(
+                "Selected {}. Enter the API key securely, then press Enter.\nGet your key at: {}",
+                choice.display_name, choice.key_url
+            ),
+        );
     }
 
     pub fn model_picker_up(&mut self) {
@@ -1182,6 +1572,7 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.loading_progress = None;
+        self.loading_label = None;
         self.pending_permission = None;
         self.pending_permission_response = None;
         self.pending_cancel = false;
@@ -1197,10 +1588,16 @@ impl App {
         self.handled_slash_command = false;
         self.close_session_picker();
         self.close_model_picker();
+        self.close_login_picker();
+        self.pending_secret_login = None;
         self.scroll_to_bottom();
         self.tokens_input = 0;
         self.tokens_output = 0;
         self.active_run_id = None;
+        self.compaction_state = None;
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = false;
+        self.compact_declined_for_message = None;
     }
 
     pub fn start_new_session(&mut self) {
@@ -1210,6 +1607,7 @@ impl App {
         self.reasoning_buffer.clear();
         self.tool_calls.clear();
         self.loading_progress = None;
+        self.loading_label = None;
         self.pending_permission = None;
         self.pending_permission_response = None;
         self.pending_cancel = false;
@@ -1225,8 +1623,14 @@ impl App {
         self.handled_slash_command = false;
         self.close_session_picker();
         self.close_model_picker();
+        self.close_login_picker();
+        self.pending_secret_login = None;
         self.active_session_id = None;
         self.active_run_id = None;
+        self.compaction_state = None;
+        self.pending_compact_confirmation = false;
+        self.pending_auto_compact_send = false;
+        self.compact_declined_for_message = None;
         self.tokens_input = 0;
         self.tokens_output = 0;
         self.scroll_to_bottom();
@@ -1279,7 +1683,9 @@ impl App {
         if let Some(cmd) = input.split_whitespace().next() {
             let after = input[cmd.len()..].trim_start();
             if !after.is_empty() && (cmd == "/agent" || cmd == "/a") {
-                for name in all_agent_names(&self.agent_names) {
+                for name in
+                    all_agent_names(&self.agent_names, &self.default_agent)
+                {
                     if name.starts_with(after) {
                         self.suggestions.push(format!("/agent {}", name));
                     }
@@ -1338,11 +1744,25 @@ fn shell_command_from_input(text: &str) -> Option<String> {
         .map(|cmd| cmd.trim_start().to_string())
 }
 
-/// Returns all agent names including the built-in "default".
-fn all_agent_names(configured: &[String]) -> Vec<String> {
-    let mut names = vec!["default".to_string()];
-    names.extend(configured.iter().cloned());
+/// Returns all agent names including the built-in default agent.
+fn all_agent_names(configured: &[String], default_agent: &str) -> Vec<String> {
+    let mut names = vec![default_agent.to_string()];
+    for n in configured {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
     names
+}
+
+fn login_provider_help() -> String {
+    let mut lines = vec!["Select a provider to login:".to_string()];
+    for (name, display_name, key_url) in LOGIN_PROVIDERS {
+        lines.push(format!(
+            "- `/login {name} <api_key>` — {display_name} ({key_url})"
+        ));
+    }
+    lines.join("\n")
 }
 
 fn agent_accent_color(name: &str) -> Color {
@@ -1442,14 +1862,15 @@ mod tests {
 
     fn test_ui_config() -> marshaling_protocol::UiConfig {
         let mut agent_model_info = HashMap::new();
-        agent_model_info.insert("default".into(), "test/test-model".into());
+        agent_model_info.insert("build".into(), "test/test-model".into());
         marshaling_protocol::UiConfig {
             input_accent: "cyan".into(),
             user_accent: "cyan".into(),
-            agent_names: vec!["default".into()],
+            agent_names: vec!["build".into()],
             subagent_names: vec!["review".into()],
             model_info: "test/test-model".into(),
             agent_model_info,
+            default_agent: "build".into(),
         }
     }
 
@@ -1459,8 +1880,54 @@ mod tests {
         let app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.state, AppState::Idle);
         assert!(app.messages.is_empty());
-        assert_eq!(app.current_agent, "default");
+        assert_eq!(app.current_agent, "build");
         assert!(app.current_model_override().is_none());
+        assert!(!app.selection_mode);
+    }
+
+    #[test]
+    fn test_start_background_activity_sets_waiting_spinner_context() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        app.start_background_activity("compacting conversation");
+
+        assert_eq!(app.state, AppState::WaitingResponse);
+        assert_eq!(app.loading_progress, Some(0.0));
+        assert_eq!(
+            app.loading_label.as_deref(),
+            Some("compacting conversation")
+        );
+    }
+
+    #[test]
+    fn test_finish_background_activity_clears_waiting_state() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.start_background_activity("compacting conversation");
+        app.pending_cancel = true;
+
+        app.finish_background_activity();
+
+        assert_eq!(app.state, AppState::Idle);
+        assert!(app.loading_progress.is_none());
+        assert!(app.loading_label.is_none());
+        assert!(!app.pending_cancel);
+    }
+
+    #[test]
+    fn test_selection_mode_block_reason() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        assert!(!app.selection_mode_blocked());
+        assert_eq!(app.selection_mode_block_reason(), None);
+
+        app.session_picker_open = true;
+        assert!(app.selection_mode_blocked());
+        assert_eq!(
+            app.selection_mode_block_reason(),
+            Some("Close the session picker before entering selection mode.")
+        );
     }
 
     #[test]
@@ -1540,6 +2007,87 @@ mod tests {
     }
 
     #[test]
+    fn test_slash_compact_sets_pending_action() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.messages.push(DisplayMessage {
+            role: Role::User,
+            content: "older question".into(),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        app.input = "/compact".into();
+
+        app.submit_input();
+
+        assert!(matches!(
+            app.pending_slash,
+            Some(SlashAction::Compact {
+                include_latest_user: true
+            })
+        ));
+    }
+
+    #[test]
+    fn test_compact_history_skips_compacted_messages() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        for content in ["u1", "a1", "u2"] {
+            app.messages.push(DisplayMessage {
+                role: if content.starts_with('u') {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: content.into(),
+                thinking: None,
+                source: MessageSource::Conversation,
+            });
+        }
+        app.compaction_state = Some(marshaling_protocol::CompactionState {
+            summary: "u1/a1".into(),
+            compacted_message_count: 2,
+            model_provider: "test".into(),
+            model_id: "test-model".into(),
+        });
+
+        let history = app.compact_history_messages(false);
+
+        assert!(history.is_empty());
+        let history = app.compact_history_messages(true);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "u2");
+    }
+
+    #[test]
+    fn test_auto_compact_confirmation_flow() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.messages.push(DisplayMessage {
+            role: Role::Assistant,
+            content: "x".repeat(AUTO_COMPACT_CHAR_THRESHOLD + 1),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        app.messages.push(DisplayMessage {
+            role: Role::User,
+            content: "latest".into(),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+
+        assert!(app.needs_auto_compact());
+        app.request_auto_compact_confirmation();
+        assert!(app.pending_compact_confirmation);
+        assert_eq!(app.pending_user_message_content(), Some("latest"));
+        app.deny_auto_compact();
+        assert_eq!(app.compact_declined_for_message.as_deref(), Some("latest"));
+        assert!(app.pending_auto_compact_send);
+        assert_eq!(app.pending_user_message_content(), Some("latest"));
+        assert!(!app.needs_auto_compact());
+    }
+
+    #[test]
     fn test_slash_tokens() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -1584,8 +2132,8 @@ mod tests {
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.open_model_picker(vec![
             marshaling_protocol::ModelInfo {
-                provider: "github".into(),
-                model_id: "gpt-4o".into(),
+                provider: "kimi".into(),
+                model_id: "kimi-k2.6".into(),
             },
             marshaling_protocol::ModelInfo {
                 provider: "deepseek".into(),
@@ -1648,19 +2196,82 @@ mod tests {
     }
 
     #[test]
-    fn test_slash_login_github_saves_token() {
+    fn test_slash_login_kimi_saves_api_key() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.input = "/login github ghp_test".into();
+        app.input = "/login kimi sk_test".into();
 
         app.submit_input();
 
         assert!(matches!(
             app.pending_slash,
             Some(SlashAction::SaveCredential(ref provider, ref field, ref value))
-                if provider == "github" && field == "token" && value == "ghp_test"
+                if provider == "kimi" && field == "api_key" && value == "sk_test"
         ));
-        assert!(app.messages[0].content.contains("Saving GitHub token"));
+        assert!(app.messages[0].content.contains("Saving Kimi"));
+    }
+
+    #[test]
+    fn test_slash_login_without_provider_opens_picker() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "/login".into();
+
+        app.submit_input();
+
+        assert!(app.login_picker_open);
+        assert_eq!(app.login_picker_items.len(), LOGIN_PROVIDERS.len());
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn test_apply_login_choice_prefills_input() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        app.apply_login_choice(LoginProviderChoice {
+            provider: "glm".into(),
+            display_name: "GLM (Z.ai)".into(),
+            key_url: "https://z.ai/manage-apikey/apikey-list".into(),
+        });
+
+        assert_eq!(app.input, "");
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(app.secret_input_prompt(), Some("GLM (Z.ai)"));
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("Selected GLM"))
+        );
+    }
+
+    #[test]
+    fn test_secure_login_input_saves_without_echoing_secret() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.apply_login_choice(LoginProviderChoice {
+            provider: "kimi".into(),
+            display_name: "Kimi (Moonshot)".into(),
+            key_url: "https://platform.kimi.ai/console/api-keys".into(),
+        });
+        app.input = "sk_secret_value".into();
+        app.input_cursor = app.input.len();
+
+        let result = app.submit_input();
+
+        assert!(result.is_empty());
+        assert!(matches!(
+            app.pending_slash,
+            Some(SlashAction::SaveCredential(ref provider, ref field, ref value))
+                if provider == "kimi" && field == "api_key" && value == "sk_secret_value"
+        ));
+        assert!(app.input_history.is_empty());
+        assert!(app.secret_input_prompt().is_none());
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("sk_secret_value"))
+        );
     }
 
     #[test]
@@ -1693,22 +2304,22 @@ mod tests {
     fn test_slash_model_bare_name_uses_cached_provider() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.models_cache = vec![("github".into(), "gpt-4o".into())];
-        app.input = "/model gpt-4o".into();
+        app.models_cache = vec![("kimi".into(), "kimi-k2.6".into())];
+        app.input = "/model kimi-k2.6".into();
 
         app.submit_input();
 
         let ov = app.current_model_override().unwrap();
-        assert_eq!(ov.provider.as_deref(), Some("github"));
-        assert_eq!(ov.model_id, "gpt-4o");
-        assert_eq!(app.model_info, "github/gpt-4o");
+        assert_eq!(ov.provider.as_deref(), Some("kimi"));
+        assert_eq!(ov.model_id, "kimi-k2.6");
+        assert_eq!(app.model_info, "kimi/kimi-k2.6");
     }
 
     #[test]
     fn test_slash_model_default_is_removed() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.input = "/model default".into();
+        app.input = "/model build".into();
 
         app.submit_input();
 
@@ -1847,17 +2458,17 @@ mod tests {
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.input = "/agent".into();
         app.submit_input();
-        assert!(app.messages[0].content.contains("default"));
+        assert!(app.messages[0].content.contains("build"));
     }
 
     #[test]
     fn test_slash_agent_switch() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.input = "/agent default".into();
+        app.input = "/agent build".into();
         app.submit_input();
-        assert_eq!(app.current_agent, "default");
-        assert_eq!(app.input_accent, agent_accent_color("default"));
+        assert_eq!(app.current_agent, "build");
+        assert_eq!(app.input_accent, agent_accent_color("build"));
     }
 
     #[test]
@@ -1869,14 +2480,15 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
 
-        assert_eq!(app.input_accent, agent_accent_color("default"));
+        assert_eq!(app.input_accent, agent_accent_color("build"));
 
         app.cycle_agent();
         assert_eq!(app.current_agent, "plan");
@@ -2017,13 +2629,14 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        assert_eq!(app.current_agent, "default");
+        assert_eq!(app.current_agent, "build");
         app.cycle_agent();
         assert_eq!(app.current_agent, "plan");
         assert!(app.messages.is_empty());
@@ -2063,10 +2676,11 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.model_info, "test/test-model");
@@ -2075,7 +2689,7 @@ mod tests {
         assert_eq!(app.model_info, "deepseek/plan-model");
         app.cycle_agent();
         assert_eq!(app.current_agent, "review");
-        assert_eq!(app.model_info, "github/review-model");
+        assert_eq!(app.model_info, "kimi/review-model");
     }
 
     #[test]
@@ -2087,10 +2701,11 @@ mod tests {
             subagent_names: vec![],
             model_info: "test/test-model".into(),
             agent_model_info: HashMap::from([
-                ("default".into(), "test/test-model".into()),
+                ("build".into(), "test/test-model".into()),
                 ("plan".into(), "deepseek/plan-model".into()),
-                ("review".into(), "github/review-model".into()),
+                ("review".into(), "kimi/review-model".into()),
             ]),
+            default_agent: "build".into(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.cycle_agent();
@@ -2102,10 +2717,10 @@ mod tests {
 
         app.cycle_agent();
         assert_eq!(app.current_agent, "review");
-        assert_eq!(app.model_info, "github/review-model");
+        assert_eq!(app.model_info, "kimi/review-model");
 
         app.cycle_agent();
-        assert_eq!(app.current_agent, "default");
+        assert_eq!(app.current_agent, "build");
         assert_eq!(app.model_info, "test/test-model");
 
         app.cycle_agent();
@@ -2143,8 +2758,8 @@ mod tests {
     #[test]
     fn test_all_agent_names() {
         let configured = vec!["plan".into(), "review".into()];
-        let names = all_agent_names(&configured);
-        assert_eq!(names, vec!["default", "plan", "review"]);
+        let names = all_agent_names(&configured, "build");
+        assert_eq!(names, vec!["build", "plan", "review"]);
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{ChatMessage, Role, Usage};
+use marshaling_protocol::CompactionState;
 
 /// A single entry in the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -35,6 +36,9 @@ pub struct SessionMeta {
     /// Short summary of the conversation (first user message or auto-generated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Compacted context for older conversation turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionState>,
 }
 
 /// In-memory conversation session.
@@ -49,6 +53,8 @@ pub struct Session {
     pub tokens_output: u64,
     /// Short summary of the conversation.
     pub summary: Option<String>,
+    /// Compacted context for older conversation turns.
+    pub compaction: Option<CompactionState>,
 }
 
 impl Session {
@@ -66,6 +72,7 @@ impl Session {
             tokens_input: 0,
             tokens_output: 0,
             summary: None,
+            compaction: None,
         }
     }
 
@@ -81,6 +88,7 @@ impl Session {
             model_id: meta.model_id,
             messages,
             summary: meta.summary,
+            compaction: meta.compaction,
         }
     }
 
@@ -157,19 +165,7 @@ impl Session {
         // Generate summary from the first user message (5-10 words style)
         let summary = chat_history.iter().find_map(|msg| {
             if matches!(msg.role, crate::llm::Role::User) {
-                msg.content.as_ref().map(|c| {
-                    let trimmed: String = c.trim().replace('\n', " ");
-                    let words: Vec<&str> = trimmed
-                        .split_whitespace()
-                        .filter(|w| !w.is_empty())
-                        .collect();
-                    let take_n = 8usize;
-                    if words.len() > take_n {
-                        format!("{}...", words[..take_n].join(" "))
-                    } else {
-                        words.join(" ")
-                    }
-                })
+                msg.content.as_deref().and_then(summary_from_user_content)
             } else {
                 None
             }
@@ -184,7 +180,16 @@ impl Session {
             tokens_input,
             tokens_output,
             summary,
+            compaction: None,
         }
+    }
+
+    pub fn summary_from_messages(messages: &[Message]) -> Option<String> {
+        messages.iter().find_map(|msg| {
+            (msg.role == Role::User)
+                .then(|| summary_from_user_content(&msg.content))
+                .flatten()
+        })
     }
 
     /// Build session metadata for the history file.
@@ -199,8 +204,26 @@ impl Session {
             tokens_output: self.tokens_output,
             version: env!("CARGO_PKG_VERSION").to_string(),
             summary: self.summary.clone(),
+            compaction: self.compaction.clone(),
         }
     }
+}
+
+fn summary_from_user_content(content: &str) -> Option<String> {
+    let trimmed: String = content.trim().replace('\n', " ");
+    let words: Vec<&str> = trimmed
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let take_n = 8usize;
+    Some(if words.len() > take_n {
+        format!("{}...", words[..take_n].join(" "))
+    } else {
+        words.join(" ")
+    })
 }
 
 #[cfg(test)]
@@ -267,12 +290,19 @@ mod tests {
             tokens_output: 50,
             version: "0.1.0".into(),
             summary: None,
+            compaction: Some(CompactionState {
+                summary: "old context".into(),
+                compacted_message_count: 2,
+                model_provider: "ollama".into(),
+                model_id: "r1".into(),
+            }),
         };
         let msgs = vec![Message::new(Role::User, "Hello".into())];
         let s = Session::from_meta(meta, msgs);
         assert_eq!(s.id, "chat-test");
         assert_eq!(s.tokens_input, 100);
         assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.compaction.as_ref().unwrap().summary, "old context");
     }
 
     #[test]
@@ -299,5 +329,24 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].content, "please read");
         assert_eq!(session.messages[1].content, "done");
+    }
+
+    #[test]
+    fn test_summary_from_messages_uses_first_user_message() {
+        let messages = vec![
+            Message::new(Role::Assistant, "hello".into()),
+            Message::new(
+                Role::User,
+                "first line\nsecond line words here".into(),
+            ),
+            Message::new(Role::User, "later user".into()),
+        ];
+
+        let summary = Session::summary_from_messages(&messages);
+
+        assert_eq!(
+            summary.as_deref(),
+            Some("first line second line words here")
+        );
     }
 }

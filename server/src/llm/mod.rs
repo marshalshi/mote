@@ -261,7 +261,6 @@ pub trait LlmProvider: Send + Sync {
 }
 
 pub mod deepseek;
-pub mod github;
 pub mod ollama;
 
 /// Build a provider by name (useful when an agent overrides the provider).
@@ -274,12 +273,18 @@ pub fn build_provider_for(
         "deepseek" => {
             Ok(Box::new(deepseek::DeepSeekProvider::new(config, auth)?))
         }
-        "github" => {
-            Ok(Box::new(github::GitHubModelsProvider::new(config, auth)?))
+        "glm" => {
+            Ok(Box::new(deepseek::DeepSeekProvider::new_glm(config, auth)?))
         }
+        "kimi" => Ok(Box::new(deepseek::DeepSeekProvider::new_kimi(
+            config, auth,
+        )?)),
+        "minimax" => Ok(Box::new(deepseek::DeepSeekProvider::new_minimax(
+            config, auth,
+        )?)),
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(config, auth)?)),
         other => Err(anyhow::anyhow!(
-            "Unknown provider '{}'. Supported: deepseek, github, ollama",
+            "Unknown provider '{}'. Supported: deepseek, glm, kimi, minimax, ollama",
             other
         )),
     }

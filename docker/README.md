@@ -81,7 +81,9 @@ Secrets are stored in `~/.config/mote/auth.json` on the host. The container read
 ```bash
 ./docker/run.sh
 # Then in the TUI: /login deepseek <your-api-key>
-# Or: /login github
+# Or: /login glm <your-api-key>
+# Or: /login kimi <your-api-key>
+# Or: /login minimax <your-api-key>
 ```
 
 Credentials saved this way persist in `~/.config/mote/auth.json` on the host.
@@ -131,6 +133,6 @@ cargo run -- --tui --server-url http://127.0.0.1:9847
 ## Limitations
 
 - The container has no GPU access — Ollama GPU inference is not available sandboxed.
-- Network access works normally (needed for remote LLM APIs like DeepSeek, GitHub Models).
+- Network access works normally (needed for remote LLM APIs like DeepSeek, GLM, Kimi, and MiniMax).
 - The `bash` tool runs inside the container, so commands like `curl`, `git`, `cargo` are available if installed at build time.
 - File tool operations cannot escape the mounted workspace root.

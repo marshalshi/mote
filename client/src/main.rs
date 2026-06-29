@@ -10,6 +10,39 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:9847";
+const API_KEY_PROVIDERS: &[ProviderLogin] = &[
+    ProviderLogin {
+        name: "deepseek",
+        display_name: "DeepSeek",
+        key_url: "https://platform.deepseek.com/api_keys",
+        example_model: "deepseek/deepseek-v4-flash",
+    },
+    ProviderLogin {
+        name: "glm",
+        display_name: "GLM (Z.ai)",
+        key_url: "https://z.ai/manage-apikey/apikey-list",
+        example_model: "glm/glm-5.2",
+    },
+    ProviderLogin {
+        name: "kimi",
+        display_name: "Kimi (Moonshot)",
+        key_url: "https://platform.kimi.ai/console/api-keys",
+        example_model: "kimi/kimi-k2.6",
+    },
+    ProviderLogin {
+        name: "minimax",
+        display_name: "MiniMax",
+        key_url: "https://platform.minimax.io/user-center/basic-information/interface-key",
+        example_model: "minimax/MiniMax-M3",
+    },
+];
+
+struct ProviderLogin {
+    name: &'static str,
+    display_name: &'static str,
+    key_url: &'static str,
+    example_model: &'static str,
+}
 
 /// Mote — starts a local server and opens the TUI by default.
 #[derive(Parser, Debug)]
@@ -35,9 +68,9 @@ struct Cli {
     #[arg(short = 'r', long)]
     resume: Option<String>,
 
-    /// Login to a provider (e.g., github).
-    #[arg(short = 'L', long)]
-    login: Option<String>,
+    /// Login to a provider. Omit provider to choose interactively.
+    #[arg(short = 'L', long, num_args = 0..=1)]
+    login: Option<Option<String>>,
 
     /// Verbose logging.
     #[arg(short = 'v', long, global = true)]
@@ -126,20 +159,11 @@ async fn main() -> Result<()> {
 
     // Handle login first (no TUI needed)
     if let Some(provider) = &cli.login {
-        match provider.as_str() {
-            "github" => {
-                return login_github(&client).await;
-            }
-            "deepseek" => {
-                return login_deepseek(&client).await;
-            }
-            other => {
-                anyhow::bail!(
-                    "Unknown provider: {}. Supported: github, deepseek",
-                    other
-                );
-            }
-        }
+        let provider = match provider.as_deref() {
+            Some(name) => provider_login(name)?,
+            None => select_login_provider()?,
+        };
+        return login_api_key_provider(&client, provider).await;
     }
 
     // Fetch UI config from server
@@ -184,6 +208,8 @@ async fn main() -> Result<()> {
                         source: tui::state::MessageSource::Conversation,
                     });
                 }
+                app.compaction_state = session.compaction;
+                app.active_session_id = Some(session_id.clone());
                 tracing::info!(
                     "Resumed session {} with {} messages",
                     session_id,
@@ -334,13 +360,13 @@ fn command_exists(name: &str) -> bool {
 
 async fn single_message(
     client: &client::MoteClient,
-    _ui: &marshaling_protocol::UiConfig,
+    ui: &marshaling_protocol::UiConfig,
     msg: &str,
     workspace_ctx: &workspace::WorkspaceContext,
 ) -> Result<()> {
     let request = marshaling_protocol::ChatRequest {
         message: msg.to_string(),
-        agent: "default".into(),
+        agent: ui.default_agent.clone(),
         model_override: None,
         provider_override: None,
         history: vec![],
@@ -349,6 +375,7 @@ async fn single_message(
         repo_agents_md: workspace_ctx.repo_agents_md.clone(),
         runtime_session_key: Some(workspace_ctx.runtime_session_key.clone()),
         run_id: None,
+        compaction: None,
     };
     let mut stream = client
         .chat_stream(request)
@@ -381,77 +408,87 @@ async fn single_message(
     Ok(())
 }
 
-/// Save a GitHub PAT token to the server's auth.json.
-async fn login_github(client: &client::MoteClient) -> Result<()> {
-    println!();
-    println!("  🔑 GitHub Models Authentication");
-    println!();
-    println!(
-        "  GitHub Models requires a Personal Access Token with 'models:read' scope."
-    );
-    println!();
-    println!("  1. Go to:  https://github.com/settings/tokens?type=beta");
-    println!("  2. Click \"Generate new token\" → \"Fine-grained token\"");
-    println!("  3. Name: \"mote\", Expiration: 90 days");
-    println!("  4. Repository access: \"Public repositories only\"");
-    println!("  5. Account permissions → Models → Read");
-    println!("  6. Click \"Generate token\" and copy it");
-    println!();
-    print!("  Enter your GitHub token: ");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-
-    let mut token = String::new();
-    std::io::stdin().read_line(&mut token).ok();
-    let token = token.trim().to_string();
-
-    if token.is_empty() {
-        anyhow::bail!("No token entered.");
-    }
-
-    client
-        .save_credential("github", "token", &token)
-        .await
-        .context("Failed to save GitHub token")?;
-
-    println!();
-    println!("  ✅ GitHub token saved to ~/.config/mote/auth.json");
-    println!("  You can now use GitHub models.");
-    println!("  Switch with: /model github/gpt-4o-mini");
-    println!();
-    Ok(())
+fn provider_login(name: &str) -> Result<&'static ProviderLogin> {
+    API_KEY_PROVIDERS
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown provider: {}. Supported: {}",
+                name,
+                API_KEY_PROVIDERS
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
 }
 
-/// Save a DeepSeek API key to the server's auth.json.
-async fn login_deepseek(client: &client::MoteClient) -> Result<()> {
+fn select_login_provider() -> Result<&'static ProviderLogin> {
     println!();
-    println!("  🔑 DeepSeek API Key Setup");
+    println!("  Select provider to login:");
+    for (idx, provider) in API_KEY_PROVIDERS.iter().enumerate() {
+        println!(
+            "  {}. {} ({})",
+            idx + 1,
+            provider.display_name,
+            provider.name
+        );
+    }
     println!();
-    println!("  Get your API key at: https://platform.deepseek.com/api_keys");
-    println!();
-    print!("  Enter your DeepSeek API key: ");
+    print!("  Provider [1-{}]: ", API_KEY_PROVIDERS.len());
     use std::io::Write;
     std::io::stdout().flush().ok();
 
-    let mut key = String::new();
-    std::io::stdin().read_line(&mut key).ok();
-    let key = key.trim().to_string();
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice).ok();
+    let idx: usize = choice
+        .trim()
+        .parse()
+        .context("Invalid provider selection")?;
+    API_KEY_PROVIDERS
+        .get(idx.saturating_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("Provider selection out of range"))
+}
+
+/// Save a provider API key to the server's auth.json.
+async fn login_api_key_provider(
+    client: &client::MoteClient,
+    provider: &ProviderLogin,
+) -> Result<()> {
+    println!();
+    println!("  🔑 {} API Key Setup", provider.display_name);
+    println!();
+    println!("  Get your API key at: {}", provider.key_url);
+    println!();
+    print!("  Enter your {} API key: ", provider.display_name);
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+
+    let key = rpassword::read_password()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
     if key.is_empty() {
         anyhow::bail!("No API key entered.");
     }
-    if !key.starts_with("sk-") {
-        eprintln!("  Warning: DeepSeek API keys usually start with 'sk-'");
-    }
 
     client
-        .save_credential("deepseek", "api_key", &key)
+        .save_credential(provider.name, "api_key", &key)
         .await
-        .context("Failed to save DeepSeek API key")?;
+        .with_context(|| {
+            format!("Failed to save {} API key", provider.display_name)
+        })?;
 
     println!();
-    println!("  ✅ DeepSeek API key saved to ~/.config/mote/auth.json");
-    println!("  You can now use DeepSeek models.");
+    println!(
+        "  ✅ {} API key saved to ~/.config/mote/auth.json",
+        provider.display_name
+    );
+    println!("  You can now use {} models.", provider.display_name);
+    println!("  Switch with: /model {}", provider.example_model);
     println!();
     Ok(())
 }

@@ -17,12 +17,12 @@ docker build -f docker/Dockerfile -t mote:latest .
 
 ## How it works
 
-The image bundles the `mote-client` TUI and `mote-server` in a single container.  
+The image bundles the `mote-tui` frontend and `mote-server` in a single container.  
 When you run the container:
 
 1. Your chosen host directory is mounted at `/workspace` inside the container.
 2. Your `~/.config/mote/` directory is mounted at `/root/.config/mote/` (config, auth, history, agents, skills).
-3. `mote-client` starts in the foreground with the TUI, spawning `mote-server` automatically — just like the non-Docker flow.
+3. `mote-tui` starts in the foreground with the TUI, spawning `mote-server` automatically — just like the non-Docker flow.
 
 ## Building the image
 

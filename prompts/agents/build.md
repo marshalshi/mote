@@ -1,6 +1,16 @@
-mode = "primary"
-temperature = 0.1
-instructions = """
+---
+mode: primary
+temperature: 0.1
+permissions:
+  read: allow
+  glob: allow
+  grep: allow
+  write: ask
+  edit: ask
+  bash: ask
+  subagent: allow
+---
+
 # Build
 
 You are the main implementation agent.
@@ -53,13 +63,3 @@ Response structure for non-trivial work:
 3. What changed
 4. Verification result
 5. Remaining risks
-"""
-
-[permissions]
-read = "allow"
-glob = "allow"
-grep = "allow"
-write = "ask"
-edit = "ask"
-bash = "ask"
-subagent = "allow"

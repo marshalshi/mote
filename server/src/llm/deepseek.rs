@@ -380,6 +380,7 @@ impl LlmProvider for DeepSeekProvider {
             content,
             tool_calls,
             usage,
+            finish_reason: Some(choice.finish_reason),
             reasoning_content,
         })
     }
@@ -438,6 +439,7 @@ impl LlmProvider for DeepSeekProvider {
         let mut tool_call_acc: HashMap<usize, PendingToolCall> = HashMap::new();
         let mut usage = Usage::default();
         let mut saw_completion = false;
+        let mut finish_reason: Option<String> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -466,6 +468,7 @@ impl LlmProvider for DeepSeekProvider {
                                 &mut text_content,
                                 &mut tool_call_acc,
                                 usage,
+                                finish_reason.take(),
                                 &mut reasoning_content,
                             );
                             let _ = sender.send(Ok(StreamEvent::Done(result)));
@@ -525,6 +528,7 @@ impl LlmProvider for DeepSeekProvider {
                                 }
                                 // Handle finish_reason
                                 if let Some(ref reason) = choice.finish_reason {
+                                    finish_reason = Some(reason.clone());
                                     saw_completion |=
                                         finish_reason_signals_completion(
                                             reason,
@@ -556,6 +560,7 @@ impl LlmProvider for DeepSeekProvider {
                 &mut text_content,
                 &mut tool_call_acc,
                 usage,
+                finish_reason.take(),
                 &mut reasoning_content,
             );
             let _ = sender.send(Ok(StreamEvent::Done(result)));
@@ -883,6 +888,7 @@ fn finalize(
     text: &mut String,
     acc: &mut HashMap<usize, PendingToolCall>,
     usage: Usage,
+    finish_reason: Option<String>,
     reasoning: &mut Option<String>,
 ) -> ChatResult {
     let mut tool_calls: Vec<(usize, ToolCall)> = acc
@@ -919,6 +925,7 @@ fn finalize(
         content,
         tool_calls: tool_calls.into_iter().map(|(_, tc)| tc).collect(),
         usage,
+        finish_reason,
         reasoning_content,
     }
 }

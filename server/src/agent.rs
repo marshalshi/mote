@@ -42,6 +42,14 @@ fn advertised_tool_defs(
         .collect()
 }
 
+fn assistant_turn_is_finished(result: &ChatResult) -> bool {
+    result.tool_calls.is_empty()
+        && matches!(
+            result.finish_reason.as_deref(),
+            Some("stop" | "length" | "content_filter")
+        )
+}
+
 /// Events emitted by the agent loop to the TUI.
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -212,6 +220,20 @@ pub async fn run_loop(
             return;
         }
 
+        // Hard turn budget: stop before exceeding max_steps so a model that
+        // keeps emitting tool calls without finishing can't loop unbounded.
+        // Emits the "(max steps reached)" sentinel, which the client renders
+        // as a quiet stop (it goes idle without showing an assistant message).
+        if step > max_steps {
+            let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
+                content: "(max steps reached)".into(),
+                tokens_input: total_input,
+                tokens_output: total_output,
+                history,
+            }));
+            return;
+        }
+
         // ── Phase 1: Build messages and stream from LLM ─────────
 
         // Build messages: system + reminder + history
@@ -312,13 +334,23 @@ pub async fn run_loop(
         total_input += result.usage.prompt_tokens;
         total_output += result.usage.completion_tokens;
 
-        // Check for tool calls. A plain assistant message is not treated as a
-        // completed task anymore: the model must call the internal finish_task
-        // tool when it is actually done. This avoids stopping in the middle of
-        // work just because the model emitted prose without another tool call.
+        // Match OpenCode's stop semantics: only end the task when this
+        // assistant turn is actually finished *and* there is no pending tool
+        // work left to execute. Plain text alone is not sufficient because the
+        // model may still intend to continue on the next turn.
         if result.tool_calls.is_empty() {
+            let turn_finished = assistant_turn_is_finished(&result);
             let content = result.content.unwrap_or_default();
             history.push(ChatMessage::assistant_text(content.clone()));
+            if turn_finished {
+                let _ = events_tx.send(Ok(AgentEvent::Done {
+                    content,
+                    tokens_input: total_input,
+                    tokens_output: total_output,
+                    history,
+                }));
+                return;
+            }
             let _ = events_tx.send(Ok(AgentEvent::TurnDone {
                 text: content,
                 tool_calls: Vec::new(),
@@ -724,6 +756,7 @@ mod tests {
                     completion_tokens: 2,
                     total_tokens: 3,
                 },
+                finish_reason: Some("tool_calls".into()),
                 reasoning_content: None,
             })));
         }
@@ -859,6 +892,373 @@ mod tests {
             seen_tools.lock().unwrap().as_slice(),
             ["read", "finish_task"]
         );
+    }
+
+    struct ScriptedProvider {
+        calls: Arc<Mutex<usize>>,
+        responses: Arc<Mutex<std::collections::VecDeque<ChatResult>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+        ) -> Result<ChatResult> {
+            unreachable!("run_loop uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+            sender: tokio::sync::mpsc::UnboundedSender<Result<StreamEvent>>,
+        ) {
+            *self.calls.lock().unwrap() += 1;
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted response missing");
+            let _ = sender.send(Ok(StreamEvent::Done(response)));
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Emits a single (non-finish_task) tool call on every call, so the loop
+    /// would run forever without a hard step budget.
+    struct LoopingToolProvider {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for LoopingToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+        ) -> Result<ChatResult> {
+            unreachable!("run_loop uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+            sender: tokio::sync::mpsc::UnboundedSender<Result<StreamEvent>>,
+        ) {
+            let id = {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                format!("call_{}", *n)
+            };
+            let _ = sender.send(Ok(StreamEvent::Done(ChatResult {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id,
+                    call_type: "function".into(),
+                    function: ToolFunction {
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                finish_reason: Some("tool_calls".into()),
+                reasoning_content: None,
+            })));
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A text-only turn without a terminal finish reason is not enough to end
+    /// the task. The loop continues until an actual finish signal or the hard
+    /// step budget stops it.
+    #[tokio::test]
+    async fn test_run_loop_plain_text_without_finish_reason_continues() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [
+                    ChatResult {
+                        content: Some("working...".into()),
+                        tool_calls: Vec::new(),
+                        usage: Usage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                        },
+                        finish_reason: None,
+                        reasoning_content: None,
+                    },
+                    ChatResult {
+                        content: Some("still working...".into()),
+                        tool_calls: Vec::new(),
+                        usage: Usage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                        },
+                        finish_reason: None,
+                        reasoning_content: None,
+                    },
+                ],
+            ))),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let permissions = std::collections::HashMap::from([(
+            "read".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            2,
+            "/tmp".into(),
+        )
+        .await;
+
+        let mut saw_turn_done = 0;
+        let mut terminal = None;
+        while let Some(event) = events_rx.recv().await {
+            match event.unwrap() {
+                AgentEvent::TurnDone { .. } => saw_turn_done += 1,
+                AgentEvent::NeedsContinuation { content, .. } => {
+                    terminal = Some(content);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(saw_turn_done, 2);
+        assert_eq!(terminal.as_deref(), Some("(max steps reached)"));
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_terminal_finish_reason_ends_text_only_turn() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [ChatResult {
+                    content: Some("all done".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    },
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                }],
+            ))),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let permissions = std::collections::HashMap::from([(
+            "read".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            10,
+            "/tmp".into(),
+        )
+        .await;
+
+        let mut done_content = None;
+        while let Some(event) = events_rx.recv().await {
+            match event.unwrap() {
+                AgentEvent::Done { content, .. } => {
+                    done_content = Some(content);
+                    break;
+                }
+                AgentEvent::TurnDone { .. } => {
+                    panic!(
+                        "terminal finish reason should not continue the loop"
+                    )
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(done_content.as_deref(), Some("all done"));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    /// Even if a provider mislabels the finish reason as "stop", pending tool
+    /// calls keep the loop alive until the follow-up turn completes.
+    #[tokio::test]
+    async fn test_run_loop_tool_calls_override_terminal_finish_reason() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [
+                    ChatResult {
+                        content: Some("checking".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "call_read".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "read".into(),
+                                arguments: "{}".into(),
+                            },
+                        }],
+                        usage: Usage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                        },
+                        finish_reason: Some("stop".into()),
+                        reasoning_content: None,
+                    },
+                    ChatResult {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call_finish".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "finish_task".into(),
+                                arguments: r#"{"final_answer":"final answer"}"#
+                                    .into(),
+                            },
+                        }],
+                        usage: Usage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                        },
+                        finish_reason: Some("tool_calls".into()),
+                        reasoning_content: None,
+                    },
+                ],
+            ))),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(NamedTool("read")),
+            Box::new(NamedTool("finish_task")),
+        ]);
+        let permissions = std::collections::HashMap::from([
+            ("read".to_string(), crate::config::Permission::Allow),
+            ("finish_task".to_string(), crate::config::Permission::Allow),
+        ]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            10,
+            "/tmp".into(),
+        )
+        .await;
+
+        let mut done_content = None;
+        while let Some(event) = events_rx.recv().await {
+            if let AgentEvent::Done { content, .. } = event.unwrap() {
+                done_content = Some(content);
+                break;
+            }
+        }
+        assert_eq!(done_content.as_deref(), Some("final answer"));
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    /// A model that never finishes is stopped at the hard step budget, which
+    /// caps the number of LLM calls and emits the max-steps sentinel.
+    #[tokio::test]
+    async fn test_run_loop_hard_stops_at_max_steps() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let provider: Arc<dyn LlmProvider> = Arc::new(LoopingToolProvider {
+            calls: Arc::clone(&calls),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let permissions = std::collections::HashMap::from([(
+            "read".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let max_steps = 3usize;
+        run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "go".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            max_steps,
+            "/tmp".into(),
+        )
+        .await;
+
+        let mut needs_continuation = None;
+        while let Some(event) = events_rx.recv().await {
+            if let AgentEvent::NeedsContinuation { content, .. } =
+                event.unwrap()
+            {
+                needs_continuation = Some(content);
+                break;
+            }
+        }
+        assert_eq!(needs_continuation.as_deref(), Some("(max steps reached)"));
+        // The loop stops before the (max_steps + 1)th LLM call.
+        assert_eq!(*calls.lock().unwrap(), max_steps);
     }
 
     #[test]

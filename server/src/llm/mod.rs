@@ -168,6 +168,9 @@ pub struct ChatResult {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    /// Provider-reported reason this assistant turn ended.
+    /// Examples: "stop", "tool_calls", "length", "content_filter".
+    pub finish_reason: Option<String>,
     /// Reasoning/thinking content (DeepSeek r1, etc.)
     pub reasoning_content: Option<String>,
 }

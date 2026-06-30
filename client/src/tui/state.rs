@@ -1242,6 +1242,23 @@ impl App {
         self.stream_buffer.push_str(chunk);
     }
 
+    fn finalized_assistant_content(&self, content: &str) -> String {
+        let streamed = self.stream_buffer.as_str();
+        if streamed.is_empty() {
+            return content.to_string();
+        }
+        if content.is_empty()
+            || streamed == content
+            || streamed.contains(content)
+        {
+            return streamed.to_string();
+        }
+        if content.starts_with(streamed) {
+            return content.to_string();
+        }
+        format!("{}\n\n{}", streamed, content)
+    }
+
     pub fn agent_reasoning_delta(&mut self, chunk: &str) {
         self.reasoning_buffer.push_str(chunk);
     }
@@ -1340,10 +1357,11 @@ impl App {
             self.loading_label = None;
             return;
         }
-        if !content.is_empty() {
+        let final_content = self.finalized_assistant_content(content);
+        if !final_content.is_empty() {
             self.messages.push(DisplayMessage {
                 role: Role::Assistant,
-                content: content.to_string(),
+                content: final_content,
                 thinking,
                 source: MessageSource::Conversation,
             });
@@ -2936,6 +2954,37 @@ mod tests {
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.agent_done("(cancelled)");
         assert_eq!(app.messages.len(), 0);
+    }
+
+    #[test]
+    fn test_agent_done_preserves_streamed_content_over_shorter_final_text() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.stream_buffer = "full streamed output\nwith details".into();
+
+        app.agent_done("short summary");
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(
+            app.messages[0].content,
+            "full streamed output\nwith details\n\nshort summary"
+        );
+        assert!(app.stream_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_agent_done_keeps_streamed_content_when_final_text_is_subset() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.stream_buffer = "full streamed output with details".into();
+
+        app.agent_done("output with details");
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(
+            app.messages[0].content,
+            "full streamed output with details"
+        );
     }
 
     #[test]

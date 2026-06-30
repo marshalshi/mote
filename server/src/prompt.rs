@@ -357,7 +357,7 @@ pub fn build_system_reminder(ctx: &ReminderContext) -> String {
     };
 
     let guidance = if ctx.step == 1 {
-        "You are at the start of a task. Use the tools above to accomplish the user's request. When the request is fully complete, call finish_task with the final answer. Do not stop with plain text unless you are blocked."
+        "You are at the start of a task. Use the tools above to accomplish the user's request. When the request is fully complete, call finish_task with the final answer. Do not stop early if more tool work or follow-up reasoning is still needed."
     } else {
         "Continue the task based on these results. Do not repeat tool calls that already succeeded. When the request is fully complete, call finish_task with the final answer."
     };

@@ -1039,10 +1039,10 @@ fn render_markdown_table(
             lines.push(Line::from(spans));
         }
 
-        if row.is_header {
-            lines.push(border_line('├', '─', '┼', '┤'));
-        } else if row_idx + 1 == table.rows.len() {
+        if row_idx + 1 == table.rows.len() {
             lines.push(border_line('└', '─', '┴', '┘'));
+        } else {
+            lines.push(border_line('├', '─', '┼', '┤'));
         }
     }
 
@@ -2512,6 +2512,8 @@ mod tests {
         assert!(joined.contains("Name"), "table output:\n{joined}");
         assert!(joined.contains("Ada"), "table output:\n{joined}");
         assert!(joined.contains("Grace"), "table output:\n{joined}");
+        assert_eq!(joined.matches('├').count(), 2, "table output:\n{joined}");
+        assert_eq!(joined.matches('┼').count(), 2, "table output:\n{joined}");
     }
 
     #[test]

@@ -1589,26 +1589,36 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
 
 // ── Response area ───────────────────────────────────────
 
-fn render_response_area(frame: &mut Frame, area: Rect, app: &App) {
+fn render_response_area(frame: &mut Frame, area: Rect, app: &mut App) {
     if is_welcome_empty_state(app) {
         render_welcome_screen(frame, area, app);
         return;
     }
     let content_width = area.width.saturating_sub(7) as usize; // 4 for accent bar + 2 right padding + 1 scrollbar
-    let lines = if let Some(idx) = app.current_subagent_index {
-        if let Some(sv) = app.subagent_views.get(idx) {
-            build_subagent_lines(
-                sv,
-                content_width,
-                idx,
-                app.subagent_views.len(),
-            )
+    let subagent_index = app.current_subagent_index;
+    if app
+        .cached_response_lines(content_width, subagent_index)
+        .is_none()
+    {
+        let lines = if let Some(idx) = subagent_index {
+            if let Some(sv) = app.subagent_views.get(idx) {
+                build_subagent_lines(
+                    sv,
+                    content_width,
+                    idx,
+                    app.subagent_views.len(),
+                )
+            } else {
+                build_lines(app, content_width)
+            }
         } else {
             build_lines(app, content_width)
-        }
-    } else {
-        build_lines(app, content_width)
-    };
+        };
+        app.store_response_lines_cache(content_width, subagent_index, lines);
+    }
+    let lines = app
+        .cached_response_lines(content_width, subagent_index)
+        .unwrap_or(&[]);
     let available_height = area.height.saturating_sub(1) as usize;
     let total_lines = lines.len();
     let max_scroll = if total_lines > available_height {
@@ -1621,10 +1631,11 @@ fn render_response_area(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         max_scroll.saturating_sub(app.scroll_offset)
     };
-    let visible: Vec<Line> = if total_lines > scroll {
-        lines[scroll..].to_vec()
+    let end = (scroll + available_height).min(total_lines);
+    let visible: Vec<Line> = if scroll < end {
+        lines[scroll..end].to_vec()
     } else {
-        lines
+        Vec::new()
     };
     let text = Text::from(visible);
     let paragraph = Paragraph::new(text); // no wrap — we already pre-wrapped

@@ -1,7 +1,7 @@
 use crate::llm::Role;
 use crate::slash_command::{CustomCommandInvocation, CustomSlashCommand};
 use marshaling_protocol::{ModelInfo, ToolCallDisplay, ToolStatus};
-use ratatui::style::Color;
+use ratatui::{style::Color, text::Line};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -188,6 +188,16 @@ pub struct App {
 
     /// Pending secure API-key entry after selecting a login provider.
     pending_secret_login: Option<PendingSecretLogin>,
+
+    response_render_revision: u64,
+    response_render_cache: Option<ResponseRenderCache>,
+}
+
+struct ResponseRenderCache {
+    width: usize,
+    revision: u64,
+    subagent_index: Option<usize>,
+    lines: Vec<Line<'static>>,
 }
 
 /// Tracks a running subagent's output for the multi-agent TUI.
@@ -260,7 +270,7 @@ pub enum AppState {
 
 // ── Built-in commands ─────────────────────────────────────
 
-const AUTO_COMPACT_CHAR_THRESHOLD: usize = 50_000;
+const AUTO_COMPACT_CHAR_THRESHOLD: usize = 100_000;
 
 const LOGIN_PROVIDERS: &[(&str, &str, &str)] = &[
     (
@@ -406,7 +416,57 @@ impl App {
             mouse_position: None,
             selection_mode: false,
             pending_secret_login: None,
+            response_render_revision: 0,
+            response_render_cache: None,
         }
+    }
+
+    fn invalidate_response_render_cache(&mut self) {
+        self.response_render_revision =
+            self.response_render_revision.wrapping_add(1);
+        self.response_render_cache = None;
+    }
+
+    pub(crate) fn touch_response_render(&mut self) {
+        self.invalidate_response_render_cache();
+    }
+
+    pub(crate) fn cached_response_lines(
+        &self,
+        width: usize,
+        subagent_index: Option<usize>,
+    ) -> Option<&[Line<'static>]> {
+        self.response_render_cache.as_ref().and_then(|cache| {
+            (cache.width == width
+                && cache.revision == self.response_render_revision
+                && cache.subagent_index == subagent_index)
+                .then_some(cache.lines.as_slice())
+        })
+    }
+
+    pub(crate) fn store_response_lines_cache(
+        &mut self,
+        width: usize,
+        subagent_index: Option<usize>,
+        lines: Vec<Line<'static>>,
+    ) {
+        self.response_render_cache = Some(ResponseRenderCache {
+            width,
+            revision: self.response_render_revision,
+            subagent_index,
+            lines,
+        });
+    }
+
+    pub(crate) fn has_running_tool_animation(&self) -> bool {
+        self.tool_calls
+            .iter()
+            .any(|tc| matches!(tc.status, ToolStatus::Running))
+            || self.subagent_views.iter().any(|sv| {
+                sv.tool_calls
+                    .iter()
+                    .any(|tc| matches!(tc.status, ToolStatus::Running))
+            })
     }
 
     pub fn esc_cancel_step(&mut self) -> bool {
@@ -595,6 +655,7 @@ impl App {
         // Clear stream/resoning buffers for the new turn
         self.stream_buffer.clear();
         self.reasoning_buffer.clear();
+        self.invalidate_response_render_cache();
         transformed
     }
 
@@ -616,6 +677,7 @@ impl App {
         });
         self.stream_buffer.clear();
         self.reasoning_buffer.clear();
+        self.invalidate_response_render_cache();
     }
 
     fn handle_secret_login_input(&mut self, text: String) {
@@ -653,6 +715,7 @@ impl App {
     fn push_command_message(&mut self, role: Role, content: impl Into<String>) {
         self.messages
             .push(DisplayMessage::command(role, content.into()));
+        self.invalidate_response_render_cache();
     }
 
     pub fn set_custom_commands(
@@ -899,12 +962,7 @@ impl App {
                 format!("- `/{}` — {}", command.name, description)
             }));
         }
-        self.messages.push(DisplayMessage {
-            role: Role::Assistant,
-            content: lines.join("\n"),
-            thinking: None,
-            source: MessageSource::Command,
-        });
+        self.push_command_message(Role::Assistant, lines.join("\n"));
     }
 
     fn custom_command_invocation(
@@ -1070,15 +1128,13 @@ impl App {
         let all_agents =
             all_agent_names(&self.agent_names, &self.default_agent);
         if parts.len() < 2 {
-            self.messages.push(DisplayMessage {
-                role: Role::Assistant,
-                content: format!(
+            self.push_command_message(
+                Role::Assistant,
+                format!(
                     "Available agents:\n  {}\nType /agent <name> to switch.",
                     all_agents.join("\n  ")
                 ),
-                thinking: None,
-                source: MessageSource::Command,
-            });
+            );
             return;
         }
 
@@ -1107,12 +1163,10 @@ impl App {
 
     fn handle_model_command(&mut self, parts: &[&str]) {
         if parts.len() < 2 {
-            self.messages.push(DisplayMessage {
-                role: Role::Assistant,
-                content: "Fetching available models...".into(),
-                thinking: None,
-                source: MessageSource::Command,
-            });
+            self.push_command_message(
+                Role::Assistant,
+                "Fetching available models...",
+            );
             self.pending_slash = Some(SlashAction::FetchModels);
             return;
         }
@@ -1218,6 +1272,7 @@ impl App {
         self.loading_progress = Some(0.0);
         self.loading_label = None;
         self.current_skill = None;
+        self.invalidate_response_render_cache();
     }
 
     pub fn start_background_activity(&mut self, label: impl Into<String>) {
@@ -1240,10 +1295,29 @@ impl App {
 
     pub fn agent_text_delta(&mut self, chunk: &str) {
         self.stream_buffer.push_str(chunk);
+        self.invalidate_response_render_cache();
+    }
+
+    fn finalized_assistant_content(&self, content: &str) -> String {
+        let streamed = self.stream_buffer.as_str();
+        if streamed.is_empty() {
+            return content.to_string();
+        }
+        if content.is_empty()
+            || streamed == content
+            || streamed.contains(content)
+        {
+            return streamed.to_string();
+        }
+        if content.starts_with(streamed) {
+            return content.to_string();
+        }
+        format!("{}\n\n{}", streamed, content)
     }
 
     pub fn agent_reasoning_delta(&mut self, chunk: &str) {
         self.reasoning_buffer.push_str(chunk);
+        self.invalidate_response_render_cache();
     }
 
     pub fn agent_tool_started(&mut self, id: &str, name: &str) {
@@ -1253,6 +1327,7 @@ impl App {
             status: ToolStatus::Running,
             changes: Vec::new(),
         });
+        self.invalidate_response_render_cache();
     }
 
     pub fn agent_tool_completed(
@@ -1265,12 +1340,14 @@ impl App {
             tc.status = ToolStatus::Success;
             tc.changes = changes.to_vec();
         }
+        self.invalidate_response_render_cache();
     }
 
     pub fn agent_tool_failed(&mut self, id: &str, error: &str) {
         if let Some(tc) = self.tool_calls.iter_mut().find(|t| t.id == id) {
             tc.status = ToolStatus::Failed(error.to_string());
         }
+        self.invalidate_response_render_cache();
     }
 
     /// Called at the end of each agent turn. Saves the intermediate text
@@ -1311,6 +1388,7 @@ impl App {
         }
         self.stream_buffer.clear();
         self.tool_calls.clear();
+        self.invalidate_response_render_cache();
     }
 
     /// Called when the agent loop finishes entirely.
@@ -1338,12 +1416,14 @@ impl App {
             self.state = AppState::Idle;
             self.loading_progress = None;
             self.loading_label = None;
+            self.invalidate_response_render_cache();
             return;
         }
-        if !content.is_empty() {
+        let final_content = self.finalized_assistant_content(content);
+        if !final_content.is_empty() {
             self.messages.push(DisplayMessage {
                 role: Role::Assistant,
-                content: content.to_string(),
+                content: final_content,
                 thinking,
                 source: MessageSource::Conversation,
             });
@@ -1360,6 +1440,7 @@ impl App {
         self.state = AppState::Idle;
         self.loading_progress = None;
         self.loading_label = None;
+        self.invalidate_response_render_cache();
     }
 
     /// Show an error message (used by start_agent on setup failure).
@@ -1385,6 +1466,7 @@ impl App {
         self.state = AppState::Idle;
         self.loading_progress = None;
         self.loading_label = None;
+        self.invalidate_response_render_cache();
     }
 
     /// Queue a message for later processing (when agent is running).
@@ -1655,6 +1737,7 @@ impl App {
                         self.current_agent
                     ),
                 ));
+                self.invalidate_response_render_cache();
             }
         }
     }
@@ -1712,6 +1795,7 @@ impl App {
         self.pending_compact_confirmation = false;
         self.pending_auto_compact_send = false;
         self.compact_declined_for_message = None;
+        self.invalidate_response_render_cache();
     }
 
     pub fn start_new_session(&mut self) {
@@ -1753,6 +1837,7 @@ impl App {
             Role::Assistant,
             "Started a new session.".into(),
         ));
+        self.invalidate_response_render_cache();
     }
 
     /// Scroll up: increase offset from bottom to see OLDER content above.
@@ -2936,6 +3021,37 @@ mod tests {
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.agent_done("(cancelled)");
         assert_eq!(app.messages.len(), 0);
+    }
+
+    #[test]
+    fn test_agent_done_preserves_streamed_content_over_shorter_final_text() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.stream_buffer = "full streamed output\nwith details".into();
+
+        app.agent_done("short summary");
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(
+            app.messages[0].content,
+            "full streamed output\nwith details\n\nshort summary"
+        );
+        assert!(app.stream_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_agent_done_keeps_streamed_content_when_final_text_is_subset() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.stream_buffer = "full streamed output with details".into();
+
+        app.agent_done("output with details");
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(
+            app.messages[0].content,
+            "full streamed output with details"
+        );
     }
 
     #[test]

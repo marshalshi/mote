@@ -151,6 +151,8 @@ impl LlmProvider for OllamaProvider {
             total_tokens: 0,
         };
 
+        let had_tool_calls = completion.message.tool_calls.is_some();
+        let content = completion.message.content;
         let tool_calls = completion
             .message
             .tool_calls
@@ -172,9 +174,14 @@ impl LlmProvider for OllamaProvider {
             .collect();
 
         Ok(ChatResult {
-            content: completion.message.content,
+            content,
             tool_calls,
             usage,
+            finish_reason: Some(if had_tool_calls {
+                "tool_calls".into()
+            } else {
+                "stop".into()
+            }),
             reasoning_content: None,
         })
     }
@@ -368,6 +375,11 @@ fn finalize_ollama(
     };
     ChatResult {
         content,
+        finish_reason: Some(if calls.is_empty() {
+            "stop".into()
+        } else {
+            "tool_calls".into()
+        }),
         tool_calls: calls,
         usage,
         reasoning_content: None,

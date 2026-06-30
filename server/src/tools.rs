@@ -29,6 +29,7 @@ fn truncate_output(output: String) -> String {
 }
 
 const MAX_DIFF_LINES_PER_FILE: usize = 40;
+const DIFF_CONTEXT_LINES: usize = 3;
 
 fn result_no_changes(output: String) -> ToolExecutionResult {
     ToolExecutionResult {
@@ -55,23 +56,26 @@ fn compute_modified_file_change(
     }
     let mut lines: Vec<DiffLine> = Vec::new();
     let mut truncated = false;
-    for change in
-        similar::TextDiff::from_lines(before, after).iter_all_changes()
-    {
-        if lines.len() >= MAX_DIFF_LINES_PER_FILE {
-            truncated = true;
-            break;
+    let diff = similar::TextDiff::from_lines(before, after);
+    'groups: for group in diff.grouped_ops(DIFF_CONTEXT_LINES) {
+        for op in group {
+            for change in diff.iter_changes(&op) {
+                if lines.len() >= MAX_DIFF_LINES_PER_FILE {
+                    truncated = true;
+                    break 'groups;
+                }
+                let kind = match change.tag() {
+                    similar::ChangeTag::Delete => DiffLineKind::Removed,
+                    similar::ChangeTag::Insert => DiffLineKind::Added,
+                    similar::ChangeTag::Equal => DiffLineKind::Context,
+                };
+                let mut content = change.to_string();
+                if content.ends_with('\n') {
+                    content.pop();
+                }
+                lines.push(DiffLine { kind, content });
+            }
         }
-        let kind = match change.tag() {
-            similar::ChangeTag::Delete => DiffLineKind::Removed,
-            similar::ChangeTag::Insert => DiffLineKind::Added,
-            similar::ChangeTag::Equal => DiffLineKind::Context,
-        };
-        let mut content = change.to_string();
-        if content.ends_with('\n') {
-            content.pop();
-        }
-        lines.push(DiffLine { kind, content });
     }
     Some(FileChange {
         path: path.to_string_lossy().to_string(),
@@ -1466,6 +1470,39 @@ mod tests {
         let result = EditTool::new(ws_path).execute(serde_json::json!({"file_path": "edit.txt", "old_string": "baz qux", "new_string": "z"})).await.unwrap();
         assert_eq!(result.changes.len(), 1);
         assert!(matches!(result.changes[0].kind, FileChangeKind::Modified));
+    }
+
+    #[tokio::test]
+    async fn test_edit_diff_focuses_changed_hunk_after_long_context() {
+        let (_d, ws) = tmp_workspace();
+        let f = ws.join("long.txt");
+        let mut content = String::new();
+        for i in 0..80 {
+            content.push_str(&format!("context {i}\n"));
+        }
+        content.push_str("target line\n");
+        std::fs::write(&f, content).unwrap();
+
+        let tool = EditTool::new(ws);
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "long.txt",
+                "old_string": "target line",
+                "new_string": "replacement line"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.changes.len(), 1);
+        let diff_lines = &result.changes[0].diff_lines;
+        assert!(diff_lines.iter().any(|line| {
+            matches!(line.kind, DiffLineKind::Removed)
+                && line.content == "target line"
+        }));
+        assert!(diff_lines.iter().any(|line| {
+            matches!(line.kind, DiffLineKind::Added)
+                && line.content == "replacement line"
+        }));
     }
 
     #[tokio::test]

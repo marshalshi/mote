@@ -105,6 +105,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                                     thinking: None,
                                     source: self::state::MessageSource::Conversation,
                                 });
+                                app.touch_response_render();
                             }
                             chat_stream = None;
                             app.state = AppState::Idle;
@@ -342,6 +343,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     }
                 }
             }
+            app.touch_response_render();
         }
 
         // Send pending permission response if any
@@ -452,6 +454,7 @@ fn start_compaction(
             crate::llm::Role::Assistant,
             "Nothing new to compact.".into(),
         ));
+        app.touch_response_render();
         return;
     }
 
@@ -499,6 +502,7 @@ fn handle_background_event(app: &mut App, event: BackgroundEvent) {
                         thinking: None,
                         source: self::state::MessageSource::Error,
                     });
+                    app.touch_response_render();
                 }
             }
         }
@@ -506,7 +510,8 @@ fn handle_background_event(app: &mut App, event: BackgroundEvent) {
 }
 
 fn should_animate_loading(app: &App, chat_stream_active: bool) -> bool {
-    app.loading_progress.is_some() || chat_stream_active
+    app.loading_progress.is_some()
+        || (chat_stream_active && app.has_running_tool_animation())
 }
 
 fn build_chat_request(
@@ -607,6 +612,7 @@ fn handle_server_event(
                     args: args.to_string(),
                     confirming_always: false,
                 });
+                app.touch_response_render();
             }
         }
         ServerEvent::SkillsLoaded { .. } => {
@@ -626,11 +632,13 @@ fn handle_server_event(
                 done: false,
                 content: String::new(),
             });
+            app.touch_response_render();
         }
         ServerEvent::SubagentTextDelta { id, data } => {
             if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
             {
                 sv.stream_buffer.push_str(&data);
+                app.touch_response_render();
             } else {
                 tracing::warn!("SubagentTextDelta for unknown id: {}", id);
             }
@@ -639,6 +647,7 @@ fn handle_server_event(
             if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
             {
                 sv.reasoning_buffer.push_str(&data);
+                app.touch_response_render();
             } else {
                 tracing::warn!("SubagentReasoningDelta for unknown id: {}", id);
             }
@@ -656,6 +665,7 @@ fn handle_server_event(
                     status: marshaling_protocol::ToolStatus::Running,
                     changes: Vec::new(),
                 });
+                app.touch_response_render();
             } else {
                 tracing::warn!("SubagentToolStarted for unknown id: {}", id);
             }
@@ -673,6 +683,7 @@ fn handle_server_event(
                 {
                     tc.status = marshaling_protocol::ToolStatus::Success;
                     tc.changes = changes;
+                    app.touch_response_render();
                 }
             } else {
                 tracing::warn!("SubagentToolCompleted for unknown id: {}", id);
@@ -685,6 +696,7 @@ fn handle_server_event(
                     sv.tool_calls.iter_mut().find(|t| t.id == sub_id)
                 {
                     tc.status = marshaling_protocol::ToolStatus::Failed(error);
+                    app.touch_response_render();
                 }
             } else {
                 tracing::warn!("SubagentToolFailed for unknown id: {}", id);
@@ -713,6 +725,7 @@ fn handle_server_event(
                     thinking: None,
                     source: self::state::MessageSource::Conversation,
                 });
+                app.touch_response_render();
             }
         }
         ServerEvent::Done {
@@ -748,6 +761,7 @@ fn handle_server_event(
                     thinking: None,
                     source: self::state::MessageSource::Conversation,
                 });
+                app.touch_response_render();
             }
         }
         ServerEvent::RollbackResult {
@@ -779,6 +793,7 @@ fn handle_server_event(
                     self::state::MessageSource::Error
                 },
             });
+            app.touch_response_render();
         }
         ServerEvent::Error { message } => {
             app.pending_permission = None;
@@ -1654,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_animate_loading_when_chat_stream_active() {
+    fn test_should_not_animate_for_chat_stream_without_running_tools() {
         let cfg = test_ui_config();
         let app = App::new_with_workspace(
             &cfg,
@@ -1664,6 +1679,21 @@ mod tests {
             "runtime-key".into(),
         );
 
+        assert!(!should_animate_loading(&app, true));
+    }
+
+    #[test]
+    fn test_should_animate_for_chat_stream_with_running_tool() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+
+        app.agent_tool_started("tool-1", "read");
         assert!(should_animate_loading(&app, true));
     }
 

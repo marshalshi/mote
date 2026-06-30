@@ -108,9 +108,16 @@ impl ChatMessage {
     }
 
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self::assistant_tool_calls_with_content(calls, None)
+    }
+
+    pub fn assistant_tool_calls_with_content(
+        calls: Vec<ToolCall>,
+        content: Option<String>,
+    ) -> Self {
         Self {
             role: Role::Assistant,
-            content: None,
+            content,
             tool_calls: Some(calls),
             tool_call_id: None,
             reasoning_content: None,

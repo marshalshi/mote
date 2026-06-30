@@ -184,8 +184,8 @@ pub struct ServerConfig {
     /// Port to listen on (default: 9847).
     #[serde(default = "default_server_port")]
     pub port: u16,
-    /// Soft reminder budget shown to the agent loop (default: 10). The loop
-    /// keeps running until explicit finish_task or user cancellation.
+    /// Normal tool-capable turn budget before a text-only finalization step
+    /// (default: 30).
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
     /// Agent name used when no agent is specified (default: "build").
@@ -197,7 +197,7 @@ fn default_server_port() -> u16 {
     9847
 }
 fn default_max_steps() -> usize {
-    10
+    30
 }
 fn default_agent_name() -> String {
     marshaling_protocol::DEFAULT_AGENT_NAME.into()
@@ -1349,7 +1349,7 @@ base_url = "http://localhost:11434"
 "#,
         )
         .unwrap();
-        assert_eq!(config.server.max_steps, 10);
+        assert_eq!(config.server.max_steps, 30);
     }
 
     #[test]

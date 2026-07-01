@@ -752,17 +752,9 @@ fn handle_server_event(
             app.loading_progress = None;
             app.clear_pending_command_overrides();
             *chat_stream = None;
-            // Auto-dequeue: if there are queued messages, add one as a user message
-            if !app.input_queue.is_empty() {
-                let next = app.input_queue.pop_front().unwrap();
-                app.messages.push(self::state::DisplayMessage {
-                    role: crate::llm::Role::User,
-                    content: next,
-                    thinking: None,
-                    source: self::state::MessageSource::Conversation,
-                });
-                app.touch_response_render();
-            }
+            // Auto-dequeue one queued prompt after the current assistant turn
+            // has been recorded, preserving conversation chronology.
+            app.pop_queued_input_as_message();
         }
         ServerEvent::RollbackResult {
             success,
@@ -1104,10 +1096,7 @@ fn handle_action(
     if app.state == AppState::AgentRunning {
         match action {
             Some(Action::SendMessage) => {
-                let text = app.submit_input();
-                if !text.is_empty() {
-                    app.queue_input(&text);
-                }
+                app.submit_input_to_queue();
             }
             Some(Action::InsertNewline) => app.insert_newline(),
             Some(Action::CursorLeft) => app.cursor_left(),
@@ -1695,6 +1684,38 @@ mod tests {
 
         app.agent_tool_started("tool-1", "read");
         assert!(should_animate_loading(&app, true));
+    }
+
+    #[test]
+    fn test_done_dequeues_one_prompt_after_assistant_turn() {
+        let cfg = test_ui_config();
+        let mut app = App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        );
+        app.start_agent();
+        app.queue_input("next prompt");
+        let mut chat_stream = None;
+
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::Done {
+                content: "assistant done".into(),
+                tokens_input: 1,
+                tokens_output: 2,
+            },
+            &mut chat_stream,
+        );
+
+        assert!(app.input_queue.is_empty());
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].role, crate::llm::Role::Assistant);
+        assert_eq!(app.messages[0].content, "assistant done");
+        assert_eq!(app.messages[1].role, crate::llm::Role::User);
+        assert_eq!(app.messages[1].content, "next prompt");
     }
 
     #[test]

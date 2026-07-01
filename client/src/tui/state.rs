@@ -599,6 +599,33 @@ impl App {
         self.submit_conversation_input(text)
     }
 
+    pub fn submit_input_to_queue(&mut self) {
+        let text = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
+        self.auto_scroll = true;
+
+        if self.pending_secret_login.is_some() {
+            self.reset_suggestions();
+            self.handled_slash_command = true;
+            self.handle_secret_login_input(text);
+            return;
+        }
+
+        self.remember_input(&text);
+
+        if self.handle_shell_input(&text) || self.handle_slash_input(&text) {
+            return;
+        }
+
+        self.reset_suggestions();
+        self.handled_slash_command = false;
+
+        if !text.is_empty() {
+            let transformed = self.transform_mentions(&text);
+            self.queue_input(&transformed);
+        }
+    }
+
     fn remember_input(&mut self, text: &str) {
         // Save to history first (including slash commands), dedup against last entry
         if !text.is_empty()
@@ -1476,6 +1503,22 @@ impl App {
         self.input_cursor = 0;
     }
 
+    pub fn pop_queued_input_as_message(&mut self) -> bool {
+        let Some(next) = self.input_queue.pop_front() else {
+            return false;
+        };
+        self.messages.push(DisplayMessage {
+            role: Role::User,
+            content: next,
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        self.stream_buffer.clear();
+        self.reasoning_buffer.clear();
+        self.invalidate_response_render_cache();
+        true
+    }
+
     // ── Text editing helpers ─────────────────────────────
 
     pub fn insert_newline(&mut self) {
@@ -2151,6 +2194,47 @@ mod tests {
         assert_eq!(app.messages[0].role, Role::User);
         assert_eq!(app.messages[0].content, "hello");
         assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn test_submit_input_to_queue_does_not_append_user_message_immediately() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.state = AppState::AgentRunning;
+        app.input = "queued prompt".into();
+        app.input_cursor = app.input.len();
+
+        app.submit_input_to_queue();
+
+        assert!(app.messages.is_empty());
+        assert_eq!(app.input_queue.len(), 1);
+        assert_eq!(
+            app.input_queue.front().map(String::as_str),
+            Some("queued prompt")
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn test_pop_queued_input_as_message_appends_one_prompt() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.messages.push(DisplayMessage {
+            role: Role::Assistant,
+            content: "done".into(),
+            thinking: None,
+            source: MessageSource::Conversation,
+        });
+        app.queue_input("first");
+        app.queue_input("second");
+
+        assert!(app.pop_queued_input_as_message());
+
+        assert_eq!(app.input_queue.len(), 1);
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[1].role, Role::User);
+        assert_eq!(app.messages[1].content, "first");
+        assert_eq!(app.pending_user_message_content(), Some("first"));
     }
 
     #[test]

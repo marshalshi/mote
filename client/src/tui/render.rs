@@ -34,6 +34,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let newline_count = app.input.matches('\n').count();
     let input_lines =
         (newline_count.saturating_add(1)).max(1).min(8) as u16 + 4; // +2 for top/bottom accent +2 for spacers
+    let max_queue_lines = full_area.height.saturating_sub(8) as usize;
+    let queue_lines = app.input_queue.len().min(max_queue_lines) as u16;
+    let input_panel_lines = input_lines.saturating_add(queue_lines);
     let show_loading = app.loading_progress.is_some();
     let loading_height: u16 = if show_loading { 1 } else { 0 };
 
@@ -41,15 +44,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Length(input_lines),
+            Constraint::Length(input_panel_lines),
             Constraint::Length(loading_height),
             Constraint::Length(2), // status bar + empty line below
         ])
         .split(area);
 
     render_response_area(frame, chunks[0], app);
-    render_input_area(frame, chunks[1], app, app.input_accent);
-    render_suggestions(frame, chunks[1], app, app.input_accent);
+    let input_area = if queue_lines > 0 {
+        let input_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(queue_lines),
+                Constraint::Length(input_lines),
+            ])
+            .split(chunks[1]);
+        render_queued_accent_area(
+            frame,
+            input_chunks[0],
+            app,
+            queue_lines as usize,
+        );
+        input_chunks[1]
+    } else {
+        chunks[1]
+    };
+    render_input_area(frame, input_area, app, app.input_accent);
+    render_suggestions(frame, input_area, app, app.input_accent);
     if show_loading {
         render_loading_bar(frame, chunks[2], app);
     }
@@ -1312,6 +1333,8 @@ fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
 fn welcome_logo_lines() -> Vec<String> {
     vec![
         "".to_string(),
+        "".to_string(),
+        "".to_string(),
         ".S~S*S~S.    mSP~YSm    YSSS~S%SSP   d%SRs  ".to_string(),
         "SS `Y' SS  dS'     `Sb      SS       dS'    ".to_string(),
         "SS  Y  SS  SS       SS      SS       SS_Yz  ".to_string(),
@@ -1321,7 +1344,9 @@ fn welcome_logo_lines() -> Vec<String> {
         "       SP                   SP                ".to_string(),
         "       Y                    Y                 ".to_string(),
         "".to_string(),
+        "".to_string(),
         "    --         ---          -          .".to_string(),
+        "".to_string(),
     ]
 }
 
@@ -1825,10 +1850,7 @@ pub(crate) fn json_to_yaml_lines_for_popup(
 }
 
 fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
-    let input_disabled = matches!(
-        app.state,
-        AppState::WaitingResponse | AppState::AgentRunning
-    );
+    let input_disabled = app.state == AppState::WaitingResponse;
     let input_style = if input_disabled {
         Style::default().fg(Color::DarkGray)
     } else {
@@ -1865,8 +1887,8 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     } else {
         display_input
     };
-    let is_placeholder =
-        display_input.is_empty() && app.state == AppState::Idle;
+    let is_placeholder = display_input.is_empty()
+        && matches!(app.state, AppState::Idle | AppState::AgentRunning);
     let display_text = if is_placeholder {
         "message · /command · !shell".to_string()
     } else {
@@ -1904,8 +1926,10 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     let paragraph = Paragraph::new(text);
     frame.render_widget(paragraph, area);
 
-    // Cursor — only when idle and no pending permission
-    if app.pending_permission.is_none() && app.state == AppState::Idle {
+    // Cursor — only when input is editable and no pending permission
+    if app.pending_permission.is_none()
+        && matches!(app.state, AppState::Idle | AppState::AgentRunning)
+    {
         let prompt_width = 2; // "❯ " or "$ "
         let (col, visual_row) = cursor_pos_after_wrap(
             &display_input,
@@ -1916,6 +1940,68 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
         let cy = area.y + 2 + visual_row as u16; // +1 for spacer +1 for top accent padding
         frame.set_cursor_position(ratatui::prelude::Position::new(cx, cy));
     }
+}
+
+fn render_queued_accent_area(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    max_rows: usize,
+) {
+    let width = area.width.saturating_sub(6) as usize;
+    let lines = queued_accent_lines(app, width, max_rows);
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn queued_accent_lines(
+    app: &App,
+    message_width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let visible_count = app.input_queue.len().min(max_rows);
+    app.input_queue
+        .iter()
+        .take(visible_count)
+        .enumerate()
+        .map(|(idx, message)| {
+            queued_accent_line(idx + 1, message, message_width)
+        })
+        .collect()
+}
+
+fn queued_accent_line(
+    sequence: usize,
+    message: &str,
+    message_width: usize,
+) -> Line<'static> {
+    const QUEUED_ACCENT: Color = Color::Yellow;
+    let message = single_line_preview(message, message_width);
+    Line::from(vec![
+        Span::styled(" ▌  ", Style::default().fg(QUEUED_ACCENT)),
+        Span::styled(
+            "QUEUED ",
+            Style::default()
+                .fg(QUEUED_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("#{sequence} "),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(message, Style::default().fg(Color::White)),
+    ])
+}
+
+fn single_line_preview(message: &str, max_chars: usize) -> String {
+    let mut preview = message.lines().next().unwrap_or_default().to_string();
+    if preview.chars().count() <= max_chars {
+        return preview;
+    }
+
+    let keep = max_chars.saturating_sub(1);
+    preview = preview.chars().take(keep).collect();
+    preview.push('…');
+    preview
 }
 
 fn shell_input_display(
@@ -2309,6 +2395,48 @@ mod tests {
         // accent = 4, prompt = 2, text width = 12, so cursor after the final
         // character should land at x = 18, not be clamped left to 14.
         assert_eq!(input_cursor_screen_x(20, 2, 12), 18);
+    }
+
+    #[test]
+    fn test_queued_accent_lines_render_in_queue_order() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.queue_input("first queued prompt");
+        app.queue_input("second queued prompt");
+
+        let lines = queued_accent_lines(&app, 80, 10);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].contains("QUEUED #1 first queued prompt"));
+        assert!(rendered[1].contains("QUEUED #2 second queued prompt"));
+    }
+
+    #[test]
+    fn test_queued_accent_lines_renumber_after_pop() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.queue_input("first queued prompt");
+        app.queue_input("second queued prompt");
+        app.pop_queued_input_as_message();
+
+        let lines = queued_accent_lines(&app, 80, 10);
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(lines.len(), 1);
+        assert!(rendered.contains("QUEUED #1 second queued prompt"));
     }
 
     #[test]

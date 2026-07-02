@@ -56,6 +56,46 @@ impl PromptAssembler {
         self
     }
 
+    /// Build the shared system prompt layers (1-4, 6) without agent-specific
+    /// instructions. Callers can inject Layer 5 with the active role's
+    /// instructions via `build_agent_instructions_layer()`.
+    pub fn assemble_shared_layers(
+        &self,
+        model_provider: &str,
+        model_id: &str,
+    ) -> Result<Vec<String>> {
+        let mut layers: Vec<String> = Vec::new();
+
+        // Layer 1: Environment
+        layers.push(
+            self.build_env_block(model_id, self.workspace_root.as_deref()),
+        );
+
+        // Layer 2: Shared system prompt
+        if let Some(layer) = self.load_system_prompt_layer(model_provider)? {
+            layers.push(layer);
+        }
+
+        // Layer 3: Global AGENTS.md
+        if let Some(layer) = self.load_global_agents_layer()? {
+            layers.push(layer);
+        }
+
+        // Layer 4: Workspace AGENTS.md
+        if let Some(layer) = self.workspace_agents_layer() {
+            layers.push(layer);
+        }
+
+        // Layer 5 intentionally skipped — caller injects it
+
+        // Layer 6: Skills
+        if let Some(layer) = self.skills_layer() {
+            layers.push(layer);
+        }
+
+        Ok(layers)
+    }
+
     /// Build the system layer list (each element is one layer).
     ///
     /// Layers are assembled in order:
@@ -70,31 +110,19 @@ impl PromptAssembler {
         model_provider: &str,
         model_id: &str,
     ) -> Result<Vec<String>> {
-        let mut layers: Vec<String> = Vec::new();
+        let mut layers =
+            self.assemble_shared_layers(model_provider, model_id)?;
 
-        // Layer 1: Environment
-        layers.push(
-            self.build_env_block(model_id, self.workspace_root.as_deref()),
-        );
-
-        if let Some(layer) = self.load_system_prompt_layer(model_provider)? {
-            layers.push(layer);
-        }
-
-        if let Some(layer) = self.load_global_agents_layer()? {
-            layers.push(layer);
-        }
-
-        if let Some(layer) = self.workspace_agents_layer() {
-            layers.push(layer);
-        }
-
+        // Layer 5: agent-specific instructions (inserted before skills if present)
         if let Some(layer) = self.agent_instructions_layer() {
-            layers.push(layer);
-        }
-
-        if let Some(layer) = self.skills_layer() {
-            layers.push(layer);
+            let has_skills = layers
+                .last()
+                .map_or(false, |l| l.starts_with("Skills available:"));
+            if has_skills {
+                layers.insert(layers.len() - 1, layer);
+            } else {
+                layers.push(layer);
+            }
         }
 
         Ok(layers)
@@ -140,12 +168,19 @@ impl PromptAssembler {
             .and_then(|content| Self::format_instructions_layer(src, content))
     }
 
-    fn agent_instructions_layer(&self) -> Option<String> {
-        self.agent_instructions
-            .as_deref()
+    /// Build the agent-specific instructions layer from the given text.
+    /// Returns None when the text is empty or all whitespace.
+    pub fn build_agent_instructions_layer(
+        instructions: Option<&str>,
+    ) -> Option<String> {
+        instructions
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(ToOwned::to_owned)
+    }
+
+    fn agent_instructions_layer(&self) -> Option<String> {
+        Self::build_agent_instructions_layer(self.agent_instructions.as_deref())
     }
 
     fn skills_layer(&self) -> Option<String> {
@@ -402,6 +437,95 @@ default = "/nonexistent/prompts/system/mote.md"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         PromptAssembler::new(config)
+    }
+
+    /// Creates a PromptAssembler with specific agent instructions.
+    fn test_assembler_with_instructions(instructions: &str) -> PromptAssembler {
+        use crate::config::AgentConfig;
+        let toml = r#"
+[model]
+provider = "test"
+model_id = "test-model"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+[prompts]
+default = "/nonexistent/prompts/system/mote.md"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let agent = AgentConfig {
+            instructions: Some(instructions.to_string()),
+            ..Default::default()
+        };
+        PromptAssembler::for_agent(&config, Some(&agent))
+    }
+
+    // ── New assembly method tests ─────────────────────────
+
+    #[test]
+    fn test_assemble_shared_layers_excludes_agent_instructions() {
+        let a = test_assembler_with_instructions("AGENT RULES");
+        let layers = a.assemble_shared_layers("test", "test-model").unwrap();
+        // Should not contain agent instructions
+        assert!(!layers.iter().any(|l| l.contains("AGENT RULES")));
+        // Layer 1 (env) should be present
+        assert!(layers[0].contains("test-model"));
+    }
+
+    #[test]
+    fn test_assemble_includes_agent_instructions() {
+        let a = test_assembler_with_instructions("AGENT RULES");
+        let layers = a.assemble("test", "test-model").unwrap();
+        // Should contain agent instructions
+        assert!(layers.iter().any(|l| l.contains("AGENT RULES")));
+    }
+
+    #[test]
+    fn test_build_agent_instructions_layer_empty() {
+        assert!(
+            PromptAssembler::build_agent_instructions_layer(None).is_none()
+        );
+        assert!(
+            PromptAssembler::build_agent_instructions_layer(Some("")).is_none()
+        );
+        assert!(
+            PromptAssembler::build_agent_instructions_layer(Some("  "))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_build_agent_instructions_layer_present() {
+        let layer = PromptAssembler::build_agent_instructions_layer(Some(
+            "ROLE INSTRUCTIONS",
+        ));
+        assert!(layer.is_some());
+        assert_eq!(layer.unwrap(), "ROLE INSTRUCTIONS");
+    }
+
+    #[test]
+    fn test_shared_plus_role_layers_equals_assemble() {
+        let a = test_assembler_with_instructions("AGENT RULES");
+        let full = a.assemble("test", "test-model").unwrap();
+
+        // Build shared layers + inject role instructions manually
+        let mut shared =
+            a.assemble_shared_layers("test", "test-model").unwrap();
+        if let Some(layer) =
+            PromptAssembler::build_agent_instructions_layer(Some("AGENT RULES"))
+        {
+            let has_skills = shared
+                .last()
+                .map_or(false, |l| l.starts_with("Skills available:"));
+            if has_skills {
+                shared.insert(shared.len() - 1, layer);
+            } else {
+                shared.push(layer);
+            }
+        }
+
+        assert_eq!(shared, full);
     }
 
     #[test]

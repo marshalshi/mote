@@ -271,6 +271,15 @@ pub struct AgentConfig {
     /// If set, these instructions appear in the system prompt for this agent only.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// If true, omit the global ~/.config/mote/AGENTS.md layer for this agent.
+    #[serde(default)]
+    pub disable_user_agents_md: bool,
+    /// If true, omit the shared system prompt layer for this agent.
+    ///
+    /// The field name intentionally matches the current agent-definition
+    /// contract spelling. `disable_system_prompt` is accepted as an alias.
+    #[serde(default, alias = "disable_system_prompt")]
+    pub disble_system_prompt: bool,
     /// Agent mode: "primary" (user-selectable, default), "subagent" (tool-only), "all" (both).
     #[serde(default = "default_agent_mode")]
     pub mode: String,
@@ -294,6 +303,8 @@ impl Default for AgentConfig {
             max_tokens: None,
             permissions: HashMap::new(),
             instructions: None,
+            disable_user_agents_md: false,
+            disble_system_prompt: false,
             mode: default_agent_mode(),
             roles: None,
         }
@@ -1120,6 +1131,8 @@ base_url = "https://api.deepseek.com/v1"
                 max_tokens: Some(4096),
                 permissions: HashMap::new(),
                 instructions: None,
+                disable_user_agents_md: false,
+                disble_system_prompt: false,
                 mode: "primary".into(),
                 roles: None,
             },
@@ -1579,6 +1592,37 @@ Just instructions.
         assert_eq!(cfg.mode, "primary");
         assert!(cfg.roles.is_none());
         assert!(cfg.validate_roles().is_ok());
+    }
+
+    #[test]
+    fn test_agent_prompt_disable_flags_default_false() {
+        let cfg = parse_agent_markdown("# Build\n\nInstructions.").unwrap();
+        assert!(!cfg.disable_user_agents_md);
+        assert!(!cfg.disble_system_prompt);
+    }
+
+    #[test]
+    fn test_parse_agent_prompt_disable_flags() {
+        let markdown = r#"---
+disable_user_agents_md: true
+disble_system_prompt: true
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert!(cfg.disable_user_agents_md);
+        assert!(cfg.disble_system_prompt);
+    }
+
+    #[test]
+    fn test_parse_agent_prompt_disable_system_prompt_alias() {
+        let markdown = r#"---
+disable_system_prompt: true
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert!(cfg.disble_system_prompt);
     }
 
     #[test]

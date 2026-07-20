@@ -15,6 +15,8 @@ struct SkillMeta {
 pub struct PromptAssembler {
     config: Config,
     agent_instructions: Option<String>,
+    disable_user_agents_md: bool,
+    disble_system_prompt: bool,
     workspace_root: Option<PathBuf>,
     repo_agents_md: Option<String>,
 }
@@ -26,6 +28,8 @@ impl PromptAssembler {
         Self {
             config,
             agent_instructions: None,
+            disable_user_agents_md: false,
+            disble_system_prompt: false,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -38,9 +42,15 @@ impl PromptAssembler {
     ) -> Self {
         let cfg = config.clone();
         let instructions = agent.and_then(|a| a.instructions.clone());
+        let disable_user_agents_md =
+            agent.is_some_and(|a| a.disable_user_agents_md);
+        let disble_system_prompt =
+            agent.is_some_and(|a| a.disble_system_prompt);
         Self {
             config: cfg,
             agent_instructions: instructions,
+            disable_user_agents_md,
+            disble_system_prompt,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -132,12 +142,18 @@ impl PromptAssembler {
         &self,
         _model_provider: &str,
     ) -> Result<Option<String>> {
+        if self.disble_system_prompt {
+            return Ok(None);
+        }
         let prompt =
             self.load_file_or_default(&self.config.prompts.default, "")?;
         Ok((!prompt.is_empty()).then_some(prompt))
     }
 
     fn load_global_agents_layer(&self) -> Result<Option<String>> {
+        if self.disable_user_agents_md {
+            return Ok(None);
+        }
         let Some(home) = dirs::home_dir() else {
             return Ok(None);
         };
@@ -461,6 +477,13 @@ default = "/nonexistent/prompts/system/mote.md"
         PromptAssembler::for_agent(&config, Some(&agent))
     }
 
+    fn test_assembler_with_agent(
+        config: Config,
+        agent: crate::config::AgentConfig,
+    ) -> PromptAssembler {
+        PromptAssembler::for_agent(&config, Some(&agent))
+    }
+
     // ── New assembly method tests ─────────────────────────
 
     #[test]
@@ -526,6 +549,59 @@ default = "/nonexistent/prompts/system/mote.md"
         }
 
         assert_eq!(shared, full);
+    }
+
+    #[test]
+    fn test_agent_can_disable_system_prompt_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_path = dir.path().join("mote.md");
+        std::fs::write(&prompt_path, "SHARED SYSTEM PROMPT").unwrap();
+
+        let toml = format!(
+            r#"
+[model]
+provider = "ollama"
+model_id = "m"
+[providers.ollama]
+base_url = "http://localhost:11434"
+[prompts]
+default = "{}"
+"#,
+            prompt_path.display()
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        let agent = crate::config::AgentConfig {
+            disble_system_prompt: true,
+            ..Default::default()
+        };
+
+        let layers = test_assembler_with_agent(config, agent)
+            .assemble("ollama", "m")
+            .unwrap();
+        assert!(!layers.iter().any(|l| l.contains("SHARED SYSTEM PROMPT")));
+    }
+
+    #[test]
+    fn test_agent_can_disable_global_agents_md_layer() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "test-model"
+[providers.ollama]
+base_url = "http://localhost:11434"
+[prompts]
+default = "/nonexistent/prompts/system/mote.md"
+"#,
+        )
+        .unwrap();
+        let agent = crate::config::AgentConfig {
+            disable_user_agents_md: true,
+            ..Default::default()
+        };
+
+        let assembler = test_assembler_with_agent(config, agent);
+        assert!(assembler.load_global_agents_layer().unwrap().is_none());
     }
 
     #[test]

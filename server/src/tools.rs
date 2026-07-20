@@ -1133,10 +1133,20 @@ impl SubagentRunner for AgentSubagentRunner {
                     Some(workspace.clone()),
                     self.repo_agents_md.clone(),
                 );
+        let has_roles = agent_cfg
+            .and_then(|a| a.roles.as_ref())
+            .map_or(false, |r| !r.is_empty());
         let provider_for_prompt = eff_provider_name.clone();
         let model_for_prompt = eff_model_id.clone();
         let system_layers = tokio::task::spawn_blocking(move || {
-            prompt.assemble(&provider_for_prompt, &model_for_prompt)
+            if has_roles {
+                prompt.assemble_shared_layers(
+                    &provider_for_prompt,
+                    &model_for_prompt,
+                )
+            } else {
+                prompt.assemble(&provider_for_prompt, &model_for_prompt)
+            }
         })
         .await
         .map_err(|e| anyhow::anyhow!("Prompt assembly panicked: {:#}", e))??;
@@ -1203,6 +1213,65 @@ impl SubagentRunner for AgentSubagentRunner {
         let p2 = Arc::clone(&provider);
         let workspace_display = workspace.display().to_string();
 
+        // Resolve role_loop_config for role-aware subagents.
+        // In subagent mode, all roles share the parent's provider (they use the
+        // same LLM backend) but can have different model_ids. Cross-provider role
+        // switching is not supported for subagents in the MVP.
+        let role_config: Option<crate::agent::RoleLoopConfig> = if let (
+            Some(cfg),
+            Some(roles),
+        ) =
+            (agent_cfg, agent_cfg.and_then(|a| a.roles.as_ref()))
+        {
+            // Validate roles before building — treat invalid config as
+            // legacy mode (no roles) so run_loop doesn't panic on empty list.
+            if let Err(e) = cfg.validate_roles() {
+                tracing::warn!(
+                    "Subagent '{}' has invalid roles, falling back to legacy mode: {e}",
+                    agent_name
+                );
+                None
+            } else {
+                let effective_agent_model: Option<String> =
+                    agent_model.map(|s| s.to_string());
+                let mut resolved_roles = Vec::with_capacity(roles.len());
+                for role in roles {
+                    let (role_prov_name, role_model_id) =
+                        self.config.effective_role_model(
+                            role.model.as_deref(),
+                            effective_agent_model.as_deref(),
+                        );
+                    // Subagent roles all use the parent's provider
+                    let provider = Arc::clone(&provider);
+                    let instructions = agent_cfg
+                        .and_then(|a| a.effective_role_instructions(role))
+                        .unwrap_or_default();
+                    let temperature = self.config.effective_temperature(
+                        role.temperature
+                            .or(agent_cfg.and_then(|a| a.temperature)),
+                    );
+                    let max_tokens = self.config.effective_max_tokens(
+                        role.max_tokens
+                            .or(agent_cfg.and_then(|a| a.max_tokens)),
+                        &role_prov_name,
+                    );
+                    resolved_roles.push(crate::agent::ResolvedRole {
+                        name: role.name.clone(),
+                        instructions,
+                        provider,
+                        model_id: role_model_id,
+                        temperature: Some(temperature),
+                        max_tokens: Some(max_tokens),
+                    });
+                }
+                Some(crate::agent::RoleLoopConfig {
+                    roles: resolved_roles,
+                })
+            }
+        } else {
+            None
+        };
+
         tokio::spawn(async move {
             crate::agent::run_loop(
                 p2,
@@ -1217,6 +1286,7 @@ impl SubagentRunner for AgentSubagentRunner {
                 perms,
                 crate::agent::DEFAULT_MAX_STEPS,
                 workspace_display,
+                role_config,
             )
             .await;
         });

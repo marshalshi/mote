@@ -12,6 +12,63 @@ pub use marshaling_protocol::{FileChange, ToolCallDisplay, ToolStatus};
 /// Default max steps if not configured.
 pub const DEFAULT_MAX_STEPS: usize = 30;
 
+/// A fully resolved role ready for use in the agent loop.
+/// Owns all data needed to switch the active role per turn.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct ResolvedRole {
+    pub name: String,
+    pub instructions: String,
+    pub provider: Arc<dyn LlmProvider>,
+    pub model_id: String,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+/// Configuration for role-aware loop mode.
+/// When present in `run_loop`, the loop enters role-switching mode.
+/// The first role is the orchestrator.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct RoleLoopConfig {
+    pub roles: Vec<ResolvedRole>,
+}
+
+#[allow(dead_code)]
+impl RoleLoopConfig {
+    /// Find a role by name, returning its index.
+    pub fn find_role(&self, name: &str) -> Option<usize> {
+        self.roles.iter().position(|r| r.name == name)
+    }
+}
+
+/// Build the tool definition for `switch_role`.
+/// This is NOT a normal Tool trait object; it is injected directly into
+/// the advertised tool list and its calls are intercepted by the loop.
+fn switch_role_tool_def() -> ToolDef {
+    ToolDef {
+        def_type: "function".into(),
+        function: ToolFunctionDef {
+            name: "switch_role".into(),
+            description: "Switch to a different role and pass it a task. Available roles are listed in the system prompt. Use this to delegate work to specialist roles, then switch back to the orchestrator when done.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "Name of the role to switch to (e.g., 'coder', 'reviewer')"
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The task description for the target role. This will be presented as the next user message."
+                    }
+                },
+                "required": ["role", "task"]
+            }),
+        },
+    }
+}
+
 const MAX_STEPS_PROMPT: &str = r#"CRITICAL - MAXIMUM STEPS REACHED
 
 The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
@@ -182,12 +239,18 @@ pub async fn run_loop(
     max_steps: usize,
     // Workspace context for dynamic reminder text.
     working_directory: String,
+    // Role-aware loop config. When None, runs in legacy (single-role) mode.
+    role_config: Option<RoleLoopConfig>,
 ) {
     let max_steps = if max_steps == 0 {
         DEFAULT_MAX_STEPS
     } else {
         max_steps
     };
+    // Role-aware loop state: tracks which role is currently active.
+    // When role_config is None (legacy mode), this remains at 0 and is unused.
+    let mut current_role_idx: usize = 0;
+    let role_mode = role_config.is_some();
     // Add the user message
     history.push(ChatMessage::user(&user_message));
 
@@ -267,13 +330,73 @@ pub async fn run_loop(
         // Build messages: system + reminder + history
         // Use iter().cloned() to avoid allocating an intermediate Vec from history.clone()
         let mut messages: Vec<ChatMessage> =
-            Vec::with_capacity(system_layers.len() + 1 + history.len());
-        messages.extend(system_layers.iter().map(|l| ChatMessage::system(l)));
+            Vec::with_capacity(system_layers.len() + 2 + history.len());
+
+        // Identify the skills layer (layer 6) so we can inject role layers (5)
+        // before it: correct order is shared (1-4), role (5), skills (6), reminder (7).
+        let has_skills = system_layers
+            .last()
+            .map_or(false, |l| l.starts_with("Skills available:"));
+        let pre_skills_count = if has_skills {
+            system_layers.len().saturating_sub(1)
+        } else {
+            system_layers.len()
+        };
+
+        // Inject shared layers (1-4): env, system prompt, global AGENTS.md,
+        // workspace AGENTS.md
+        for i in 0..pre_skills_count {
+            messages.push(ChatMessage::system(&system_layers[i]));
+        }
+
+        // Inject role layers (5) — only in role mode
+        if let Some(ref rc) = role_config {
+            // Role roster
+            let mut roster = String::from("Available roles in this agent:\n");
+            for role in &rc.roles {
+                // Brief description: first non-empty line of instructions (up to 80 chars)
+                let brief = role
+                    .instructions
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| {
+                        let trimmed = l.trim();
+                        if trimmed.len() > 80 {
+                            format!("{}…", &trimmed[..77])
+                        } else {
+                            trimmed.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "(no description)".to_string());
+                roster.push_str(&format!("  {} — {}\n", role.name, brief));
+            }
+            roster
+                .push_str("\nUse switch_role to delegate tasks between roles.");
+            messages.push(ChatMessage::system(&roster));
+
+            // Current role's specific instructions
+            let role_instructions = &rc.roles[current_role_idx].instructions;
+            if !role_instructions.is_empty() {
+                messages.push(ChatMessage::system(role_instructions));
+            }
+        }
+
+        // Inject skills layer (6) after role layers
+        if has_skills {
+            messages.push(ChatMessage::system(
+                &system_layers[system_layers.len() - 1],
+            ));
+        }
 
         // Build and inject the dynamic system reminder (Layer 7)
         let last_user_msg = extract_last_user_message(&history);
         let last_turn_results = extract_last_turn_results(&history);
-        let tool_defs = advertised_tool_defs(&tools, &permissions);
+        let mut tool_defs = advertised_tool_defs(&tools, &permissions);
+        // When in role mode, inject the switch_role tool def so the model can
+        // delegate to other roles. This is an internal loop tool, not a filesystem tool.
+        if role_mode && !final_text_only_step {
+            tool_defs.push(switch_role_tool_def());
+        }
 
         let reminder_ctx = crate::prompt::ReminderContext {
             step,
@@ -292,7 +415,17 @@ pub async fn run_loop(
         }
 
         // Build tool definitions for the API
-        let mut opts = options.clone();
+        let mut opts = if let Some(ref rc) = role_config {
+            let role = &rc.roles[current_role_idx];
+            ChatOptions {
+                model_id: role.model_id.clone(),
+                temperature: role.temperature.unwrap_or(options.temperature),
+                max_tokens: role.max_tokens.unwrap_or(options.max_tokens),
+                tools: Vec::new(), // populated below
+            }
+        } else {
+            options.clone()
+        };
         opts.tools = if final_text_only_step {
             Vec::new()
         } else {
@@ -303,7 +436,11 @@ pub async fn run_loop(
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Clone the Arc for the spawned task
-        let prov = Arc::clone(&provider);
+        let prov = if let Some(ref rc) = role_config {
+            Arc::clone(&rc.roles[current_role_idx].provider)
+        } else {
+            Arc::clone(&provider)
+        };
         let stream_handle = tokio::spawn(async move {
             prov.chat_stream(&messages, &opts, stream_tx).await;
         });
@@ -470,6 +607,107 @@ pub async fn run_loop(
                     history,
                 }));
                 return;
+            }
+
+            // ── Handle switch_role (role-mode loop-owned tool) ──────
+            if tc.function.name == "switch_role" {
+                let _ = events_tx.send(Ok(AgentEvent::ToolStarted {
+                    id: tc.id.clone(),
+                    name: "switch_role".into(),
+                }));
+
+                let args: serde_json::Value =
+                    match serde_json::from_str(&tc.function.arguments) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let err =
+                                format!("Invalid switch_role arguments: {e}");
+                            let _ =
+                                events_tx.send(Ok(AgentEvent::ToolFailed {
+                                    id: tc.id.clone(),
+                                    error: err.clone(),
+                                }));
+                            history
+                                .push(ChatMessage::tool_result(&tc.id, &err));
+                            displays.push(ToolCallDisplay {
+                                id: tc.id.clone(),
+                                name: "switch_role".into(),
+                                status: ToolStatus::Failed(err),
+                                changes: Vec::new(),
+                            });
+                            continue;
+                        }
+                    };
+                let target_role =
+                    args.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                let task =
+                    args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+
+                match role_config.as_ref().and_then(|rc| {
+                    rc.find_role(target_role).map(|idx| (rc, idx))
+                }) {
+                    Some((_rc, idx)) => {
+                        // Valid role — switch and inject task
+                        current_role_idx = idx;
+                        let task_msg = if task.is_empty() {
+                            format!("Switched to role: {}", target_role)
+                        } else {
+                            task.to_string()
+                        };
+                        let result_text =
+                            format!("Switched to role: {}", target_role);
+                        // Push tool result first — providers expect tool
+                        // results to immediately follow the assistant tool_call.
+                        history.push(ChatMessage::tool_result(
+                            &tc.id,
+                            &result_text,
+                        ));
+                        let _ = events_tx.send(Ok(AgentEvent::ToolCompleted {
+                            id: tc.id.clone(),
+                            name: "switch_role".into(),
+                            result: result_text,
+                            changes: Vec::new(),
+                            rollback_entries: Vec::new(),
+                        }));
+                        displays.push(ToolCallDisplay {
+                            id: tc.id.clone(),
+                            name: "switch_role".into(),
+                            status: ToolStatus::Success,
+                            changes: Vec::new(),
+                        });
+                        // Push user message LAST — marks the start of the
+                        // next turn, after the tool result.
+                        history.push(ChatMessage::user(&task_msg));
+                    }
+                    None => {
+                        let available = role_config
+                            .as_ref()
+                            .map(|rc| {
+                                rc.roles
+                                    .iter()
+                                    .map(|r| r.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_else(|| "none".into());
+                        let err = format!(
+                            "Unknown role: '{}'. Available: {}",
+                            target_role, available
+                        );
+                        let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
+                            id: tc.id.clone(),
+                            error: err.clone(),
+                        }));
+                        history.push(ChatMessage::tool_result(&tc.id, &err));
+                        displays.push(ToolCallDisplay {
+                            id: tc.id.clone(),
+                            name: "switch_role".into(),
+                            status: ToolStatus::Failed(err),
+                            changes: Vec::new(),
+                        });
+                    }
+                }
+                continue;
             }
 
             // Emit skill selected event when use_skill is called
@@ -721,6 +959,12 @@ fn extract_last_turn_results(
                     summary,
                 });
             }
+            // After a switch_role turn, history ends with a trailing
+            // user(task) message. Skip it and keep scanning for tool
+            // results — it's a boundary marker, not actual user input.
+            Role::User if results.is_empty() => {
+                continue;
+            }
             _ => break,
         }
     }
@@ -963,6 +1207,7 @@ mod tests {
             permissions,
             2,
             "/tmp".into(),
+            None,
         )
         .await;
 
@@ -1191,6 +1436,7 @@ mod tests {
             permissions,
             2,
             "/tmp".into(),
+            None,
         )
         .await;
 
@@ -1256,6 +1502,7 @@ mod tests {
             permissions,
             10,
             "/tmp".into(),
+            None,
         )
         .await;
 
@@ -1352,6 +1599,7 @@ mod tests {
             permissions,
             10,
             "/tmp".into(),
+            None,
         )
         .await;
 
@@ -1433,6 +1681,7 @@ mod tests {
             permissions,
             10,
             "/tmp".into(),
+            None,
         )
         .await;
 
@@ -1521,6 +1770,7 @@ mod tests {
             permissions,
             1,
             "/tmp".into(),
+            None,
         )
         .await;
 
@@ -1576,6 +1826,7 @@ mod tests {
             permissions,
             max_steps,
             "/tmp".into(),
+            None,
         )
         .await;
 
@@ -1646,5 +1897,36 @@ mod tests {
     fn test_safe_truncate_empty() {
         assert_eq!(safe_truncate("", 0), "");
         assert_eq!(safe_truncate("", 10), "");
+    }
+
+    #[test]
+    fn test_role_loop_config_new() {
+        let config = RoleLoopConfig { roles: vec![] };
+        assert_eq!(config.find_role("nonexistent"), None);
+        assert_eq!(config.roles.len(), 0);
+    }
+
+    #[test]
+    fn test_switch_role_tool_def_schema() {
+        let def = switch_role_tool_def();
+        assert_eq!(def.function.name, "switch_role");
+        assert!(
+            def.function
+                .description
+                .contains("Switch to a different role")
+        );
+        // Verify required fields
+        let params = &def.function.parameters;
+        assert_eq!(params["type"], "object");
+        let required = params["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("role")));
+        assert!(required.iter().any(|v| v.as_str() == Some("task")));
+    }
+
+    #[test]
+    fn test_role_loop_config_find_role() {
+        let config = RoleLoopConfig { roles: vec![] };
+        assert_eq!(config.find_role("orchestrator"), None);
+        assert_eq!(config.find_role("coder"), None);
     }
 }

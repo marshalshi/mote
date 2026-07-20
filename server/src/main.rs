@@ -776,6 +776,172 @@ struct AgentContext {
     opts: llm::ChatOptions,
     eff_provider: String,
     eff_model_id: String,
+    /// Optional role-loop configuration. When present, the agent loop
+    /// enters role-switching mode. The first role is the orchestrator.
+    #[allow(dead_code)]
+    role_loop_config: Option<agent::RoleLoopConfig>,
+}
+
+/// Resolve agent context for role-aware loop mode.
+/// Creates providers for all unique provider names, builds ResolvedRole structs,
+/// and assembles shared system layers using the orchestrator's identity.
+async fn resolve_role_aware_context(
+    config: &config::Config,
+    auth: &auth::Auth,
+    _merged_agents: &HashMap<String, config::AgentConfig>,
+    req_ctx: &RequestContext,
+    agent_cfg: &config::AgentConfig,
+    roles: &[config::RoleConfig],
+    agent_model: Option<&str>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+) -> Result<AgentContext> {
+    // Validate roles
+    agent_cfg
+        .validate_roles()
+        .map_err(|e| anyhow::anyhow!("Invalid role config for agent: {e}"))?;
+
+    // Resolve overridden agent-level model (for role fallback chain)
+    // When model_override and/or provider_override are set, build the
+    // effective agent model to reflect both overrides for provider resolution.
+    let effective_agent_model: Option<String> = {
+        let prov = provider_override.or_else(|| {
+            model_override.and_then(|m| m.split_once('/').map(|(p, _)| p))
+        });
+        let mid = model_override.map(|s| {
+            s.split_once('/')
+                .map(|(_, m)| m.to_string())
+                .unwrap_or_else(|| s.to_string())
+        });
+        if prov.is_some() || mid.is_some() {
+            let prov = prov
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| config.effective_provider(agent_model));
+            let mid =
+                mid.unwrap_or_else(|| config.effective_model_id(agent_model));
+            Some(format!("{prov}/{mid}"))
+        } else {
+            agent_model.map(|s| s.to_string())
+        }
+    };
+
+    let mut provider_cache: HashMap<String, Arc<dyn llm::LlmProvider>> =
+        HashMap::new();
+    let mut resolved_roles: Vec<agent::ResolvedRole> =
+        Vec::with_capacity(roles.len());
+
+    for role in roles {
+        // Resolve provider + model_id for this role
+        let (role_prov_name, role_model_id) = config.effective_role_model(
+            role.model.as_deref(),
+            effective_agent_model.as_deref(),
+        );
+
+        // Deduplicate provider instances by provider name
+        let provider = match provider_cache.get(&role_prov_name) {
+            Some(p) => Arc::clone(p),
+            None => {
+                let p: Arc<dyn llm::LlmProvider> = Arc::from(
+                    llm::build_provider_for(config, auth, &role_prov_name)
+                        .with_context(|| {
+                            format!(
+                                "Failed to build provider '{}' for role '{}'",
+                                role_prov_name, role.name
+                            )
+                        })?,
+                );
+                provider_cache.insert(role_prov_name.clone(), Arc::clone(&p));
+                p
+            }
+        };
+
+        // Resolve instructions with fallback: role -> agent -> ""
+        let instructions = agent_cfg
+            .effective_role_instructions(role)
+            .unwrap_or_default();
+
+        // Resolve temperature: role -> agent -> config default
+        let temperature = config
+            .effective_temperature(role.temperature.or(agent_cfg.temperature));
+
+        // Resolve max_tokens: role -> agent -> provider default -> global
+        let max_tokens = config.effective_max_tokens(
+            role.max_tokens.or(agent_cfg.max_tokens),
+            &role_prov_name,
+        );
+
+        resolved_roles.push(agent::ResolvedRole {
+            name: role.name.clone(),
+            instructions,
+            provider,
+            model_id: role_model_id,
+            temperature: Some(temperature),
+            max_tokens: Some(max_tokens),
+        });
+    }
+
+    // Orchestrator is always the first role
+    let orchestrator = &resolved_roles[0];
+
+    // Determine the orchestrator's effective provider name from overrides + role config
+    let orc_provider_name = provider_override
+        .map(|s| s.to_string())
+        .or_else(|| {
+            model_override
+                .and_then(|m| m.split_once('/').map(|(p, _)| p.to_string()))
+        })
+        .unwrap_or_else(|| {
+            let (pn, _) = config
+                .effective_role_model(roles[0].model.as_deref(), agent_model);
+            pn
+        });
+
+    // Apply model_override to orchestrator model_id for prompt/env
+    let orc_model_id_for_prompt = model_override
+        .map(|mo| {
+            mo.split_once('/')
+                .map(|(_, m)| m.to_string())
+                .unwrap_or_else(|| mo.to_string())
+        })
+        .unwrap_or_else(|| orchestrator.model_id.clone());
+
+    // Assemble shared layers (1-4, 6) using orchestrator identity
+    let prompt_assembler =
+        prompt::PromptAssembler::for_agent(config, Some(agent_cfg))
+            .with_workspace_context(
+                Some(req_ctx.workspace.clone()),
+                req_ctx.repo_agents_md.clone(),
+            );
+    let orc_provider_name_for_closure = orc_provider_name.clone();
+    let system_layers = tokio::task::spawn_blocking(move || {
+        prompt_assembler.assemble_shared_layers(
+            &orc_provider_name_for_closure,
+            &orc_model_id_for_prompt,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Prompt assembly panicked: {:#}", e))??;
+
+    // Build canonical options from orchestrator (used for compaction, session metadata)
+    let opts = llm::ChatOptions {
+        model_id: orchestrator.model_id.clone(),
+        temperature: orchestrator
+            .temperature
+            .unwrap_or(config.model.temperature),
+        max_tokens: orchestrator.max_tokens.unwrap_or(config.model.max_tokens),
+        tools: Vec::new(),
+    };
+
+    Ok(AgentContext {
+        provider: Arc::clone(&orchestrator.provider),
+        system_layers,
+        opts,
+        eff_provider: orc_provider_name,
+        eff_model_id: orchestrator.model_id.clone(),
+        role_loop_config: Some(agent::RoleLoopConfig {
+            roles: resolved_roles,
+        }),
+    })
 }
 
 /// Resolve the agent context: provider, model, system prompt, and options.
@@ -793,6 +959,24 @@ async fn resolve_agent_context(
     let agent_cfg = merged_agents.get(agent_name);
     let agent_model = agent_cfg.and_then(|a| a.model.as_deref());
 
+    // ── Role-aware mode ──────────────────────────────────
+    if let Some(roles) = agent_cfg.and_then(|a| a.roles.as_ref()) {
+        // Safe: agent_cfg is Some because roles came from it
+        return resolve_role_aware_context(
+            config,
+            auth,
+            merged_agents,
+            req_ctx,
+            agent_cfg.unwrap(),
+            roles,
+            agent_model,
+            model_override,
+            provider_override,
+        )
+        .await;
+    }
+
+    // ── Legacy mode (unchanged) ──────────────────────────
     // Resolve provider:
     // 1. Explicit provider_override (set by client /model command when using "provider/model" format)
     // 2. Fallback: parse from model_override (backward compat with "provider/model" embedded in model_override)
@@ -857,6 +1041,7 @@ async fn resolve_agent_context(
         opts,
         eff_provider,
         eff_model_id,
+        role_loop_config: None,
     })
 }
 
@@ -883,6 +1068,11 @@ pub fn build_permission_map(
     perms.insert("use_skill".into(), config::Permission::Allow);
     // finish_task is an internal completion marker handled by the loop.
     perms.insert("finish_task".into(), config::Permission::Allow);
+    // switch_role is always allowed when the agent defines roles.
+    // This tool is handled internally by the loop (not as a normal Tool trait object).
+    if agent_cfg.map_or(false, |a| a.roles.is_some()) {
+        perms.insert("switch_role".into(), config::Permission::Allow);
+    }
     // Resolve subagent permission
     let subagent_perm = agent_permissions
         .and_then(|ap| ap.get("subagent"))
@@ -1135,6 +1325,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             perms,
             max_steps,
             workspace_display,
+            ctx.role_loop_config,
         )
         .await;
     });
@@ -1152,6 +1343,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     tokens_output,
                     history,
                 }) => {
+                    // In role mode, eff_model_id_save and eff_provider hold the orchestrator
+                    // (roles[0]) identity — this is intentional canonical metadata for session lists.
                     save_run_session(
                         history,
                         eff_model_id_save.clone(),
@@ -1182,6 +1375,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     tokens_output,
                     history,
                 }) => {
+                    // In role mode, eff_model_id_save and eff_provider hold the orchestrator
+                    // (roles[0]) identity — this is intentional canonical metadata for session lists.
                     save_run_session(
                         history,
                         eff_model_id_save.clone(),
@@ -2259,5 +2454,55 @@ read = "allow"
         assert!(!result.success);
         let sessions = state.runtime_states.lock().await;
         assert_eq!(sessions["sess"].rollback_journal.len(), 1);
+    }
+
+    #[test]
+    fn test_build_permission_map_includes_switch_role_for_role_agent() {
+        let toml = r#"
+[model]
+provider = "test"
+model_id = "test-model"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+"#;
+        let config: config::Config = toml::from_str(toml).unwrap();
+        let tool_names = vec!["read".to_string(), "edit".to_string()];
+
+        // Agent with roles
+        let agent_with_roles = config::AgentConfig {
+            roles: Some(vec![config::RoleConfig {
+                name: "orchestrator".into(),
+                instructions: Some("Plan".into()),
+                model: None,
+                temperature: None,
+                max_tokens: None,
+            }]),
+            ..Default::default()
+        };
+        let perms =
+            build_permission_map(&config, Some(&agent_with_roles), &tool_names);
+        assert_eq!(perms.get("switch_role"), Some(&config::Permission::Allow));
+
+        // Agent without roles
+        let agent_no_roles = config::AgentConfig {
+            roles: None,
+            ..Default::default()
+        };
+        let perms2 =
+            build_permission_map(&config, Some(&agent_no_roles), &tool_names);
+        assert!(
+            !perms2.contains_key("switch_role")
+                || perms2.get("switch_role")
+                    != Some(&config::Permission::Allow)
+        );
+
+        // No agent at all
+        let perms3 = build_permission_map(&config, None, &tool_names);
+        assert!(
+            !perms3.contains_key("switch_role")
+                || perms3.get("switch_role")
+                    != Some(&config::Permission::Allow)
+        );
     }
 }

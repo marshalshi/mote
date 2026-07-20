@@ -234,6 +234,27 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Per-role configuration within an agent's `roles` array.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoleConfig {
+    /// Role identifier (e.g., "orchestrator", "coder", "reviewer").
+    pub name: String,
+    /// Agent-specific system instructions for this role. Falls back to
+    /// the agent-level `instructions` when not set.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Optional model override: "provider/model_id" or just "model_id".
+    /// Falls back to agent.model -> config defaults.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional temperature override for this role.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Optional max_tokens override for this role.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
 /// Per-agent override within the `[agents]` section.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
@@ -253,6 +274,12 @@ pub struct AgentConfig {
     /// Agent mode: "primary" (user-selectable, default), "subagent" (tool-only), "all" (both).
     #[serde(default = "default_agent_mode")]
     pub mode: String,
+    /// Optional list of roles for native loop orchestration.
+    /// When present, the first role is the orchestrator and the loop
+    /// can switch between roles via the `switch_role` tool.
+    /// When None (legacy), the agent behaves as a single-role agent.
+    #[serde(default)]
+    pub roles: Option<Vec<RoleConfig>>,
 }
 
 fn default_agent_mode() -> String {
@@ -268,6 +295,7 @@ impl Default for AgentConfig {
             permissions: HashMap::new(),
             instructions: None,
             mode: default_agent_mode(),
+            roles: None,
         }
     }
 }
@@ -281,6 +309,39 @@ impl AgentConfig {
     /// Whether this agent can be invoked as a subagent tool.
     pub fn is_subagent_callable(&self) -> bool {
         self.mode == "subagent" || self.mode == "all"
+    }
+
+    /// Validate the role list: must not be empty, names must be non-empty and unique.
+    pub fn validate_roles(&self) -> Result<(), String> {
+        if let Some(ref roles) = self.roles {
+            if roles.is_empty() {
+                return Err("roles list is empty".into());
+            }
+            let mut seen = std::collections::HashSet::new();
+            for role in roles {
+                let name = role.name.trim();
+                if name.is_empty() {
+                    return Err("role name must not be empty".into());
+                }
+                if !seen.insert(name.to_string()) {
+                    return Err(format!("duplicate role name: {}", name));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the effective instructions for a role.
+    /// Falls back: role.instructions -> agent.instructions -> None.
+    pub fn effective_role_instructions(
+        &self,
+        role: &RoleConfig,
+    ) -> Option<String> {
+        role.instructions
+            .clone()
+            .or_else(|| self.instructions.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -368,6 +429,66 @@ impl Config {
         let provider = self.effective_provider(agent_override);
         let model_id = self.effective_model_id(agent_override);
         format!("{provider}/{model_id}")
+    }
+
+    /// Resolve effective provider and model_id for a role, with the standard
+    /// fallback chain: role.model -> agent.model -> config defaults.
+    ///
+    /// Provider cascade:
+    ///   1. role_model explicit prefix (e.g., "ollama/qwen" → "ollama")
+    ///   2. agent_model explicit prefix (e.g., "ollama/llama3" → "ollama")
+    ///   3. config default provider
+    ///
+    /// Model_id cascade:
+    ///   1. role_model id (strip prefix if present)
+    ///   2. agent_model id (strip prefix if present)
+    ///   3. config default model_id
+    pub fn effective_role_model(
+        &self,
+        role_model: Option<&str>,
+        agent_model: Option<&str>,
+    ) -> (String, String) {
+        // Resolve provider
+        let provider = if let Some(rm) = role_model {
+            if let Some((p, _)) = rm.split_once('/') {
+                p.to_string()
+            } else if let Some(am) = agent_model {
+                if let Some((p, _)) = am.split_once('/') {
+                    p.to_string()
+                } else {
+                    self.model.provider.clone()
+                }
+            } else {
+                self.model.provider.clone()
+            }
+        } else if let Some(am) = agent_model {
+            if let Some((p, _)) = am.split_once('/') {
+                p.to_string()
+            } else {
+                self.model.provider.clone()
+            }
+        } else {
+            self.model.provider.clone()
+        };
+
+        // Resolve model_id
+        let model_id = if let Some(rm) = role_model {
+            if let Some((_, m)) = rm.split_once('/') {
+                m.to_string()
+            } else {
+                rm.to_string()
+            }
+        } else if let Some(am) = agent_model {
+            if let Some((_, m)) = am.split_once('/') {
+                m.to_string()
+            } else {
+                am.to_string()
+            }
+        } else {
+            self.effective_model_id(None)
+        };
+
+        (provider, model_id)
     }
 
     pub fn effective_temperature(&self, agent_override: Option<f32>) -> f32 {
@@ -1000,6 +1121,7 @@ base_url = "https://api.deepseek.com/v1"
                 permissions: HashMap::new(),
                 instructions: None,
                 mode: "primary".into(),
+                roles: None,
             },
         );
         // all_agents should include file agents (if any) AND config agents, with config winning
@@ -1399,5 +1521,165 @@ dir = "/tmp/mote-logs"
         )
         .unwrap();
         assert_eq!(config.logging.dir, PathBuf::from("/tmp/mote-logs"));
+    }
+
+    // ── Role-based loop tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_agent_with_roles() {
+        let markdown = r#"---
+mode: primary
+temperature: 0.1
+roles:
+  - name: orchestrator
+    model: deepseek/v4
+    instructions: "Plan and delegate."
+  - name: coder
+    model: deepseek/v3
+---
+# Build
+
+Fallback instructions.
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert_eq!(cfg.mode, "primary");
+        assert_eq!(cfg.temperature, Some(0.1));
+        assert!(cfg.instructions.is_some());
+        assert!(
+            cfg.instructions
+                .as_ref()
+                .unwrap()
+                .contains("Fallback instructions")
+        );
+        assert!(cfg.roles.is_some());
+        let roles = cfg.roles.as_ref().unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0].name, "orchestrator");
+        assert_eq!(roles[0].model.as_deref(), Some("deepseek/v4"));
+        assert_eq!(
+            roles[0].instructions.as_deref(),
+            Some("Plan and delegate.")
+        );
+        assert_eq!(roles[1].name, "coder");
+        assert_eq!(roles[1].model.as_deref(), Some("deepseek/v3"));
+        assert!(roles[1].instructions.is_none());
+        assert!(cfg.validate_roles().is_ok());
+    }
+
+    #[test]
+    fn test_parse_agent_without_roles_is_legacy() {
+        let markdown = r#"---
+mode: primary
+---
+# Build
+
+Just instructions.
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert_eq!(cfg.mode, "primary");
+        assert!(cfg.roles.is_none());
+        assert!(cfg.validate_roles().is_ok());
+    }
+
+    #[test]
+    fn test_validate_roles_empty_rejected() {
+        let cfg = AgentConfig {
+            roles: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(cfg.validate_roles().is_err());
+    }
+
+    #[test]
+    fn test_validate_roles_duplicate_name_rejected() {
+        let cfg = AgentConfig {
+            roles: Some(vec![
+                RoleConfig {
+                    name: "coder".into(),
+                    instructions: None,
+                    model: None,
+                    temperature: None,
+                    max_tokens: None,
+                },
+                RoleConfig {
+                    name: "coder".into(),
+                    instructions: None,
+                    model: None,
+                    temperature: None,
+                    max_tokens: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        assert!(cfg.validate_roles().is_err());
+    }
+
+    #[test]
+    fn test_role_instructions_fallback() {
+        let agent = AgentConfig {
+            instructions: Some("Agent default instructions".into()),
+            roles: Some(vec![
+                RoleConfig {
+                    name: "orchestrator".into(),
+                    instructions: Some("Orchestrator specific".into()),
+                    model: None,
+                    temperature: None,
+                    max_tokens: None,
+                },
+                RoleConfig {
+                    name: "coder".into(),
+                    instructions: None,
+                    model: None,
+                    temperature: None,
+                    max_tokens: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        let roles = agent.roles.as_ref().unwrap();
+        // Orchestrator has its own instructions
+        assert_eq!(
+            agent.effective_role_instructions(&roles[0]),
+            Some("Orchestrator specific".into())
+        );
+        // Coder falls back to agent instructions
+        assert_eq!(
+            agent.effective_role_instructions(&roles[1]),
+            Some("Agent default instructions".into())
+        );
+    }
+
+    #[test]
+    fn test_effective_role_model_fallback() {
+        let toml = r#"
+[model]
+provider = "deepseek"
+model_id = "deepseek-chat"
+
+[providers.ollama]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        // Role model wins
+        let (prov, model) =
+            config.effective_role_model(Some("ollama/qwen"), None);
+        assert_eq!(prov, "ollama");
+        assert_eq!(model, "qwen");
+
+        // Agent model fallback when role has no model
+        let (prov, model) =
+            config.effective_role_model(None, Some("glm/glm-4"));
+        assert_eq!(prov, "glm");
+        assert_eq!(model, "glm-4");
+
+        // Config default when neither has model
+        let (prov, model) = config.effective_role_model(None, None);
+        assert_eq!(prov, "deepseek");
+        assert_eq!(model, "deepseek-chat");
+
+        // Model without provider prefix uses default provider
+        let (prov, model) = config.effective_role_model(Some("gpt-4"), None);
+        assert_eq!(prov, "deepseek");
+        assert_eq!(model, "gpt-4");
     }
 }

@@ -2099,33 +2099,64 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
                 .as_ref()
                 .map(|s| format!(" | skill:{}", s))
                 .unwrap_or_default();
-            format!(
-                " {} | Sub: {} ({}/{}) {}{} | in:{} out:{} ",
-                app.model_info,
+            let sub_info = format!(
+                "Sub: {} ({}/{}) {}{}",
                 sv.name,
                 idx + 1,
                 app.subagent_views.len(),
                 status,
-                skill,
+                skill
+            );
+            status_right_info(
+                &app.model_info,
+                Some(&sub_info),
                 app.tokens_input,
-                app.tokens_output
+                app.tokens_output,
             )
         } else {
-            format!(
-                " {} | in:{} out:{} ",
-                app.model_info, app.tokens_input, app.tokens_output
+            status_right_info(
+                &app.model_info,
+                None,
+                app.tokens_input,
+                app.tokens_output,
             )
         }
     } else {
         let skill = app
             .current_skill
             .as_ref()
-            .map(|s| format!(" | skill:{}", s))
+            .map(|s| format!("skill:{}", s))
             .unwrap_or_default();
-        format!(
-            " {}{} | in:{} out:{} ",
-            app.model_info, skill, app.tokens_input, app.tokens_output
+        let extra = (!skill.is_empty()).then_some(skill.as_str());
+        status_right_info(
+            &app.model_info,
+            extra,
+            app.tokens_input,
+            app.tokens_output,
         )
+    };
+
+    let audio_hint = match &app.audio_state {
+        super::state::AudioState::Idle => {
+            format!("{} mic", app.push_to_talk_label)
+        }
+        super::state::AudioState::Connecting => "mic connecting".to_string(),
+        super::state::AudioState::Recording => {
+            format!("● REC · {} stop", app.push_to_talk_label)
+        }
+        super::state::AudioState::Transcribing => "● transcribing".to_string(),
+        super::state::AudioState::Error(_) => "mic error".to_string(),
+    };
+    let audio_style = match &app.audio_state {
+        super::state::AudioState::Idle => Style::default().fg(Color::DarkGray),
+        super::state::AudioState::Connecting
+        | super::state::AudioState::Transcribing => {
+            Style::default().fg(Color::Yellow)
+        }
+        super::state::AudioState::Recording => Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+        super::state::AudioState::Error(_) => Style::default().fg(Color::Red),
     };
 
     let style = Style::default().fg(Color::DarkGray);
@@ -2146,31 +2177,71 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
             " Ctrl+C quit · /help "
         }
     };
-    let right = if total > left.len() + right_info.len() {
-        right_info
+    let hints_prefix = format!("{}· ", hints.trim_end());
+    let hints_len = hints_prefix.len() + audio_hint.len() + 1;
+    // Always keep the same status categories visible: agent, help/mic hint,
+    // model, and token counts. If width is tight, truncate the right-side model
+    // block rather than dropping it entirely.
+    let show_middle = total > left.len() + hints_len;
+    let middle_len = if show_middle { hints_len } else { 0 };
+    let available_right = total.saturating_sub(left.len() + middle_len);
+    let right = if available_right > 0 {
+        truncate_status_right(&right_info, available_right)
     } else {
         String::new()
     };
-    let used = left.len() + right.len();
-    let middle = if total > used + hints.len() {
-        hints.to_string()
-    } else {
-        String::new()
-    };
-    let padding = total.saturating_sub(left.len() + middle.len() + right.len());
+    let padding = total.saturating_sub(left.len() + middle_len + right.len());
     let pad_left = padding / 2;
     let pad_right = padding - pad_left;
 
     let mut spans = vec![Span::styled(left, agent_style)];
-    if !middle.is_empty() {
+    if show_middle {
         spans.push(Span::styled(" ".repeat(pad_left), style));
-        spans.push(Span::styled(middle, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            hints_prefix,
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(audio_hint, audio_style));
+        spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(" ".repeat(pad_right), style));
     }
     if !right.is_empty() {
         spans.push(Span::styled(right, style));
     }
     frame.render_widget(Paragraph::new(Text::from(Line::from(spans))), area);
+}
+
+fn status_right_info(
+    model_info: &str,
+    extra: Option<&str>,
+    tokens_input: u64,
+    tokens_output: u64,
+) -> String {
+    let extra = extra.filter(|s| !s.is_empty()).unwrap_or_default();
+    if extra.is_empty() {
+        format!(" {model_info} | in:{tokens_input} out:{tokens_output} ")
+    } else {
+        format!(
+            " {model_info} | {extra} | in:{tokens_input} out:{tokens_output} "
+        )
+    }
+}
+
+fn truncate_status_right(text: &str, max_chars: usize) -> String {
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".into();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('…');
+    out
 }
 
 /// Second status line: current working directory / workspace root.
@@ -2313,6 +2384,7 @@ mod tests {
                 "deepseek/deepseek-chat".into(),
             )]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         }
     }
 

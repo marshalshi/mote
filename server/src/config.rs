@@ -52,6 +52,10 @@ pub struct Config {
     /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// Audio transcription configuration.
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,6 +127,52 @@ pub struct ProviderOllama {
     pub base_url: String,
     pub default_model: Option<String>,
     pub default_max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioConfig {
+    #[serde(default = "default_audio_provider")]
+    pub provider: String,
+    #[serde(default = "default_audio_model")]
+    pub model: String,
+    #[serde(default = "default_audio_sample_rate")]
+    pub sample_rate: u32,
+    #[serde(default = "default_audio_channels")]
+    pub channels: u16,
+    #[serde(default = "default_audio_realtime_url")]
+    pub realtime_url: String,
+}
+
+fn default_audio_provider() -> String {
+    "openai".into()
+}
+
+fn default_audio_model() -> String {
+    "gpt-4o-mini-transcribe".into()
+}
+
+fn default_audio_sample_rate() -> u32 {
+    24_000
+}
+
+fn default_audio_channels() -> u16 {
+    1
+}
+
+fn default_audio_realtime_url() -> String {
+    "https://api.openai.com/v1/audio/transcriptions".into()
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_audio_provider(),
+            model: default_audio_model(),
+            sample_rate: default_audio_sample_rate(),
+            channels: default_audio_channels(),
+            realtime_url: default_audio_realtime_url(),
+        }
+    }
 }
 
 fn default_ollama_base_url() -> String {
@@ -723,6 +773,21 @@ impl Config {
                 .is_some(),
             _ => false,
         }
+    }
+
+    pub fn resolve_audio_api_key(
+        &self,
+        auth: &crate::auth::Auth,
+    ) -> Result<String> {
+        if self.audio.provider != "openai" {
+            anyhow::bail!(
+                "Unsupported audio provider '{}'. Supported: openai",
+                self.audio.provider
+            );
+        }
+        auth.api_key("openai")
+            .map(Self::expand)
+            .context("No OpenAI API key found. Run --login openai or add {\"openai\":{\"api_key\":\"sk-...\"}} to ~/.config/mote/auth.json.")
     }
 
     fn provider_api_key_config(

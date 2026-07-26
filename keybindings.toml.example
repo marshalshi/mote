@@ -25,3 +25,4 @@
 # complete = "tab"
 # toggle_selection_mode = "f6"
 # cancel_agent = "esc"
+# push_to_talk = "ctrl+m"

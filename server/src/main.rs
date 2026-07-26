@@ -18,6 +18,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, info};
 
 mod agent;
+mod audio;
 mod auth;
 mod config;
 mod history;
@@ -151,6 +152,11 @@ async fn get_config(
         model_info: format!("{}/{}", cfg.model.provider, cfg.model.model_id),
         agent_model_info,
         default_agent: cfg.server.default_agent.clone(),
+        audio: marshaling_protocol::AudioUiConfig {
+            model: cfg.audio.model.clone(),
+            sample_rate: cfg.audio.sample_rate,
+            channels: cfg.audio.channels,
+        },
     })
 }
 
@@ -331,6 +337,32 @@ async fn compact_handler(
             Err((StatusCode::BAD_REQUEST, format!("{e:#}")))
         }
     }
+}
+
+async fn audio_transcribe_handler(
+    ws: WebSocketUpgrade,
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl IntoResponse {
+    tracing::debug!("audio transcription websocket upgrade requested");
+    let audio_config = state.config.audio.clone();
+    let api_key = {
+        let auth_guard = state.auth.read().await;
+        match state.config.resolve_audio_api_key(&auth_guard) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!("audio transcription unavailable: {e:#}");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Audio transcription unavailable: {e:#}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    ws.on_upgrade(move |socket| {
+        audio::handle_transcription_socket(socket, audio_config, api_key)
+    })
+    .into_response()
 }
 
 async fn compact_conversation(
@@ -2151,6 +2183,7 @@ async fn main() -> Result<()> {
         .route("/sessions/{id}", get(load_session).delete(delete_session))
         .route("/models", get(list_models_handler))
         .route("/compact", post(compact_handler))
+        .route("/audio/transcribe", get(audio_transcribe_handler))
         .route("/rollback/last", post(rollback_last_handler))
         .route("/chat", get(ws_handler))
         .route("/auth/save", post(auth_save))

@@ -31,12 +31,15 @@ pub enum Action {
     ToggleSelectionMode,
     /// Cancel the running agent (Escape while streaming).
     CancelAgent,
+    /// Toggle push-to-talk audio transcription.
+    PushToTalk,
 }
 
 /// Resolved keybinding map.
 #[derive(Debug, Clone)]
 pub struct Keybindings {
     map: HashMap<(KeyCode, KeyModifiers), Action>,
+    labels: HashMap<Action, String>,
 }
 
 /// A single action→keys mapping from TOML.
@@ -63,10 +66,14 @@ impl Keybindings {
     /// Build from optional user overrides, filling missing actions with defaults.
     pub fn from_config(raw: Option<&RawBindings>) -> Self {
         let mut map = HashMap::new();
+        let mut labels = HashMap::new();
         let mut insert = |action: Action, keys: &[String]| {
             for key_str in keys {
                 if let Ok((code, mods)) = parse_key_def(key_str) {
                     map.insert((code, mods), action);
+                    labels
+                        .entry(action)
+                        .or_insert_with(|| format_key_label(key_str));
                 }
             }
         };
@@ -83,17 +90,21 @@ impl Keybindings {
                 if let Some(action) = action_from_name(name) {
                     // Remove all existing default bindings for this action
                     map.retain(|_, v| *v != action);
+                    labels.remove(&action);
                     // Add the user's bindings
                     for key_str in keylist.clone().into_vec() {
                         if let Ok((code, mods)) = parse_key_def(&key_str) {
                             map.insert((code, mods), action);
+                            labels
+                                .entry(action)
+                                .or_insert_with(|| format_key_label(&key_str));
                         }
                     }
                 }
             }
         }
 
-        Self { map }
+        Self { map, labels }
     }
 
     /// Look up the action for a key event.
@@ -112,6 +123,41 @@ impl Keybindings {
         }
         None
     }
+
+    /// User-facing label for the first configured key for an action.
+    pub fn display_label(&self, action: Action) -> Option<&str> {
+        self.labels.get(&action).map(String::as_str)
+    }
+}
+
+fn format_key_label(raw: &str) -> String {
+    raw.split('+')
+        .map(|part| match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "Ctrl".into(),
+            "alt" | "option" => "Alt".into(),
+            "shift" => "Shift".into(),
+            "super" | "cmd" | "command" => "Cmd".into(),
+            "esc" | "escape" => "Esc".into(),
+            "enter" => "Enter".into(),
+            "tab" => "Tab".into(),
+            "space" => "Space".into(),
+            "backspace" | "bs" => "Backspace".into(),
+            "delete" | "del" => "Delete".into(),
+            other if other.len() == 1 => other.to_ascii_uppercase(),
+            other if other.starts_with('f') => other.to_ascii_uppercase(),
+            other => {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>()
+                            + chars.as_str()
+                    }
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("+")
 }
 
 fn action_from_name(name: &str) -> Option<Action> {
@@ -136,6 +182,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "switch_view" => Some(Action::SwitchView),
         "toggle_selection_mode" => Some(Action::ToggleSelectionMode),
         "cancel_agent" => Some(Action::CancelAgent),
+        "push_to_talk" => Some(Action::PushToTalk),
         _ => None,
     }
 }
@@ -165,6 +212,7 @@ fn default_bindings() -> Vec<(Action, Vec<String>)> {
         (Action::SwitchView, vec!["f5".into()]),
         (Action::ToggleSelectionMode, vec!["f6".into()]),
         (Action::CancelAgent, vec!["esc".into()]),
+        (Action::PushToTalk, vec!["ctrl+m".into()]),
     ]
 }
 
@@ -355,6 +403,14 @@ mod tests {
         );
         // Default binding no longer present (replaced by override)
         assert_eq!(kb.lookup(KeyCode::Enter, KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn test_display_label_uses_override() {
+        let mut raw = RawBindings::new();
+        raw.insert("push_to_talk".into(), KeyList::Single("f8".into()));
+        let kb = Keybindings::from_config(Some(&raw));
+        assert_eq!(kb.display_label(Action::PushToTalk), Some("F8"));
     }
 
     #[test]

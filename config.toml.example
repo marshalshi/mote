@@ -61,6 +61,15 @@ dir = "history/"               # with ~/.config/mote/config.toml this resolves t
 [logging]
 dir = "logs/"                  # with ~/.config/mote/config.toml this resolves to ~/.config/mote/logs/
 
+# --- Audio transcription ---
+# OpenAI API key goes in ~/.config/mote/auth.json:
+#   { "openai": { "api_key": "sk-..." } }
+[audio]
+provider = "openai"
+model = "gpt-4o-mini-transcribe"
+sample_rate = 24000
+channels = 1
+
 # --- Prompt files ---
 [prompts]
 default = "prompts/system/mote.md"

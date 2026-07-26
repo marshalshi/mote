@@ -101,6 +101,15 @@ pub struct App {
     /// Pending async slash action (e.g., fetching models).
     pub pending_slash: Option<SlashAction>,
 
+    /// Pending push-to-talk toggle requested by keybinding.
+    pub pending_audio_toggle: bool,
+
+    /// Current audio transcription UI state.
+    pub audio_state: AudioState,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u16,
+    pub push_to_talk_label: String,
+
     /// Queued user messages (entered while agent was running).
     pub input_queue: VecDeque<String>,
 
@@ -268,6 +277,15 @@ pub enum AppState {
     Quitting,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioState {
+    Idle,
+    Connecting,
+    Recording,
+    Transcribing,
+    Error(String),
+}
+
 // ── Built-in commands ─────────────────────────────────────
 
 const AUTO_COMPACT_CHAR_THRESHOLD: usize = 100_000;
@@ -293,6 +311,7 @@ const LOGIN_PROVIDERS: &[(&str, &str, &str)] = &[
         "MiniMax",
         "https://platform.minimax.io/user-center/basic-information/interface-key",
     ),
+    ("openai", "OpenAI", "https://platform.openai.com/api-keys"),
 ];
 
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -382,6 +401,11 @@ impl App {
             input_accent,
             user_accent: parse_ui_color(&ui_config.user_accent),
             pending_slash: None,
+            pending_audio_toggle: false,
+            audio_state: AudioState::Idle,
+            audio_sample_rate: ui_config.audio.sample_rate,
+            audio_channels: ui_config.audio.channels,
+            push_to_talk_label: "Ctrl+M".into(),
             input_queue: VecDeque::new(),
             loading_progress: None,
             loading_label: None,
@@ -1535,6 +1559,34 @@ impl App {
         self.update_suggestions();
     }
 
+    pub fn insert_transcript(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let needs_leading_space = self
+            .input
+            .get(..self.input_cursor)
+            .and_then(|s| s.chars().next_back())
+            .is_some_and(|c| !c.is_whitespace());
+        let needs_trailing_space = self
+            .input
+            .get(self.input_cursor..)
+            .and_then(|s| s.chars().next())
+            .is_some_and(|c| !c.is_whitespace());
+        let mut insert = String::new();
+        if needs_leading_space {
+            insert.push(' ');
+        }
+        insert.push_str(trimmed);
+        if needs_trailing_space {
+            insert.push(' ');
+        }
+        self.input.insert_str(self.input_cursor, &insert);
+        self.input_cursor += insert.len();
+        self.update_suggestions();
+    }
+
     pub fn delete_before(&mut self) {
         if self.input_cursor > 0 {
             let prev = self.input[..self.input_cursor]
@@ -2122,6 +2174,7 @@ mod tests {
             model_info: "test/test-model".into(),
             agent_model_info,
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         }
     }
 
@@ -2777,6 +2830,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
 
@@ -2982,6 +3036,17 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_transcript_adds_word_boundaries() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "fixbug".into();
+        app.input_cursor = 3;
+        app.insert_transcript(" the ");
+        assert_eq!(app.input, "fix the bug");
+        assert_eq!(app.input_cursor, "fix the ".len());
+    }
+
+    #[test]
     fn test_cycle_agent_updates_agent_without_echo_message() {
         let cfg = marshaling_protocol::UiConfig {
             input_accent: "cyan".into(),
@@ -2995,6 +3060,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.current_agent, "build");
@@ -3042,6 +3108,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.model_info, "test/test-model");
@@ -3067,6 +3134,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.cycle_agent();

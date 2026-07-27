@@ -55,6 +55,8 @@ pub struct App {
     pub messages: Vec<DisplayMessage>,
     pub input: String,
     pub input_cursor: usize,
+    /// Scroll offset from the bottom for overflowing input drafts. 0 = newest lines visible.
+    pub input_scroll_offset: usize,
     /// Scroll offset from the bottom in lines. 0 = at bottom (showing newest content).
     pub scroll_offset: usize,
     pub auto_scroll: bool,
@@ -372,6 +374,7 @@ impl App {
             messages: Vec::new(),
             input: String::new(),
             input_cursor: 0,
+            input_scroll_offset: 0,
             scroll_offset: 0,
             auto_scroll: true,
             model_info: agent_model_info
@@ -598,6 +601,7 @@ impl App {
     pub fn submit_input(&mut self) -> String {
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.auto_scroll = true;
 
         if self.pending_secret_login.is_some() {
@@ -626,6 +630,7 @@ impl App {
     pub fn submit_input_to_queue(&mut self) {
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.auto_scroll = true;
 
         if self.pending_secret_login.is_some() {
@@ -999,7 +1004,8 @@ impl App {
             "- `Esc` — Press twice within 2s to stop running agent".to_string(),
             "- `Ctrl+C` — Quit / cancel immediately".to_string(),
             "- `Tab` — Cycle agent".to_string(),
-            "- `Up/Down` — Input history".to_string(),
+            "- `Up/Down` — Input history, or scroll overflowing draft"
+                .to_string(),
             "- `PgUp/PgDn, Ctrl+↑/↓` — Scroll".to_string(),
             "- `Ctrl+P` — Agent command".to_string(),
             "- `F5` — Cycle subagent views".to_string(),
@@ -1525,6 +1531,7 @@ impl App {
         self.input_queue.push_back(text.to_string());
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
     }
 
     pub fn pop_queued_input_as_message(&mut self) -> bool {
@@ -1548,6 +1555,7 @@ impl App {
     pub fn insert_newline(&mut self) {
         self.input.insert(self.input_cursor, '\n');
         self.input_cursor += 1;
+        self.reset_input_scroll();
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -1556,6 +1564,7 @@ impl App {
         }
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
+        self.reset_input_scroll();
         self.update_suggestions();
     }
 
@@ -1596,6 +1605,7 @@ impl App {
                 .unwrap_or(1);
             self.input_cursor -= prev;
             self.input.remove(self.input_cursor);
+            self.reset_input_scroll();
             self.update_suggestions();
         }
     }
@@ -1603,6 +1613,7 @@ impl App {
     pub fn delete_after(&mut self) {
         if self.input_cursor < self.input.len() {
             self.input.remove(self.input_cursor);
+            self.reset_input_scroll();
             self.update_suggestions();
         }
     }
@@ -1610,6 +1621,7 @@ impl App {
     pub fn kill_line(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.update_suggestions();
     }
 
@@ -1637,9 +1649,11 @@ impl App {
 
     pub fn cursor_home(&mut self) {
         self.input_cursor = 0;
+        self.reset_input_scroll();
     }
     pub fn cursor_end(&mut self) {
         self.input_cursor = self.input.len();
+        self.reset_input_scroll();
     }
 
     pub fn history_up(&mut self) {
@@ -1654,6 +1668,7 @@ impl App {
         self.input_history_idx = Some(idx);
         self.input = self.input_history[idx].clone();
         self.input_cursor = self.input.len();
+        self.reset_input_scroll();
     }
 
     pub fn history_down(&mut self) {
@@ -1663,13 +1678,31 @@ impl App {
                 self.input_history_idx = Some(i + 1);
                 self.input = self.input_history[i + 1].clone();
                 self.input_cursor = self.input.len();
+                self.reset_input_scroll();
             }
             Some(_) => {
                 self.input_history_idx = None;
                 self.input.clear();
                 self.input_cursor = 0;
+                self.reset_input_scroll();
             }
         }
+    }
+
+    pub fn input_scroll_up(&mut self, amount: usize, max_offset: usize) {
+        self.input_scroll_offset = self
+            .input_scroll_offset
+            .saturating_add(amount)
+            .min(max_offset);
+    }
+
+    pub fn input_scroll_down(&mut self, amount: usize) {
+        self.input_scroll_offset =
+            self.input_scroll_offset.saturating_sub(amount);
+    }
+
+    pub fn reset_input_scroll(&mut self) {
+        self.input_scroll_offset = 0;
     }
 
     pub fn cycle_agent(&mut self) {
@@ -1779,6 +1812,7 @@ impl App {
         });
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.reset_suggestions();
         self.push_command_message(
             Role::Assistant,
@@ -1875,6 +1909,7 @@ impl App {
         self.input_queue.clear();
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.suggestions.clear();
         self.suggestion_index = 0;
         self.handled_slash_command = false;
@@ -1912,6 +1947,7 @@ impl App {
         self.input_queue.clear();
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.suggestions.clear();
         self.suggestion_index = 0;
         self.handled_slash_command = false;
@@ -2036,6 +2072,7 @@ impl App {
         if let Some(cmd) = self.selected_suggestion() {
             self.input = cmd.to_string();
             self.input_cursor = self.input.len();
+            self.reset_input_scroll();
             self.suggestions.clear();
             self.suggestion_index = 0;
         }
@@ -2998,6 +3035,24 @@ mod tests {
         assert!(!app.auto_scroll);
         app.scroll_to_bottom();
         assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn test_input_scroll_helpers() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        app.input_scroll_up(3, 5);
+        assert_eq!(app.input_scroll_offset, 3);
+
+        app.input_scroll_up(10, 5);
+        assert_eq!(app.input_scroll_offset, 5);
+
+        app.input_scroll_down(2);
+        assert_eq!(app.input_scroll_offset, 3);
+
+        app.reset_input_scroll();
+        assert_eq!(app.input_scroll_offset, 0);
     }
 
     #[test]

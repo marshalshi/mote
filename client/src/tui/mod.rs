@@ -1330,8 +1330,16 @@ fn handle_action(
             Some(Action::KillLine) => app.kill_line(),
             Some(Action::DeleteBefore) => app.delete_before(),
             Some(Action::DeleteAfter) => app.delete_after(),
-            Some(Action::HistoryUp) => app.history_up(),
-            Some(Action::HistoryDown) => app.history_down(),
+            Some(Action::HistoryUp) => {
+                if !handle_input_vertical_scroll(app, true) {
+                    app.history_up();
+                }
+            }
+            Some(Action::HistoryDown) => {
+                if !handle_input_vertical_scroll(app, false) {
+                    app.history_down();
+                }
+            }
             None => {
                 if let crossterm::event::KeyCode::Char(c) = code {
                     let clean = modifiers == KeyModifiers::NONE
@@ -1349,8 +1357,16 @@ fn handle_action(
     // During waiting response, still allow input history navigation
     if app.state == AppState::WaitingResponse {
         match action {
-            Some(Action::HistoryUp) => app.history_up(),
-            Some(Action::HistoryDown) => app.history_down(),
+            Some(Action::HistoryUp) => {
+                if !handle_input_vertical_scroll(app, true) {
+                    app.history_up();
+                }
+            }
+            Some(Action::HistoryDown) => {
+                if !handle_input_vertical_scroll(app, false) {
+                    app.history_down();
+                }
+            }
             _ => {}
         }
         return;
@@ -1449,8 +1465,16 @@ fn normal_action(
         Some(Action::KillLine) => app.kill_line(),
         Some(Action::DeleteBefore) => app.delete_before(),
         Some(Action::DeleteAfter) => app.delete_after(),
-        Some(Action::HistoryUp) => app.history_up(),
-        Some(Action::HistoryDown) => app.history_down(),
+        Some(Action::HistoryUp) => {
+            if !handle_input_vertical_scroll(app, true) {
+                app.history_up();
+            }
+        }
+        Some(Action::HistoryDown) => {
+            if !handle_input_vertical_scroll(app, false) {
+                app.history_down();
+            }
+        }
         Some(Action::AgentCommand) => {
             if app.input.is_empty() {
                 app.input.push('/');
@@ -1474,6 +1498,25 @@ fn normal_action(
         }
         _ => {}
     }
+}
+
+fn handle_input_vertical_scroll(app: &mut App, upward: bool) -> bool {
+    let Some((term_width, term_height)) = crossterm::terminal::size().ok()
+    else {
+        return false;
+    };
+    let full_area = Rect::new(0, 0, term_width, term_height);
+    let max_offset = render::input_scroll_capacity(full_area, app);
+    if max_offset == 0 && app.input_scroll_offset == 0 {
+        return false;
+    }
+
+    if upward {
+        app.input_scroll_up(1, max_offset);
+    } else {
+        app.input_scroll_down(1);
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

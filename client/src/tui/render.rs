@@ -13,31 +13,32 @@ use std::sync::OnceLock;
 use super::state::{App, AppState, SubagentView};
 use dirs;
 
+const INPUT_FRAME_CHROME_LINES: u16 = 4;
+const INPUT_SIDE_PADDING: u16 = 6;
+const INPUT_PROMPT_WIDTH: usize = 2;
+const MIN_RESPONSE_LINES: u16 = 3;
+const STATUS_LINES: u16 = 2;
+
+struct InputRenderState {
+    prompt: &'static str,
+    display_input: String,
+    display_cursor: usize,
+    display_lines: Vec<String>,
+    shell_mode: bool,
+    placeholder: bool,
+}
+
 /// Paint a frame.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let full_area = frame.area();
 
-    // Cap content width at 140 columns for readability on wide terminals
-    let max_content_width: u16 = 140;
-    let area = if full_area.width > max_content_width + 2 {
-        let margin = (full_area.width - max_content_width) / 2;
-        Rect::new(
-            full_area.x + margin,
-            full_area.y,
-            max_content_width,
-            full_area.height,
-        )
-    } else {
-        full_area
-    };
+    let area = content_area_for_frame(full_area);
 
-    let newline_count = app.input.matches('\n').count();
-    let input_lines =
-        (newline_count.saturating_add(1)).max(1).min(8) as u16 + 4; // +2 for top/bottom accent +2 for spacers
     let max_queue_lines = full_area.height.saturating_sub(8) as usize;
     let queue_lines = app.input_queue.len().min(max_queue_lines) as u16;
-    let input_panel_lines = input_lines.saturating_add(queue_lines);
     let show_loading = app.loading_progress.is_some();
+    let input_lines = input_height(area, queue_lines, show_loading, app);
+    let input_panel_lines = input_lines.saturating_add(queue_lines);
     let loading_height: u16 = if show_loading { 1 } else { 0 };
 
     let chunks = Layout::default()
@@ -1863,7 +1864,21 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     };
     let a_style = Style::default().fg(a_disabled);
     // 4 for accent bar + 2 for right padding
-    let content_width = area.width.saturating_sub(6) as usize;
+    let content_width = area.width.saturating_sub(INPUT_SIDE_PADDING) as usize;
+    let render_state = input_render_state(app, area.width);
+    let visible_content_lines =
+        area.height.saturating_sub(INPUT_FRAME_CHROME_LINES) as usize;
+    let max_scroll_offset = render_state
+        .display_lines
+        .len()
+        .saturating_sub(visible_content_lines);
+    let input_scroll_offset = app.input_scroll_offset.min(max_scroll_offset);
+    let visible_start = render_state
+        .display_lines
+        .len()
+        .saturating_sub(visible_content_lines + input_scroll_offset);
+    let visible_end = (visible_start + visible_content_lines)
+        .min(render_state.display_lines.len());
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1874,31 +1889,29 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     lines.push(Line::from(Span::styled(" ▌  ", a_style)));
 
     // Input content lines — word-wrapped with accent bar and prompt symbol
-    let shell_mode = app.input.starts_with('!');
-    let (prompt, display_input, display_cursor) =
-        shell_input_display(&app.input, app.input_cursor);
     let display_input = if let Some(provider_name) = app.secret_input_prompt() {
-        let masked = "•".repeat(display_input.chars().count());
+        let masked = "•".repeat(render_state.display_input.chars().count());
         if masked.is_empty() {
             format!("[secure {} API key entry]", provider_name)
         } else {
             masked
         }
     } else {
-        display_input
+        render_state.display_input.clone()
     };
-    let is_placeholder = display_input.is_empty()
-        && matches!(app.state, AppState::Idle | AppState::AgentRunning);
-    let display_text = if is_placeholder {
-        "message · /command · !shell".to_string()
-    } else {
-        display_input.clone()
-    };
-    let wrapped =
-        word_wrap_line(&display_text, content_width.saturating_sub(2));
-    for (i, text_line) in wrapped.iter().enumerate() {
-        let prompt_text = if i == 0 { prompt } else { "  " };
-        let prompt_style = if shell_mode {
+    for (i, text_line) in render_state
+        .display_lines
+        .iter()
+        .skip(visible_start)
+        .take(visible_content_lines)
+        .enumerate()
+    {
+        let prompt_text = if visible_start == 0 && i == 0 {
+            render_state.prompt
+        } else {
+            "  "
+        };
+        let prompt_style = if render_state.shell_mode {
             Style::default().fg(Color::Green)
         } else {
             a_style
@@ -1908,7 +1921,7 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
             Span::styled(prompt_text.to_string(), prompt_style),
             Span::styled(
                 text_line.clone(),
-                if is_placeholder {
+                if render_state.placeholder {
                     Style::default().fg(Color::DarkGray)
                 } else {
                     input_style
@@ -1930,15 +1943,103 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     if app.pending_permission.is_none()
         && matches!(app.state, AppState::Idle | AppState::AgentRunning)
     {
-        let prompt_width = 2; // "❯ " or "$ "
         let (col, visual_row) = cursor_pos_after_wrap(
             &display_input,
-            display_cursor,
-            content_width.saturating_sub(prompt_width),
+            render_state.display_cursor,
+            content_width.saturating_sub(INPUT_PROMPT_WIDTH),
         );
-        let cx = area.x + input_cursor_screen_x(area.width, prompt_width, col);
-        let cy = area.y + 2 + visual_row as u16; // +1 for spacer +1 for top accent padding
+        if !(visible_start..visible_end).contains(&visual_row) {
+            return;
+        }
+        let visible_row = visual_row.saturating_sub(visible_start);
+        let cx =
+            area.x + input_cursor_screen_x(area.width, INPUT_PROMPT_WIDTH, col);
+        let cy = area.y + 2 + visible_row as u16; // +1 for spacer +1 for top accent padding
         frame.set_cursor_position(ratatui::prelude::Position::new(cx, cy));
+    }
+}
+
+fn input_height(
+    area: Rect,
+    queue_lines: u16,
+    show_loading: bool,
+    app: &App,
+) -> u16 {
+    let content_lines = input_render_state(app, area.width).display_lines.len();
+    let max_content_lines =
+        max_input_content_lines(area.height, queue_lines, show_loading);
+    let content_lines = content_lines.clamp(1, max_content_lines) as u16;
+    content_lines + INPUT_FRAME_CHROME_LINES
+}
+
+pub(crate) fn input_scroll_capacity(full_area: Rect, app: &App) -> usize {
+    let area = content_area_for_frame(full_area);
+    let max_queue_lines = full_area.height.saturating_sub(8) as usize;
+    let queue_lines = app.input_queue.len().min(max_queue_lines) as u16;
+    let show_loading = app.loading_progress.is_some();
+    let total_lines = input_render_state(app, area.width).display_lines.len();
+    let max_content_lines =
+        max_input_content_lines(area.height, queue_lines, show_loading);
+    total_lines.saturating_sub(max_content_lines)
+}
+
+fn input_render_state(app: &App, area_width: u16) -> InputRenderState {
+    let shell_mode = app.input.starts_with('!');
+    let (prompt, display_input, display_cursor) =
+        shell_input_display(&app.input, app.input_cursor);
+    let placeholder = display_input.is_empty()
+        && matches!(app.state, AppState::Idle | AppState::AgentRunning);
+    let display_text = if placeholder {
+        "message · /command · !shell".to_string()
+    } else {
+        display_input.clone()
+    };
+    let content_width = area_width.saturating_sub(INPUT_SIDE_PADDING) as usize;
+    let display_lines = word_wrap_line(
+        &display_text,
+        content_width.saturating_sub(INPUT_PROMPT_WIDTH),
+    );
+
+    InputRenderState {
+        prompt,
+        display_input,
+        display_cursor,
+        display_lines,
+        shell_mode,
+        placeholder,
+    }
+}
+
+fn max_input_content_lines(
+    full_height: u16,
+    queue_lines: u16,
+    show_loading: bool,
+) -> usize {
+    let loading_height = if show_loading { 1 } else { 0 };
+    full_height
+        .saturating_sub(
+            MIN_RESPONSE_LINES
+                + STATUS_LINES
+                + loading_height
+                + queue_lines
+                + INPUT_FRAME_CHROME_LINES,
+        )
+        .max(1) as usize
+}
+
+pub(crate) fn content_area_for_frame(full_area: Rect) -> Rect {
+    // Cap content width at 140 columns for readability on wide terminals.
+    let max_content_width: u16 = 140;
+    if full_area.width > max_content_width + 2 {
+        let margin = (full_area.width - max_content_width) / 2;
+        Rect::new(
+            full_area.x + margin,
+            full_area.y,
+            max_content_width,
+            full_area.height,
+        )
+    } else {
+        full_area
     }
 }
 
@@ -2467,6 +2568,42 @@ mod tests {
         // accent = 4, prompt = 2, text width = 12, so cursor after the final
         // character should land at x = 18, not be clamped left to 14.
         assert_eq!(input_cursor_screen_x(20, 2, 12), 18);
+    }
+
+    #[test]
+    fn test_input_height_tracks_wrapped_visual_lines() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "1234567890 abc".into();
+        app.input_cursor = app.input.len();
+
+        assert_eq!(input_height(Rect::new(0, 0, 16, 20), 0, false, &app), 6);
+    }
+
+    #[test]
+    fn test_input_height_uses_available_terminal_height() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = (0..12)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.input_cursor = app.input.len();
+
+        assert_eq!(input_height(Rect::new(0, 0, 80, 12), 0, false, &app), 7);
+    }
+
+    #[test]
+    fn test_input_scroll_capacity_reports_hidden_lines() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = (0..12)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.input_cursor = app.input.len();
+
+        assert_eq!(input_scroll_capacity(Rect::new(0, 0, 80, 12), &app), 9);
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod auth;
 mod config;
 mod history;
 mod llm;
+mod pm;
 mod prompt;
 mod session;
 mod tools;
@@ -41,6 +42,8 @@ struct AppState {
     runtime_states: tokio::sync::Mutex<HashMap<String, RuntimeSessionState>>,
     /// Long-running agent tasks that outlive websocket subscribers.
     runs: tokio::sync::Mutex<HashMap<String, ActiveRun>>,
+    /// PM (project management) context with SQLite store.
+    pm_ctx: pm::PmContext,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +340,46 @@ async fn compact_handler(
             Err((StatusCode::BAD_REQUEST, format!("{e:#}")))
         }
     }
+}
+
+/// POST /integrations/pm/chat — local PM-only bridge for external adapters
+/// such as the DingTalk sidecar.
+async fn pm_bridge_chat_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(request): Json<marshaling_protocol::pm::PmBridgeChatRequest>,
+) -> Result<
+    Json<marshaling_protocol::pm::PmBridgeChatResponse>,
+    (StatusCode, String),
+> {
+    if !validate_runtime_session_key(&request.runtime_session_key) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid runtime_session_key".into(),
+        ));
+    }
+    if request.message.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Message cannot be empty".into(),
+        ));
+    }
+
+    let workspace =
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let req_ctx = RequestContext {
+        workspace_display: workspace.display().to_string(),
+        workspace,
+        runtime_session_key: request.runtime_session_key.clone(),
+        repo_agents_md: None,
+    };
+
+    run_pm_bridge_turn(&state, req_ctx, request)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::warn!("pm bridge request failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+        })
 }
 
 async fn audio_transcribe_handler(
@@ -745,6 +788,20 @@ fn apply_selected_session_id(
     }
 }
 
+fn pm_bridge_session_id(runtime_session_key: &str) -> String {
+    let safe = runtime_session_key
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("pm_bridge_{safe}")
+}
+
 fn history_dir_for_session(
     base_history_dir: &std::path::Path,
     runtime_session_key: &str,
@@ -1096,8 +1153,14 @@ pub fn build_permission_map(
             .unwrap_or(config.permissions.default);
         perms.insert(tool_name.clone(), effective);
     }
-    // use_skill is always allowed (safe read-only)
-    perms.insert("use_skill".into(), config::Permission::Allow);
+    // use_skill defaults to allowed (safe read-only), but respect explicit
+    // agent/global overrides for special-purpose agents such as PM.
+    let use_skill_perm = agent_permissions
+        .and_then(|ap| ap.get("use_skill"))
+        .or_else(|| config.permissions.tools.get("use_skill"))
+        .copied()
+        .unwrap_or(config::Permission::Allow);
+    perms.insert("use_skill".into(), use_skill_perm);
     // finish_task is an internal completion marker handled by the loop.
     perms.insert("finish_task".into(), config::Permission::Allow);
     // switch_role is always allowed when the agent defines roles.
@@ -1115,7 +1178,7 @@ pub fn build_permission_map(
     perms
 }
 
-/// Build the augmented tool set (builtins + use_skill + subagent tool).
+/// Build the augmented tool set (builtins + use_skill + subagent + PM tools).
 fn build_augmented_tools(
     workspace: &std::path::Path,
     repo_agents_md: Option<String>,
@@ -1124,6 +1187,9 @@ fn build_augmented_tools(
     merged_agents: &HashMap<String, config::AgentConfig>,
     cancel_rx: &tokio::sync::watch::Receiver<bool>,
     agent_tx: &mpsc::UnboundedSender<Result<agent::AgentEvent>>,
+    agent_name: &str,
+    _agent_cfg: Option<&config::AgentConfig>,
+    pm_ctx: &pm::PmContext,
 ) -> Arc<Vec<Box<dyn llm::Tool>>> {
     let mut augmented: Vec<Box<dyn llm::Tool>> =
         llm::builtin_tools(workspace.to_path_buf());
@@ -1154,6 +1220,12 @@ fn build_augmented_tools(
             parent_events_tx: agent_tx.clone(),
         }),
     )));
+
+    // PM-specific tools — only for the pm agent
+    if agent_name == "pm" {
+        augmented.extend(pm::pm_tools(pm_ctx.clone()));
+    }
+
     Arc::new(augmented)
 }
 async fn ws_handler(
@@ -1242,12 +1314,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // Drop auth guard before the long-running agent loop
     drop(auth_guard);
 
-    // Build permission map
+    // Build permission map — include PM tools when the pm agent is active
     let preview_tools = llm::builtin_tools(req_ctx.workspace.clone());
-    let tool_names: Vec<String> = preview_tools
+    let mut tool_names: Vec<String> = preview_tools
         .iter()
         .map(|t| t.def().function.name.clone())
         .collect();
+    if agent_name == "pm" {
+        tool_names.extend(pm::PM_TOOL_NAMES.iter().map(|&n| n.to_string()));
+    }
     let agent_cfg = state.merged_agents.get(&agent_name);
     let mut perms = build_permission_map(&state.config, agent_cfg, &tool_names);
     let remembered_allows = {
@@ -1283,7 +1358,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Build augmented tools (builtins + use_skill + subagent)
+    // Build augmented tools (builtins + use_skill + subagent + PM tools if applicable)
     let augmented_tools = build_augmented_tools(
         &req_ctx.workspace,
         req_ctx.repo_agents_md.clone(),
@@ -1292,6 +1367,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         &state.merged_agents,
         &cancel_rx,
         &agent_tx,
+        &agent_name,
+        agent_cfg,
+        &state.pm_ctx,
     );
 
     // Reconstruct conversation history from the client's display messages
@@ -1314,6 +1392,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // the effective permissions so denied tools stay invisible to the model.
     let mut opts = ctx.opts;
     opts.tools = Vec::new();
+
+    // Extract reminder_profile from agent config for dynamic system reminder
+    let reminder_profile = agent_cfg.and_then(|a| a.reminder_profile.clone());
 
     let eff_model_id_save = ctx.eff_model_id.clone();
     let eff_provider = ctx.eff_provider;
@@ -1358,6 +1439,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             max_steps,
             workspace_display,
             ctx.role_loop_config,
+            reminder_profile,
         )
         .await;
     });
@@ -1576,6 +1658,193 @@ fn save_run_session(
             tracing::warn!("Failed to save session: {e}");
         }
     });
+}
+
+async fn run_pm_bridge_turn(
+    state: &Arc<AppState>,
+    req_ctx: RequestContext,
+    request: marshaling_protocol::pm::PmBridgeChatRequest,
+) -> Result<marshaling_protocol::pm::PmBridgeChatResponse> {
+    let agent_name = "pm".to_string();
+    let auth_guard = state.auth.read().await;
+    let ctx = resolve_agent_context(
+        &state.config,
+        &*auth_guard,
+        &state.merged_agents,
+        &req_ctx,
+        &agent_name,
+        None,
+        None,
+    )
+    .await?;
+    drop(auth_guard);
+
+    let preview_tools = llm::builtin_tools(req_ctx.workspace.clone());
+    let mut tool_names: Vec<String> = preview_tools
+        .iter()
+        .map(|t| t.def().function.name.clone())
+        .collect();
+    tool_names.extend(pm::PM_TOOL_NAMES.iter().map(|&n| n.to_string()));
+
+    let agent_cfg = state.merged_agents.get(&agent_name);
+    let mut perms = build_permission_map(&state.config, agent_cfg, &tool_names);
+    // The local PM bridge is non-interactive. Remap Ask -> Deny so tools that
+    // require interactive approval stay hidden from the model.
+    for perm in perms.values_mut() {
+        if *perm == config::Permission::Ask {
+            *perm = config::Permission::Deny;
+        }
+    }
+
+    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (_permission_tx, permission_rx) =
+        mpsc::unbounded_channel::<(String, bool)>();
+
+    let augmented_tools = build_augmented_tools(
+        &req_ctx.workspace,
+        req_ctx.repo_agents_md.clone(),
+        &ctx.provider,
+        &state.config,
+        &state.merged_agents,
+        &cancel_rx,
+        &agent_tx,
+        &agent_name,
+        agent_cfg,
+        &state.pm_ctx,
+    );
+
+    let mut history: Vec<llm::ChatMessage> = Vec::new();
+    for hm in &request.history {
+        match hm.role.as_str() {
+            "user" => history.push(llm::ChatMessage::user(&hm.content)),
+            "assistant" => {
+                history.push(llm::ChatMessage::assistant_text(&hm.content))
+            }
+            _ => {}
+        }
+    }
+
+    let mut opts = ctx.opts;
+    opts.tools = Vec::new();
+    let reminder_profile = Some("pm_dingtalk".to_string());
+    let eff_model_id_save = ctx.eff_model_id.clone();
+    let eff_provider = ctx.eff_provider;
+    let history_dir = state.config.history.dir.clone();
+    let selected_session_id =
+        Some(pm_bridge_session_id(&req_ctx.runtime_session_key));
+    let max_steps = state.config.server.max_steps;
+    let workspace_display = req_ctx.workspace_display.clone();
+    let prov_spawn = ctx.provider;
+
+    tokio::spawn(async move {
+        let _ = cancel_tx;
+        agent::run_loop(
+            prov_spawn,
+            augmented_tools,
+            ctx.system_layers,
+            request.message,
+            history,
+            opts,
+            agent_tx,
+            cancel_rx,
+            permission_rx,
+            perms,
+            max_steps,
+            workspace_display,
+            ctx.role_loop_config,
+            reminder_profile,
+        )
+        .await;
+    });
+
+    while let Some(agent_event) = agent_rx.recv().await {
+        match agent_event? {
+            agent::AgentEvent::Done {
+                content,
+                tokens_input,
+                tokens_output,
+                history,
+            } => {
+                save_run_session(
+                    history,
+                    eff_model_id_save,
+                    eff_provider,
+                    agent_name,
+                    tokens_input,
+                    tokens_output,
+                    selected_session_id.clone(),
+                    history_dir,
+                    req_ctx.runtime_session_key,
+                    None,
+                );
+                return Ok(marshaling_protocol::pm::PmBridgeChatResponse {
+                    reply: content,
+                    tokens_input,
+                    tokens_output,
+                    status: "done".into(),
+                });
+            }
+            agent::AgentEvent::Cancelled {
+                content,
+                tokens_input,
+                tokens_output,
+                history,
+            } => {
+                save_run_session(
+                    history,
+                    eff_model_id_save,
+                    eff_provider,
+                    agent_name,
+                    tokens_input,
+                    tokens_output,
+                    selected_session_id.clone(),
+                    history_dir,
+                    req_ctx.runtime_session_key,
+                    None,
+                );
+                return Ok(marshaling_protocol::pm::PmBridgeChatResponse {
+                    reply: content,
+                    tokens_input,
+                    tokens_output,
+                    status: "cancelled".into(),
+                });
+            }
+            agent::AgentEvent::NeedsContinuation {
+                content,
+                tokens_input,
+                tokens_output,
+                history,
+            } => {
+                save_run_session(
+                    history,
+                    eff_model_id_save,
+                    eff_provider,
+                    agent_name,
+                    tokens_input,
+                    tokens_output,
+                    selected_session_id.clone(),
+                    history_dir,
+                    req_ctx.runtime_session_key,
+                    None,
+                );
+                return Ok(marshaling_protocol::pm::PmBridgeChatResponse {
+                    reply: content,
+                    tokens_input,
+                    tokens_output,
+                    status: "needs_continuation".into(),
+                });
+            }
+            agent::AgentEvent::PermissionRequest { tool_name, .. } => {
+                anyhow::bail!(
+                    "PM bridge attempted interactive permission request for tool '{tool_name}'"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    anyhow::bail!("PM bridge agent loop ended without a terminal event")
 }
 
 async fn attach_socket_to_run(
@@ -2165,12 +2434,23 @@ async fn main() -> Result<()> {
 
     info!("Server started (workspace is per-request)");
 
+    // Initialize PM context with default path
+    let pm_db_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("mote")
+        .join("pm");
+    let pm_ctx =
+        pm::PmContext::open(pm_db_dir).context("initializing PM database")?;
+    info!("PM database initialized");
+
     let state = Arc::new(AppState {
         merged_agents: config::all_agents(&config.agents),
         auth: RwLock::new(auth),
         config,
         runtime_states: tokio::sync::Mutex::new(HashMap::new()),
         runs: tokio::sync::Mutex::new(HashMap::new()),
+        pm_ctx,
     });
 
     let configured_port = state.config.server.port;
@@ -2185,6 +2465,7 @@ async fn main() -> Result<()> {
         .route("/compact", post(compact_handler))
         .route("/audio/transcribe", get(audio_transcribe_handler))
         .route("/rollback/last", post(rollback_last_handler))
+        .route("/integrations/pm/chat", post(pm_bridge_chat_handler))
         .route("/chat", get(ws_handler))
         .route("/auth/save", post(auth_save))
         .layer(CorsLayer::permissive())
@@ -2411,6 +2692,102 @@ read = "allow"
     }
 
     #[test]
+    fn test_build_permission_map_respects_use_skill_deny() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+[model]
+provider = "ollama"
+model_id = "m"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+[permissions]
+default = "ask"
+"#,
+        )
+        .unwrap();
+        let mut agent = config::AgentConfig::default();
+        agent
+            .permissions
+            .insert("use_skill".into(), config::Permission::Deny);
+
+        let perms = build_permission_map(&cfg, Some(&agent), &[]);
+        assert_eq!(perms.get("use_skill"), Some(&config::Permission::Deny));
+        assert_eq!(perms.get("finish_task"), Some(&config::Permission::Allow));
+    }
+
+    #[test]
+    fn test_build_permission_map_pm_style_hides_generic_tools() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+[model]
+provider = "ollama"
+model_id = "m"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+[permissions]
+default = "ask"
+"#,
+        )
+        .unwrap();
+        let mut agent = config::AgentConfig::default();
+        agent
+            .permissions
+            .insert("pm_get_status".into(), config::Permission::Allow);
+        for tool in [
+            "read",
+            "glob",
+            "grep",
+            "write",
+            "edit",
+            "delete",
+            "bash",
+            "use_skill",
+            "subagent",
+        ] {
+            agent
+                .permissions
+                .insert(tool.into(), config::Permission::Deny);
+        }
+        let tools = [
+            "read",
+            "glob",
+            "grep",
+            "write",
+            "edit",
+            "delete",
+            "bash",
+            "pm_get_status",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+        let perms = build_permission_map(&cfg, Some(&agent), &tools);
+        assert_eq!(
+            perms.get("pm_get_status"),
+            Some(&config::Permission::Allow)
+        );
+        assert_eq!(perms.get("finish_task"), Some(&config::Permission::Allow));
+        for tool in [
+            "read",
+            "glob",
+            "grep",
+            "write",
+            "edit",
+            "delete",
+            "bash",
+            "use_skill",
+            "subagent",
+        ] {
+            assert_eq!(perms.get(tool), Some(&config::Permission::Deny));
+        }
+    }
+
+    #[test]
     fn test_runtime_session_key_from_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("x-mote-session-key", "abc-123".parse().unwrap());
@@ -2450,6 +2827,24 @@ read = "allow"
         assert_ne!(sess.id, original);
     }
 
+    #[test]
+    fn test_pm_bridge_session_id_is_stable_and_safe() {
+        let id1 = pm_bridge_session_id(
+            "dingtalk:private:user-1:session:20260802120000000000",
+        );
+        let id2 = pm_bridge_session_id(
+            "dingtalk:private:user-1:session:20260802120000000000",
+        );
+        let id3 = pm_bridge_session_id(
+            "dingtalk:private:user-1:session:20260802210000000000",
+        );
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+        assert!(validate_session_id(&id1));
+        assert!(id1.starts_with("pm_bridge_dingtalk_private_user-1_session_"));
+    }
+
     #[tokio::test]
     async fn test_rollback_conflict_preserves_journal_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -2458,6 +2853,7 @@ read = "allow"
             .await
             .unwrap();
 
+        let pm_ctx = pm::PmContext::open_in_memory().unwrap();
         let state = Arc::new(AppState {
             config: test_config(dir.path().join("history")),
             auth: RwLock::new(auth::Auth::default()),
@@ -2480,6 +2876,7 @@ read = "allow"
                 },
             )])),
             runs: tokio::sync::Mutex::new(HashMap::new()),
+            pm_ctx,
         });
 
         let result = apply_rollback_last(&state, "sess").await;
@@ -2537,5 +2934,39 @@ base_url = "http://localhost:11434"
                 || perms3.get("switch_role")
                     != Some(&config::Permission::Allow)
         );
+    }
+
+    // ── PM tool registration tests ────────────────────────
+
+    fn open_pm_ctx() -> pm::PmContext {
+        pm::PmContext::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn test_pm_tool_names_are_registered() {
+        let ctx = open_pm_ctx();
+        let tools = pm::pm_tools(ctx);
+        assert_eq!(tools.len(), pm::PM_TOOL_NAMES.len());
+        for (tool, expected_name) in tools.iter().zip(pm::PM_TOOL_NAMES.iter())
+        {
+            assert_eq!(tool.def().function.name, *expected_name);
+        }
+    }
+
+    #[test]
+    fn test_pm_tool_names_all_have_schemas() {
+        let ctx = open_pm_ctx();
+        for tool in pm::pm_tools(ctx) {
+            let def = tool.def();
+            assert_eq!(def.def_type, "function");
+            assert!(!def.function.description.is_empty());
+            let params = def
+                .function
+                .parameters
+                .as_object()
+                .expect("param schema must be object");
+            assert!(params.contains_key("type"));
+            assert!(params.contains_key("properties"));
+        }
     }
 }

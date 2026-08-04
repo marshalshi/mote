@@ -25,12 +25,20 @@
 
 ```bash
 cargo build --workspace
+
+# 或者显式构建单个包
+cargo build -p mote-server
+cargo build -p mote-tui
 ```
 
 构建优化后的发布版二进制文件：
 
 ```bash
 cargo build --workspace --release
+
+# 或者显式构建单个包
+cargo build -p mote-server --release
+cargo build -p mote-tui --release
 ```
 
 编译后的二进制文件：
@@ -77,26 +85,32 @@ cp auth.json.example ~/.config/mote/auth.json
 
 ### 运行
 
-使用编译好的客户端二进制文件启动 Mote：
+分别启动服务端与 TUI：
 
 ```bash
-# 在后台启动本地服务器，然后显示 TUI（调试版）
-./target/debug/mote-tui
-
-# 在后台启动本地服务器，然后显示 TUI（发布版）
-./target/release/mote-tui
-
 # 独立启动服务器（调试版）
 ./target/debug/mote-server
 
 # 独立启动服务器（发布版）
 ./target/release/mote-server
 
-# 纯 TUI 模式，连接至已在运行的服务器（调试版）
-./target/debug/mote-tui --tui --server-url http://127.0.0.1:9847
+# TUI，连接到已运行服务器（调试版）
+./target/debug/mote-tui
 
-# 纯 TUI 模式，连接至已在运行的服务器（发布版）
-./target/release/mote-tui --tui --server-url http://127.0.0.1:9847
+# TUI，连接到已运行服务器（发布版）
+./target/release/mote-tui
+
+# TUI，连接到指定服务器（调试版）
+./target/debug/mote-tui --server-url http://127.0.0.1:9847
+
+# TUI，连接到指定服务器（发布版）
+./target/release/mote-tui --server-url http://127.0.0.1:9847
+
+# 可选：在后台拉起本地服务器后再打开 TUI（调试版）
+./target/debug/mote-tui --spawn-server
+
+# 可选：在后台拉起本地服务器后再打开 TUI（发布版）
+./target/release/mote-tui --spawn-server
 
 # 可选：强制指定会话密钥命名空间（调试版）
 ./target/debug/mote-tui --session-key team-a
@@ -105,7 +119,16 @@ cp auth.json.example ~/.config/mote/auth.json
 ./target/release/mote-tui --session-key team-a
 ```
 
-`mote-tui` 默认会在一个空闲的本地端口上启动服务器并显示 TUI 前端。当你希望单独运行服务器时使用 `mote-server`，然后使用 `mote-tui --tui --server-url http://127.0.0.1:<port>` 将 TUI 连接到已在运行的服务器。
+`mote-tui` 默认会连接到一个已经运行中的 `mote-server`。请先单独启动 `mote-server`，再启动 `mote-tui`。如果你仍然想保留旧的便捷模式，可以使用 `mote-tui --spawn-server` 自动在后台拉起服务器。
+
+### Cargo run 说明
+
+这个 workspace 已不再设置默认包。在仓库根目录运行时，请显式指定包名：
+
+```bash
+cargo run -p mote-server
+cargo run -p mote-tui
+```
 
 ### 运行时目录
 

@@ -39,6 +39,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+# SQLite (bundled for cross-platform compatibility)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# UUID generation for stable entity IDs
+uuid = { version = "1", features = ["v4"] }
+
 # Shared protocol types
 marshaling-protocol = { package = "mote-protocol", path = "../protocol" }
 

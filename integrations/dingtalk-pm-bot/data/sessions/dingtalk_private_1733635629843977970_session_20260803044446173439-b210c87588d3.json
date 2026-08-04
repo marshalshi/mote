@@ -1,0 +1,21 @@
+{
+  "session_key": "dingtalk:private:1733635629843977970:session:20260803044446173439",
+  "history": [
+    {
+      "role": "user",
+      "content": "Show me all the sites which we are active deploying now"
+    },
+    {
+      "role": "assistant",
+      "content": "There are no sites currently in active deployment. No batches are in a `deployed`, `ready`, or `in_preparation` state right now.\n\nIf you'd like, I can:\n- Show all sites (including inactive) with `pm_list_sites` filter `all`\n- Check for any blockers or alerts that might be preventing deployment\n- List any planned/in-progress batches\n\nLet me know what you'd like to explore."
+    },
+    {
+      "role": "user",
+      "content": "Show all sites"
+    },
+    {
+      "role": "assistant",
+      "content": "Here are all 3 sites:\n\n| Site | Location | Batch | Target Deploy |\n|------|----------|-------|---------------|\n| **BWD3D** | Cedar Rapids | EWD3A | 2026-07-27 |\n| **SGR** | South Carolina | SGR | 2026-07-27 |\n| **TNT** | Louisiana | TNT | 2026-08-03 |\n\nAll three sites have batches in **planned** status — none are actively deploying yet. BWD3D and SGR are past their target deploy date (2026-07-27), so they may be overdue."
+    }
+  ]
+}

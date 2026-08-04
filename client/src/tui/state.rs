@@ -2323,12 +2323,14 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_empty_quits() {
+    fn test_submit_empty_is_noop() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
         let text = app.submit_input();
         assert!(text.is_empty());
         assert!(!app.handled_slash_command);
+        assert_eq!(app.state, AppState::Idle);
+        assert!(app.messages.is_empty());
     }
 
     #[test]

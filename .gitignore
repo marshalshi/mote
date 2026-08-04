@@ -7,3 +7,6 @@ agent_tasks/
 config.toml
 keybindings.toml
 .env
+integrations/dingtalk-pm-bot/.env
+integrations/dingtalk-pm-bot/.venv/
+integrations/dingtalk-pm-bot/.pytest_cache/

@@ -25,12 +25,20 @@ Build debug binaries:
 
 ```bash
 cargo build --workspace
+
+# Or build one package explicitly
+cargo build -p mote-server
+cargo build -p mote-tui
 ```
 
 Build optimized release binaries:
 
 ```bash
 cargo build --workspace --release
+
+# Or build one package explicitly
+cargo build -p mote-server --release
+cargo build -p mote-tui --release
 ```
 
 Compiled binaries:
@@ -80,23 +88,29 @@ Or use the `--login` CLI flag to set them interactively:
 Start Mote with the compiled client binary:
 
 ```bash
-# Starts a local server in the background, then shows the TUI (debug build)
-./target/debug/mote-tui
-
-# Starts a local server in the background, then shows the TUI (release build)
-./target/release/mote-tui
-
 # Standalone server (debug build)
 ./target/debug/mote-server
 
 # Standalone server (release build)
 ./target/release/mote-server
 
-# TUI-only mode, connecting to an existing server (debug build)
-./target/debug/mote-tui --tui --server-url http://127.0.0.1:9847
+# TUI, connecting to an existing server (debug build)
+./target/debug/mote-tui
 
-# TUI-only mode, connecting to an existing server (release build)
-./target/release/mote-tui --tui --server-url http://127.0.0.1:9847
+# TUI, connecting to an existing server (release build)
+./target/release/mote-tui
+
+# TUI, connecting to a specific existing server (debug build)
+./target/debug/mote-tui --server-url http://127.0.0.1:9847
+
+# TUI, connecting to a specific existing server (release build)
+./target/release/mote-tui --server-url http://127.0.0.1:9847
+
+# Optional: spawn a local server in the background, then open the TUI (debug build)
+./target/debug/mote-tui --spawn-server
+
+# Optional: spawn a local server in the background, then open the TUI (release build)
+./target/release/mote-tui --spawn-server
 
 # Optional: force a specific session key namespace (debug build)
 ./target/debug/mote-tui --session-key team-a
@@ -105,7 +119,16 @@ Start Mote with the compiled client binary:
 ./target/release/mote-tui --session-key team-a
 ```
 
-`mote-tui` starts a local server on a free localhost port by default and shows the TUI frontend. Use `mote-server` when you want to run the server separately, and `mote-tui --tui --server-url http://127.0.0.1:<port>` to connect the TUI to an already-running server.
+`mote-tui` connects to an already-running `mote-server` by default. Start `mote-server` separately first, then run `mote-tui`. If you still want the old convenience behavior, use `mote-tui --spawn-server` to launch a background server automatically.
+
+### Cargo run notes
+
+This workspace no longer defines a default package. Use an explicit package name when running binaries from the repo root:
+
+```bash
+cargo run -p mote-server
+cargo run -p mote-tui
+```
 
 ### Runtime folders
 

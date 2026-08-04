@@ -52,7 +52,7 @@ struct ProviderLogin {
     example_model: &'static str,
 }
 
-/// Mote — starts a local server and opens the TUI by default.
+/// Mote — connects to an existing server by default.
 #[derive(Parser, Debug)]
 #[command(name = "mote", version, about)]
 struct Cli {
@@ -60,9 +60,13 @@ struct Cli {
     #[arg(long, conflicts_with = "tui")]
     server: bool,
 
-    /// Run only the TUI frontend, connecting to an existing server.
-    #[arg(long, conflicts_with = "server")]
+    /// Deprecated no-op: the TUI now connects to an existing server by default.
+    #[arg(long, conflicts_with_all = ["server", "spawn_server"], hide = true)]
     tui: bool,
+
+    /// Spawn a local mote-server in the background, then open the TUI.
+    #[arg(long, conflicts_with_all = ["server", "tui"])]
+    spawn_server: bool,
 
     /// Server address for TUI-only mode.
     #[arg(long, default_value = DEFAULT_SERVER_URL)]
@@ -143,12 +147,12 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    let (_server_child, server_url) = if cli.tui {
-        (None, cli.server_url.clone())
-    } else {
+    let (_server_child, server_url) = if cli.spawn_server {
         let port = reserve_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         (Some(spawn_local_server(port, cli.verbose)?), url)
+    } else {
+        (None, cli.server_url.clone())
     };
 
     // Create client
@@ -162,7 +166,10 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     if !client.health().await {
-        anyhow::bail!("Could not connect to mote-server at {}", server_url);
+        anyhow::bail!(
+            "Could not connect to mote-server at {}. Start mote-server first or use --spawn-server.",
+            server_url
+        );
     }
 
     // Handle login first (no TUI needed)

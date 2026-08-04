@@ -1287,6 +1287,7 @@ impl SubagentRunner for AgentSubagentRunner {
                 crate::agent::DEFAULT_MAX_STEPS,
                 workspace_display,
                 role_config,
+                None,
             )
             .await;
         });

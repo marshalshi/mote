@@ -241,6 +241,8 @@ pub async fn run_loop(
     working_directory: String,
     // Role-aware loop config. When None, runs in legacy (single-role) mode.
     role_config: Option<RoleLoopConfig>,
+    // Optional reminder profile for dynamic system reminder customization.
+    reminder_profile: Option<String>,
 ) {
     let max_steps = if max_steps == 0 {
         DEFAULT_MAX_STEPS
@@ -405,6 +407,7 @@ pub async fn run_loop(
             tool_defs: &tool_defs,
             last_turn_results,
             last_user_message: last_user_msg,
+            reminder_profile: reminder_profile.clone(),
         };
         let reminder = crate::prompt::build_system_reminder(&reminder_ctx);
         messages.push(ChatMessage::system(&reminder));
@@ -1208,6 +1211,7 @@ mod tests {
             2,
             "/tmp".into(),
             None,
+            None,
         )
         .await;
 
@@ -1437,6 +1441,7 @@ mod tests {
             2,
             "/tmp".into(),
             None,
+            None,
         )
         .await;
 
@@ -1502,6 +1507,7 @@ mod tests {
             permissions,
             10,
             "/tmp".into(),
+            None,
             None,
         )
         .await;
@@ -1600,6 +1606,7 @@ mod tests {
             10,
             "/tmp".into(),
             None,
+            None,
         )
         .await;
 
@@ -1681,6 +1688,7 @@ mod tests {
             permissions,
             10,
             "/tmp".into(),
+            None,
             None,
         )
         .await;
@@ -1771,6 +1779,7 @@ mod tests {
             1,
             "/tmp".into(),
             None,
+            None,
         )
         .await;
 
@@ -1826,6 +1835,7 @@ mod tests {
             permissions,
             max_steps,
             "/tmp".into(),
+            None,
             None,
         )
         .await;

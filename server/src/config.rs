@@ -195,8 +195,19 @@ pub struct PromptConfig {
     #[serde(default = "default_prompt_file")]
     pub default: PathBuf,
 }
+
+fn built_in_assets_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
 fn default_prompt_file() -> PathBuf {
-    PathBuf::from("prompts/system/mote.md")
+    built_in_assets_root()
+        .join("prompts")
+        .join("system")
+        .join("mote.md")
 }
 impl Default for PromptConfig {
     fn default() -> Self {
@@ -330,6 +341,17 @@ pub struct AgentConfig {
     /// contract spelling. `disable_system_prompt` is accepted as an alias.
     #[serde(default, alias = "disable_system_prompt")]
     pub disble_system_prompt: bool,
+    /// If true, omit the workspace/repo AGENTS.md layer for this agent.
+    /// Also accepts `disable_repo_agents_md` as a serde alias for YAML compat.
+    #[serde(default, alias = "disable_repo_agents_md")]
+    pub disable_workspace_agents_md: bool,
+    /// Optional reminder profile that changes the dynamic system reminder wording.
+    /// When `Some("pm")`, the reminder emphasizes DB as truth source, validate
+    /// before writes, ask one clarifying question when ambiguous, and surface
+    /// alerts proactively. When None or any other value, the default coding-oriented
+    /// reminder is used.
+    #[serde(default)]
+    pub reminder_profile: Option<String>,
     /// Agent mode: "primary" (user-selectable, default), "subagent" (tool-only), "all" (both).
     #[serde(default = "default_agent_mode")]
     pub mode: String,
@@ -355,6 +377,8 @@ impl Default for AgentConfig {
             instructions: None,
             disable_user_agents_md: false,
             disble_system_prompt: false,
+            disable_workspace_agents_md: false,
+            reminder_profile: None,
             mode: default_agent_mode(),
             roles: None,
         }
@@ -840,7 +864,10 @@ pub fn load_file_agents() -> HashMap<String, AgentConfig> {
     let mut agents = HashMap::new();
 
     // 1. Built-in agents shipped in the repo.
-    load_agents_from_dir(&PathBuf::from("prompts/agents"), &mut agents);
+    load_agents_from_dir(
+        &built_in_assets_root().join("prompts").join("agents"),
+        &mut agents,
+    );
 
     // 2. User agents (override built-in on name collision).
     let user_dir = resolve_config_path("agents");
@@ -1198,6 +1225,8 @@ base_url = "https://api.deepseek.com/v1"
                 instructions: None,
                 disable_user_agents_md: false,
                 disble_system_prompt: false,
+                disable_workspace_agents_md: false,
+                reminder_profile: None,
                 mode: "primary".into(),
                 roles: None,
             },
@@ -1368,6 +1397,13 @@ Plan instructions.
             Some(Permission::Deny)
         );
         assert_eq!(cfg2.instructions.as_deref(), Some("Plan instructions."));
+    }
+
+    #[test]
+    fn test_default_prompt_file_points_to_built_in_asset() {
+        let path = default_prompt_file();
+        assert!(path.ends_with("prompts/system/mote.md"));
+        assert!(path.is_absolute());
     }
 
     #[test]
@@ -1677,6 +1713,62 @@ disble_system_prompt: true
         let cfg = parse_agent_markdown(markdown).unwrap();
         assert!(cfg.disable_user_agents_md);
         assert!(cfg.disble_system_prompt);
+    }
+
+    #[test]
+    fn test_disable_workspace_agents_md_default_false() {
+        let cfg = parse_agent_markdown("# Build\n\nInstructions.").unwrap();
+        assert!(!cfg.disable_workspace_agents_md);
+    }
+
+    #[test]
+    fn test_disable_workspace_agents_md_explicit_true() {
+        let markdown = r#"---
+disable_workspace_agents_md: true
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert!(cfg.disable_workspace_agents_md);
+    }
+
+    #[test]
+    fn test_disable_workspace_agents_md_alias_repo() {
+        let markdown = r#"---
+disable_repo_agents_md: true
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert!(cfg.disable_workspace_agents_md);
+    }
+
+    #[test]
+    fn test_reminder_profile_default_none() {
+        let cfg = parse_agent_markdown("# Build\n\nInstructions.").unwrap();
+        assert_eq!(cfg.reminder_profile, None);
+    }
+
+    #[test]
+    fn test_reminder_profile_explicit_pm() {
+        let markdown = r#"---
+reminder_profile: "pm"
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert_eq!(cfg.reminder_profile.as_deref(), Some("pm"));
+    }
+
+    #[test]
+    fn test_reminder_profile_arbitrary_value() {
+        let markdown = r#"---
+reminder_profile: "custom"
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert_eq!(cfg.reminder_profile.as_deref(), Some("custom"));
     }
 
     #[test]

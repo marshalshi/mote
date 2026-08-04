@@ -1436,10 +1436,7 @@ fn normal_action(
 ) {
     match action {
         Some(Action::SendMessage) => {
-            let text = app.submit_input();
-            if text.is_empty() && !app.handled_slash_command {
-                app.state = AppState::Quitting;
-            }
+            let _ = app.submit_input();
         }
         Some(Action::InsertNewline) => app.insert_newline(),
         Some(Action::CursorLeft) => app.cursor_left(),

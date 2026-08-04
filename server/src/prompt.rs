@@ -17,6 +17,9 @@ pub struct PromptAssembler {
     agent_instructions: Option<String>,
     disable_user_agents_md: bool,
     disble_system_prompt: bool,
+    disable_workspace_agents_md: bool,
+    #[allow(dead_code)]
+    reminder_profile: Option<String>,
     workspace_root: Option<PathBuf>,
     repo_agents_md: Option<String>,
 }
@@ -30,6 +33,8 @@ impl PromptAssembler {
             agent_instructions: None,
             disable_user_agents_md: false,
             disble_system_prompt: false,
+            disable_workspace_agents_md: false,
+            reminder_profile: None,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -46,11 +51,16 @@ impl PromptAssembler {
             agent.is_some_and(|a| a.disable_user_agents_md);
         let disble_system_prompt =
             agent.is_some_and(|a| a.disble_system_prompt);
+        let disable_workspace_agents_md =
+            agent.is_some_and(|a| a.disable_workspace_agents_md);
+        let reminder_profile = agent.and_then(|a| a.reminder_profile.clone());
         Self {
             config: cfg,
             agent_instructions: instructions,
             disable_user_agents_md,
             disble_system_prompt,
+            disable_workspace_agents_md,
+            reminder_profile,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -174,6 +184,9 @@ impl PromptAssembler {
     }
 
     fn workspace_agents_layer(&self) -> Option<String> {
+        if self.disable_workspace_agents_md {
+            return None;
+        }
         let src = self
             .workspace_root
             .as_ref()
@@ -365,6 +378,9 @@ pub struct ReminderContext<'a> {
     pub tool_defs: &'a [ToolDef],
     pub last_turn_results: Vec<ToolResultSummary>,
     pub last_user_message: Option<String>,
+    /// Optional reminder profile that changes the reminder wording.
+    /// When `Some("pm")`, PM-specific guidance is used instead of coding defaults.
+    pub reminder_profile: Option<String>,
 }
 
 /// Build the dynamic `<system-reminder>` block for the current turn.
@@ -407,7 +423,19 @@ pub fn build_system_reminder(ctx: &ReminderContext) -> String {
         String::new()
     };
 
-    let guidance = if ctx.step == 1 {
+    let guidance = if ctx.reminder_profile.as_deref() == Some("pm_dingtalk") {
+        if ctx.step == 1 {
+            "Your operational mode is PM for DingTalk chat. You are not in coding or build mode. Use the same PM agent instructions and PM database truth as the TUI version. Use PM tools as the only interface to persistent PM state. Do not inspect SQLite files directly. Do not use generic file tools or shell commands for PM data access. If a write is ambiguous, ask exactly ONE precise clarifying question. Surface urgent alerts and blocked batches first, then give a concise chat-friendly reply."
+        } else {
+            "Continue in DingTalk PM mode. Use PM tools only for persistent state. Do not inspect SQLite files directly. Do not use generic file tools or shell commands for PM data access. Ask one clarifying question when ambiguous. Surface urgent alerts and blocked batches first, then reply concisely."
+        }
+    } else if ctx.reminder_profile.as_deref() == Some("pm") {
+        if ctx.step == 1 {
+            "You are a chat-first PM operator. The database is the single source of truth — always use PM tools to read and write data. Never invent entity IDs, dates, or quantities. Before writing, validate constraints and ask exactly ONE precise clarifying question if the request is ambiguous. Surface blockers and alerts proactively in every reply."
+        } else {
+            "Continue the task using PM tools for truth. Validate before writing. Ask one clarifying question when ambiguous. Surface blockers and alerts proactively. Never invent IDs, dates, or quantities."
+        }
+    } else if ctx.step == 1 {
         "You are at the start of a task. Use the tools above to accomplish the user's request. When the request is fully complete, call finish_task with the final answer. Do not stop early if more tool work or follow-up reasoning is still needed."
     } else {
         "Continue the task based on these results. Do not repeat tool calls that already succeeded. When the request is fully complete, call finish_task with the final answer."
@@ -602,6 +630,67 @@ default = "/nonexistent/prompts/system/mote.md"
 
         let assembler = test_assembler_with_agent(config, agent);
         assert!(assembler.load_global_agents_layer().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_workspace_agents_layer_suppressed_when_flag_true() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "test-model"
+[providers.ollama]
+base_url = "http://localhost:11434"
+[prompts]
+default = "/nonexistent/prompts/system/mote.md"
+"#,
+        )
+        .unwrap();
+        let agent = crate::config::AgentConfig {
+            disable_workspace_agents_md: true,
+            ..Default::default()
+        };
+
+        let assembler = test_assembler_with_agent(config, agent)
+            .with_workspace_context(
+                Some(PathBuf::from("/tmp/repo")),
+                Some("# workspace rules".into()),
+            );
+        let layers = assembler.assemble("test", "test-model").unwrap();
+        assert!(
+            !layers
+                .iter()
+                .any(|l| l.contains("Instructions from: /tmp/repo/AGENTS.md"))
+        );
+    }
+
+    #[test]
+    fn test_workspace_agents_layer_present_by_default() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "test-model"
+[providers.ollama]
+base_url = "http://localhost:11434"
+[prompts]
+default = "/nonexistent/prompts/system/mote.md"
+"#,
+        )
+        .unwrap();
+        let agent = crate::config::AgentConfig::default();
+
+        let assembler = test_assembler_with_agent(config, agent)
+            .with_workspace_context(
+                Some(PathBuf::from("/tmp/repo")),
+                Some("# workspace rules".into()),
+            );
+        let layers = assembler.assemble("test", "test-model").unwrap();
+        assert!(
+            layers
+                .iter()
+                .any(|l| l.contains("Instructions from: /tmp/repo/AGENTS.md"))
+        );
     }
 
     #[test]
@@ -813,6 +902,7 @@ Skill content here."#;
             tool_defs: &[],
             last_turn_results: vec![],
             last_user_message: None,
+            reminder_profile: None,
         };
         let reminder = build_system_reminder(&ctx);
         assert!(reminder.contains("<system-reminder>"));
@@ -844,6 +934,7 @@ Skill content here."#;
                 },
             ],
             last_user_message: Some("find the config file".into()),
+            reminder_profile: None,
         };
         let reminder = build_system_reminder(&ctx);
         assert!(reminder.contains("Turn 2 (soft budget: 10)"));
@@ -870,8 +961,102 @@ Skill content here."#;
             tool_defs: &[def],
             last_turn_results: vec![],
             last_user_message: None,
+            reminder_profile: None,
         };
         let reminder = build_system_reminder(&ctx);
         assert!(reminder.contains("Available tools: read"));
+    }
+
+    #[test]
+    fn test_pm_reminder_profile_first_turn() {
+        let ctx = ReminderContext {
+            step: 1,
+            max_steps: 10,
+            working_directory: "/pm".into(),
+            tool_defs: &[],
+            last_turn_results: vec![],
+            last_user_message: None,
+            reminder_profile: Some("pm".into()),
+        };
+        let reminder = build_system_reminder(&ctx);
+        // PM-specific wording
+        assert!(reminder.contains("chat-first PM operator"));
+        assert!(reminder.contains("single source of truth"));
+        assert!(reminder.contains("Never invent entity IDs"));
+        // Should not contain default coding guidance
+        assert!(!reminder.contains("call finish_task with the final answer"));
+    }
+
+    #[test]
+    fn test_pm_reminder_profile_non_first_turn() {
+        let ctx = ReminderContext {
+            step: 2,
+            max_steps: 10,
+            working_directory: "/pm".into(),
+            tool_defs: &[],
+            last_turn_results: vec![],
+            last_user_message: Some("check batch 12".into()),
+            reminder_profile: Some("pm".into()),
+        };
+        let reminder = build_system_reminder(&ctx);
+        assert!(
+            reminder.contains("Continue the task using PM tools for truth")
+        );
+        assert!(reminder.contains("Validate before writing"));
+        assert!(reminder.contains("Never invent IDs, dates, or quantities"));
+    }
+
+    #[test]
+    fn test_pm_dingtalk_reminder_profile_first_turn() {
+        let ctx = ReminderContext {
+            step: 1,
+            max_steps: 10,
+            working_directory: "/pm".into(),
+            tool_defs: &[],
+            last_turn_results: vec![],
+            last_user_message: None,
+            reminder_profile: Some("pm_dingtalk".into()),
+        };
+        let reminder = build_system_reminder(&ctx);
+        assert!(reminder.contains("DingTalk chat"));
+        assert!(reminder.contains("same PM agent instructions and PM database truth as the TUI version"));
+        assert!(reminder.contains("Do not inspect SQLite files directly"));
+        assert!(!reminder.contains("call finish_task with the final answer"));
+    }
+
+    #[test]
+    fn test_pm_dingtalk_reminder_profile_non_first_turn() {
+        let ctx = ReminderContext {
+            step: 2,
+            max_steps: 10,
+            working_directory: "/pm".into(),
+            tool_defs: &[],
+            last_turn_results: vec![],
+            last_user_message: Some("check alerts".into()),
+            reminder_profile: Some("pm_dingtalk".into()),
+        };
+        let reminder = build_system_reminder(&ctx);
+        assert!(reminder.contains("Continue in DingTalk PM mode"));
+        assert!(reminder.contains("PM tools only for persistent state"));
+    }
+
+    #[test]
+    fn test_default_reminder_unchanged() {
+        let ctx = ReminderContext {
+            step: 1,
+            max_steps: 10,
+            working_directory: "/wd".into(),
+            tool_defs: &[],
+            last_turn_results: vec![],
+            last_user_message: None,
+            reminder_profile: None,
+        };
+        let reminder = build_system_reminder(&ctx);
+        assert!(
+            reminder.contains(
+                "Use the tools above to accomplish the user's request"
+            )
+        );
+        assert!(!reminder.contains("PM operator"));
     }
 }

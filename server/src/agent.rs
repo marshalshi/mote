@@ -576,6 +576,9 @@ pub async fn run_loop(
 
         // Execute each tool
         let mut displays = Vec::new();
+        let mut finish_task_answer = None;
+        let mut pending_role_switch = None;
+        let mut tool_batch_failed = false;
         for tc in &result.tool_calls {
             if *cancel_rx.borrow() {
                 let _ = events_tx.send(Ok(AgentEvent::Cancelled {
@@ -599,14 +602,16 @@ pub async fn run_loop(
                 })
                 .or_else(|| result.content.clone())
                 .unwrap_or_else(|| "(task finished)".to_string());
-                history.push(ChatMessage::assistant_text(final_answer.clone()));
-                let _ = events_tx.send(Ok(AgentEvent::Done {
-                    content: final_answer,
-                    tokens_input: total_input,
-                    tokens_output: total_output,
-                    history,
-                }));
-                return;
+                finish_task_answer.get_or_insert(final_answer);
+                let result_text = "Task completion acknowledged.";
+                history.push(ChatMessage::tool_result(&tc.id, result_text));
+                displays.push(ToolCallDisplay {
+                    id: tc.id.clone(),
+                    name: "finish_task".into(),
+                    status: ToolStatus::Success,
+                    changes: Vec::new(),
+                });
+                continue;
             }
 
             // ── Handle switch_role (role-mode loop-owned tool) ──────
@@ -620,6 +625,7 @@ pub async fn run_loop(
                     match serde_json::from_str(&tc.function.arguments) {
                         Ok(v) => v,
                         Err(e) => {
+                            tool_batch_failed = true;
                             let err =
                                 format!("Invalid switch_role arguments: {e}");
                             let _ =
@@ -648,7 +654,6 @@ pub async fn run_loop(
                 }) {
                     Some((_rc, idx)) => {
                         // Valid role — switch and inject task
-                        current_role_idx = idx;
                         let task_msg = if task.is_empty() {
                             format!("Switched to role: {}", target_role)
                         } else {
@@ -675,11 +680,14 @@ pub async fn run_loop(
                             status: ToolStatus::Success,
                             changes: Vec::new(),
                         });
-                        // Push user message LAST — marks the start of the
-                        // next turn, after the tool result.
-                        history.push(ChatMessage::user(&task_msg));
+                        // Apply this after every result from the current
+                        // assistant tool-call message has been recorded.
+                        // If several switches are emitted, the last valid one
+                        // wins because it is the last requested transition.
+                        pending_role_switch = Some((idx, task_msg));
                     }
                     None => {
+                        tool_batch_failed = true;
                         let available = role_config
                             .as_ref()
                             .map(|rc| {
@@ -741,6 +749,7 @@ pub async fn run_loop(
             {
                 Some(t) => t,
                 None => {
+                    tool_batch_failed = true;
                     let err = format!("Unknown tool: {}", tc.function.name);
                     let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
                         id: tc.id.clone(),
@@ -765,6 +774,7 @@ pub async fn run_loop(
                 match serde_json::from_str(&tc.function.arguments) {
                     Ok(v) => v,
                     Err(e) => {
+                        tool_batch_failed = true;
                         let err = format!("Failed to parse arguments: {}", e);
                         let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
                             id: tc.id.clone(),
@@ -792,6 +802,7 @@ pub async fn run_loop(
             match perm {
                 crate::config::Permission::Allow => {} // proceed to execute
                 crate::config::Permission::Deny => {
+                    tool_batch_failed = true;
                     let err = format!(
                         "Permission denied: '{}' is not allowed for this agent",
                         tc.function.name
@@ -839,6 +850,7 @@ pub async fn run_loop(
                         }
                     };
                     if !allowed {
+                        tool_batch_failed = true;
                         let err = format!(
                             "Permission denied by user for tool '{}'",
                             tc.function.name
@@ -863,7 +875,31 @@ pub async fn run_loop(
             }
 
             // Execute
-            match tool.execute(args).await {
+            let execution = tool.execute(args);
+            tokio::pin!(execution);
+            let mut cancel_open = true;
+            let execution = loop {
+                tokio::select! {
+                    output = &mut execution => break Some(output),
+                    changed = cancel_rx.changed(), if cancel_open => {
+                        match changed {
+                            Ok(()) if *cancel_rx.borrow() => break None,
+                            Ok(()) => continue,
+                            Err(_) => cancel_open = false,
+                        }
+                    }
+                }
+            };
+            let Some(execution) = execution else {
+                let _ = events_tx.send(Ok(AgentEvent::Cancelled {
+                    content: "(cancelled)".into(),
+                    tokens_input: total_input,
+                    tokens_output: total_output,
+                    history,
+                }));
+                return;
+            };
+            match execution {
                 Ok(output) => {
                     let _ = events_tx.send(Ok(AgentEvent::ToolCompleted {
                         id: tc.id.clone(),
@@ -882,6 +918,7 @@ pub async fn run_loop(
                     });
                 }
                 Err(e) => {
+                    tool_batch_failed = true;
                     let err = format!("{:#}", e);
                     let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
                         id: tc.id.clone(),
@@ -899,6 +936,24 @@ pub async fn run_loop(
                     });
                 }
             }
+        }
+
+        if let Some(final_answer) =
+            finish_task_answer.filter(|_| !tool_batch_failed)
+        {
+            history.push(ChatMessage::assistant_text(final_answer.clone()));
+            let _ = events_tx.send(Ok(AgentEvent::Done {
+                content: final_answer,
+                tokens_input: total_input,
+                tokens_output: total_output,
+                history,
+            }));
+            return;
+        }
+
+        if let Some((role_idx, task_msg)) = pending_role_switch {
+            current_role_idx = role_idx;
+            history.push(ChatMessage::role_task(task_msg));
         }
 
         // ── Phase 3: Signal turn completion ────────────────────
@@ -1097,6 +1152,29 @@ mod tests {
                 changes: Vec::new(),
                 rollback_entries: Vec::new(),
             })
+        }
+    }
+
+    struct BlockingTool;
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: "block".into(),
+                    description: "blocking test tool".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            std::future::pending().await
         }
     }
 
@@ -1843,6 +1921,343 @@ mod tests {
         // The loop gets max_steps normal calls plus one text-only finalization
         // call, then stops if the model still tries to use tools.
         assert_eq!(*calls.lock().unwrap(), max_steps + 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_completes_batched_tools_before_finish_task() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            calls: Arc::new(Mutex::new(0)),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [ChatResult {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "finish".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "finish_task".into(),
+                                arguments: r#"{"final_answer":"complete"}"#
+                                    .into(),
+                            },
+                        },
+                        ToolCall {
+                            id: "read".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "read".into(),
+                                arguments: "{}".into(),
+                            },
+                        },
+                    ],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                }],
+            ))),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(NamedTool("read")),
+            Box::new(NamedTool("finish_task")),
+        ]);
+        let permissions = std::collections::HashMap::from([
+            ("read".to_string(), crate::config::Permission::Allow),
+            ("finish_task".to_string(), crate::config::Permission::Allow),
+        ]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            10,
+            "/tmp".into(),
+            None,
+        )
+        .await;
+
+        let history = loop {
+            if let Ok(AgentEvent::Done { history, .. }) =
+                events_rx.recv().await.unwrap()
+            {
+                break history;
+            }
+        };
+        let tool_results: Vec<_> = history
+            .iter()
+            .filter(|message| matches!(message.role, Role::Tool))
+            .collect();
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("finish"));
+        assert_eq!(tool_results[1].tool_call_id.as_deref(), Some("read"));
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_does_not_finish_when_later_batched_tool_fails() {
+        let calls = Arc::new(Mutex::new(0));
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [
+                    ChatResult {
+                        content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "finish".into(),
+                                call_type: "function".into(),
+                                function: ToolFunction {
+                                    name: "finish_task".into(),
+                                    arguments:
+                                        r#"{"final_answer":"premature"}"#.into(),
+                                },
+                            },
+                            ToolCall {
+                                id: "denied".into(),
+                                call_type: "function".into(),
+                                function: ToolFunction {
+                                    name: "read".into(),
+                                    arguments: "{}".into(),
+                                },
+                            },
+                        ],
+                        usage: Usage::default(),
+                        finish_reason: Some("tool_calls".into()),
+                        reasoning_content: None,
+                    },
+                    ChatResult {
+                        content: Some("recovered after tool failure".into()),
+                        tool_calls: Vec::new(),
+                        usage: Usage::default(),
+                        finish_reason: Some("stop".into()),
+                        reasoning_content: None,
+                    },
+                ],
+            ))),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(NamedTool("read")),
+            Box::new(NamedTool("finish_task")),
+        ]);
+        let permissions = std::collections::HashMap::from([
+            ("read".to_string(), crate::config::Permission::Deny),
+            ("finish_task".to_string(), crate::config::Permission::Allow),
+        ]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            10,
+            "/tmp".into(),
+            None,
+        )
+        .await;
+
+        let content = loop {
+            if let Ok(AgentEvent::Done { content, .. }) =
+                events_rx.recv().await.unwrap()
+            {
+                break content;
+            }
+        };
+        assert_eq!(content, "recovered after tool failure");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_defers_role_task_until_all_tool_results() {
+        let provider = Arc::new(ScriptedProvider {
+            calls: Arc::new(Mutex::new(0)),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "switch".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "switch_role".into(),
+                                arguments: r#"{"role":"worker","task":"inspect it"}"#.into(),
+                            },
+                        },
+                        ToolCall {
+                            id: "read".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "read".into(),
+                                arguments: "{}".into(),
+                            },
+                        },
+                    ],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+            ]))),
+        });
+        let provider_for_loop: Arc<dyn LlmProvider> = provider.clone();
+        let role_config = RoleLoopConfig {
+            roles: vec![
+                ResolvedRole {
+                    name: "orchestrator".into(),
+                    instructions: String::new(),
+                    provider: provider.clone(),
+                    model_id: "test".into(),
+                    temperature: None,
+                    max_tokens: None,
+                },
+                ResolvedRole {
+                    name: "worker".into(),
+                    instructions: String::new(),
+                    provider,
+                    model_id: "test".into(),
+                    temperature: None,
+                    max_tokens: None,
+                },
+            ],
+        };
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let permissions = std::collections::HashMap::from([(
+            "read".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        run_loop(
+            provider_for_loop,
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            10,
+            "/tmp".into(),
+            Some(role_config),
+        )
+        .await;
+
+        let history = loop {
+            if let Ok(AgentEvent::Done { history, .. }) =
+                events_rx.recv().await.unwrap()
+            {
+                break history;
+            }
+        };
+        let role_task_idx = history
+            .iter()
+            .position(|message| message.internal_role_task)
+            .unwrap();
+        let read_result_idx = history
+            .iter()
+            .position(|message| message.tool_call_id.as_deref() == Some("read"))
+            .unwrap();
+        assert!(read_result_idx < role_task_idx);
+        assert_eq!(
+            history[role_task_idx].content.as_deref(),
+            Some("inspect it")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_cancels_during_active_tool_execution() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            calls: Arc::new(Mutex::new(0)),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [ChatResult {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "block".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "block".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                }],
+            ))),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(BlockingTool)]);
+        let permissions = std::collections::HashMap::from([(
+            "block".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_task = tokio::spawn(run_loop(
+            provider,
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            perm_rx,
+            permissions,
+            10,
+            "/tmp".into(),
+            None,
+        ));
+
+        loop {
+            if matches!(
+                events_rx.recv().await.unwrap(),
+                Ok(AgentEvent::ToolStarted { .. })
+            ) {
+                break;
+            }
+        }
+        cancel_tx.send(true).unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            events_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(event, AgentEvent::Cancelled { .. }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), loop_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

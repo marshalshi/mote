@@ -1452,10 +1452,7 @@ fn normal_action(
 ) {
     match action {
         Some(Action::SendMessage) => {
-            let text = app.submit_input();
-            if text.is_empty() && !app.handled_slash_command {
-                app.state = AppState::Quitting;
-            }
+            app.submit_input();
         }
         Some(Action::InsertNewline) => app.insert_newline(),
         Some(Action::CursorLeft) => app.cursor_left(),
@@ -1824,6 +1821,41 @@ mod tests {
         let req = build_chat_request(&app, "hello".into());
         assert_eq!(req.session_id.as_deref(), Some("sess-abc"));
         assert_eq!(req.runtime_session_key.as_deref(), Some("runtime-key"));
+    }
+
+    #[test]
+    fn test_empty_submit_does_not_quit() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        normal_action(
+            &mut app,
+            Some(Action::SendMessage),
+            crossterm::event::KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+
+        assert_eq!(app.state, AppState::Idle);
+    }
+
+    #[test]
+    fn test_configured_quit_action_still_quits() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        let keys = Keybindings::from_config(None);
+        let mut chat_stream = None;
+
+        handle_key_event(
+            &mut app,
+            &keys,
+            Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )),
+            &mut chat_stream,
+        );
+
+        assert_eq!(app.state, AppState::Quitting);
     }
 
     #[test]

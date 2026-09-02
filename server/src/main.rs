@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ mod session;
 mod tools;
 
 const COMPACTION_CONTEXT_MARKER: &str = "[mote compacted conversation context]";
+const COMPLETED_RUN_RETENTION: usize = 32;
 
 // ── App state shared across all handlers ─────────────────
 
@@ -41,6 +42,8 @@ struct AppState {
     runtime_states: tokio::sync::Mutex<HashMap<String, RuntimeSessionState>>,
     /// Long-running agent tasks that outlive websocket subscribers.
     runs: tokio::sync::Mutex<HashMap<String, ActiveRun>>,
+    /// Terminal runs retained for short-lived reconnect/replay only.
+    completed_run_ids: tokio::sync::Mutex<VecDeque<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,11 +61,11 @@ struct RuntimeSessionState {
 }
 
 #[derive(Debug, Clone)]
-struct RequestContext {
-    workspace: PathBuf,
-    workspace_display: String,
-    runtime_session_key: String,
-    repo_agents_md: Option<String>,
+pub(crate) struct RequestContext {
+    pub(crate) workspace: PathBuf,
+    pub(crate) workspace_display: String,
+    pub(crate) runtime_session_key: String,
+    pub(crate) repo_agents_md: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,6 +687,7 @@ async fn record_run_event(
     run_id: &str,
     event: marshaling_protocol::ServerEvent,
 ) {
+    let terminal = is_terminal_event(&event);
     let mut runs = state.runs.lock().await;
     let Some(run) = runs.get_mut(run_id) else {
         return;
@@ -701,6 +705,27 @@ async fn record_run_event(
 
     run.events.push(event.clone());
     let _ = run.tx.send(event);
+    drop(runs);
+
+    if terminal {
+        let expired = {
+            let mut completed = state.completed_run_ids.lock().await;
+            completed.push_back(run_id.to_string());
+            let mut expired = Vec::new();
+            while completed.len() > COMPLETED_RUN_RETENTION {
+                if let Some(id) = completed.pop_front() {
+                    expired.push(id);
+                }
+            }
+            expired
+        };
+        if !expired.is_empty() {
+            let mut runs = state.runs.lock().await;
+            for id in expired {
+                runs.remove(&id);
+            }
+        }
+    }
 }
 
 /// Validate a session ID to prevent path traversal.
@@ -802,16 +827,16 @@ fn resolve_request_context(
 // ── Extracted helpers for agent setup ───────────────────
 
 /// Resolved agent context: provider, model, system prompt, and options.
-struct AgentContext {
-    provider: Arc<dyn llm::LlmProvider>,
-    system_layers: Vec<String>,
-    opts: llm::ChatOptions,
-    eff_provider: String,
-    eff_model_id: String,
+pub(crate) struct AgentContext {
+    pub(crate) provider: Arc<dyn llm::LlmProvider>,
+    pub(crate) system_layers: Vec<String>,
+    pub(crate) opts: llm::ChatOptions,
+    pub(crate) eff_provider: String,
+    pub(crate) eff_model_id: String,
     /// Optional role-loop configuration. When present, the agent loop
     /// enters role-switching mode. The first role is the orchestrator.
     #[allow(dead_code)]
-    role_loop_config: Option<agent::RoleLoopConfig>,
+    pub(crate) role_loop_config: Option<agent::RoleLoopConfig>,
 }
 
 /// Resolve agent context for role-aware loop mode.
@@ -979,7 +1004,7 @@ async fn resolve_role_aware_context(
 /// Resolve the agent context: provider, model, system prompt, and options.
 ///
 /// Used by both `handle_socket` (primary agent) and `AgentSubagentRunner`.
-async fn resolve_agent_context(
+pub(crate) async fn resolve_agent_context(
     config: &config::Config,
     auth: &auth::Auth,
     merged_agents: &HashMap<String, config::AgentConfig>,
@@ -1119,7 +1144,7 @@ pub fn build_permission_map(
 fn build_augmented_tools(
     workspace: &std::path::Path,
     repo_agents_md: Option<String>,
-    provider: &Arc<dyn llm::LlmProvider>,
+    auth: &auth::Auth,
     config: &config::Config,
     merged_agents: &HashMap<String, config::AgentConfig>,
     cancel_rx: &tokio::sync::watch::Receiver<bool>,
@@ -1143,9 +1168,9 @@ fn build_augmented_tools(
             workspace: workspace.to_path_buf(),
         },
         Box::new(tools::AgentSubagentRunner {
-            provider: Arc::clone(provider),
             tools: subagent_tools,
             config: config.clone(),
+            auth: auth.clone(),
             merged_agents: merged_agents.clone(),
             repo_agents_md,
             cancel_rx: cancel_rx.clone(),
@@ -1240,6 +1265,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         }
     };
     // Drop auth guard before the long-running agent loop
+    let auth_snapshot = auth_guard.clone();
     drop(auth_guard);
 
     // Build permission map
@@ -1287,7 +1313,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let augmented_tools = build_augmented_tools(
         &req_ctx.workspace,
         req_ctx.repo_agents_md.clone(),
-        &ctx.provider,
+        &auth_snapshot,
         &state.config,
         &state.merged_agents,
         &cancel_rx,
@@ -2171,6 +2197,7 @@ async fn main() -> Result<()> {
         config,
         runtime_states: tokio::sync::Mutex::new(HashMap::new()),
         runs: tokio::sync::Mutex::new(HashMap::new()),
+        completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
     });
 
     let configured_port = state.config.server.port;
@@ -2480,6 +2507,7 @@ read = "allow"
                 },
             )])),
             runs: tokio::sync::Mutex::new(HashMap::new()),
+            completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
         });
 
         let result = apply_rollback_last(&state, "sess").await;

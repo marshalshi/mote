@@ -117,6 +117,7 @@ impl Session {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                internal_role_task: false,
             })
             .collect()
     }
@@ -136,6 +137,9 @@ impl Session {
         let id = format!("chat-{}", now.format("%Y%m%d-%H%M%S%6f"));
         let mut messages = Vec::new();
         for msg in chat_history {
+            if msg.internal_role_task {
+                continue;
+            }
             let role = match msg.role {
                 ChatRole::User => {
                     // Tool results come as User messages with tool_call_id
@@ -164,7 +168,9 @@ impl Session {
         }
         // Generate summary from the first user message (5-10 words style)
         let summary = chat_history.iter().find_map(|msg| {
-            if matches!(msg.role, crate::llm::Role::User) {
+            if matches!(msg.role, crate::llm::Role::User)
+                && !msg.internal_role_task
+            {
                 msg.content.as_deref().and_then(summary_from_user_content)
             } else {
                 None
@@ -329,6 +335,24 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].content, "please read");
         assert_eq!(session.messages[1].content, "done");
+    }
+
+    #[test]
+    fn test_from_chat_history_skips_internal_role_tasks() {
+        let history = vec![
+            ChatMessage::user("real user request"),
+            ChatMessage::role_task("review the implementation"),
+            ChatMessage::assistant_text("review complete"),
+        ];
+
+        let session = Session::from_chat_history(
+            "model", "provider", "default", 1, 2, &history,
+        );
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "real user request");
+        assert_eq!(session.messages[1].content, "review complete");
+        assert_eq!(session.summary.as_deref(), Some("real user request"));
     }
 
     #[test]

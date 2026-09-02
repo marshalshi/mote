@@ -2360,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_empty_quits() {
+    fn test_submit_empty_is_ignored() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
         let text = app.submit_input();

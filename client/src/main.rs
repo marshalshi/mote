@@ -1,3 +1,4 @@
+mod audio;
 mod client;
 mod config;
 mod llm;
@@ -35,6 +36,12 @@ const API_KEY_PROVIDERS: &[ProviderLogin] = &[
         display_name: "MiniMax",
         key_url: "https://platform.minimax.io/user-center/basic-information/interface-key",
         example_model: "minimax/MiniMax-M3",
+    },
+    ProviderLogin {
+        name: "openai",
+        display_name: "OpenAI",
+        key_url: "https://platform.openai.com/api-keys",
+        example_model: "audio/gpt-realtime-whisper",
     },
 ];
 
@@ -300,6 +307,7 @@ fn spawn_local_server(port: u16, verbose: bool) -> Result<ManagedServer> {
     let mut cmd = server_command()?;
     cmd.env("MOTE_SERVER_PORT", port.to_string());
     if verbose {
+        cmd.env("RUST_LOG", "debug");
         cmd.stderr(Stdio::inherit()).stdout(Stdio::inherit());
     } else {
         cmd.stderr(Stdio::null()).stdout(Stdio::null());

@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use marshaling_protocol::{
-    ChatRequest, CompactRequest, CompactResponse, ModelInfo,
-    RollbackResultPayload, ServerEvent, SessionInfo, UiConfig,
+    AudioClientEvent, AudioServerEvent, AudioStartConfig, ChatRequest,
+    CompactRequest, CompactResponse, ModelInfo, RollbackResultPayload,
+    ServerEvent, SessionInfo, UiConfig,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -19,6 +21,23 @@ pub struct ChatStream {
     pub rx: mpsc::UnboundedReceiver<marshaling_protocol::ServerEvent>,
     // Hold the write half so the socket stays fully open. On drop the WS closes.
     _write: WsWriter,
+}
+
+pub struct AudioTranscriptionStream {
+    pub rx: mpsc::UnboundedReceiver<AudioServerEvent>,
+    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    control_tx: mpsc::UnboundedSender<AudioClientEvent>,
+}
+
+impl AudioTranscriptionStream {
+    pub fn stop_with_audio(&self, audio: Vec<u8>) {
+        let _ = self.audio_tx.send(audio);
+        let _ = self.control_tx.send(AudioClientEvent::Stop);
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.control_tx.send(AudioClientEvent::Cancel);
+    }
 }
 
 impl ChatStream {
@@ -45,6 +64,21 @@ fn websocket_url_from_base(base_url: &str) -> Result<String> {
     // Convert http://host:port → ws://host:port
     let ws = format!("ws://{}/chat", url.authority());
     Ok(ws)
+}
+
+fn websocket_url_from_base_with_path(
+    base_url: &str,
+    path: &str,
+) -> Result<String> {
+    let url = reqwest::Url::parse(base_url)
+        .with_context(|| format!("Invalid server URL: {base_url}"))?;
+    if url.scheme() != "http" {
+        anyhow::bail!(
+            "Only http:// server URLs are supported (got: {})",
+            url.scheme()
+        );
+    }
+    Ok(format!("ws://{}{}", url.authority(), path))
 }
 
 /// Client for communicating with the mote-server.
@@ -225,44 +259,202 @@ impl MoteClient {
 
         // Spawn a task to read events from the WebSocket and forward to the channel
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = read.next().await {
+            let mut saw_terminal = false;
+            while let Some(msg) = read.next().await {
                 match msg {
-                    Message::Text(text) => {
-                        match serde_json::from_str::<ServerEvent>(&text) {
-                            Ok(event) => {
-                                let is_terminal = matches!(
-                                    event,
-                                    ServerEvent::Done { .. }
-                                        | ServerEvent::Cancelled { .. }
-                                        | ServerEvent::NeedsContinuation { .. }
-                                        | ServerEvent::Error { .. }
-                                );
-                                if tx.send(event).is_err() {
+                    Ok(msg) => match msg {
+                        Message::Text(text) => {
+                            match serde_json::from_str::<ServerEvent>(&text) {
+                                Ok(event) => {
+                                    let is_terminal = matches!(
+                                        event,
+                                        ServerEvent::Done { .. }
+                                            | ServerEvent::Cancelled { .. }
+                                            | ServerEvent::NeedsContinuation { .. }
+                                            | ServerEvent::Error { .. }
+                                    );
+                                    if tx.send(event).is_err() {
+                                        break;
+                                    }
+                                    if is_terminal {
+                                        saw_terminal = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to parse server event: {e} — data: {text}"
+                                    );
+                                    // Send an error event so the TUI can surface it
+                                    let _ = tx.send(ServerEvent::Error {
+                                        message: format!("Protocol error: {e}"),
+                                    });
+                                    saw_terminal = true;
                                     break;
                                 }
-                                if is_terminal {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to parse server event: {e} — data: {text}"
-                                );
-                                // Send an error event so the TUI can surface it
-                                let _ = tx.send(ServerEvent::Error {
-                                    message: format!("Protocol error: {e}"),
-                                });
-                                break;
                             }
                         }
+                        Message::Close(frame) => {
+                            if !saw_terminal {
+                                let reason = frame
+                                    .map(|f| {
+                                        format!(
+                                            "code={} reason={}",
+                                            f.code, f.reason
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "no close frame".into());
+                                let _ = tx.send(ServerEvent::Error {
+                                message: format!("Chat websocket closed before completion ({reason})"),
+                            });
+                                saw_terminal = true;
+                            }
+                            break;
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        if !saw_terminal {
+                            let _ = tx.send(ServerEvent::Error {
+                                message: format!(
+                                    "Chat websocket read error: {e}"
+                                ),
+                            });
+                            saw_terminal = true;
+                        }
+                        break;
                     }
-                    Message::Close(_) => break,
-                    _ => {}
                 }
+            }
+            if !saw_terminal {
+                let _ = tx.send(ServerEvent::Error {
+                    message: "Chat websocket ended before completion".into(),
+                });
             }
         });
 
         Ok(ChatStream { rx, _write: write })
+    }
+
+    pub async fn audio_transcription_stream(
+        &self,
+        config: AudioStartConfig,
+    ) -> Result<AudioTranscriptionStream> {
+        let ws_url = websocket_url_from_base_with_path(
+            &self.base_url,
+            "/audio/transcribe",
+        )?;
+        let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .context("Failed to connect to audio transcription WebSocket")?;
+        tracing::debug!(url = %ws_url, "connected audio transcription websocket");
+        let (mut write, mut read) = ws_stream.split();
+        let start = serde_json::to_string(&AudioClientEvent::Start { config })?;
+        write.send(Message::Text(start)).await?;
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (control_tx, mut control_rx) =
+            mpsc::unbounded_channel::<AudioClientEvent>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(bytes) = audio_rx.recv() => {
+                        tracing::trace!(bytes = bytes.len(), "sending audio chunk");
+                        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        let event = AudioClientEvent::AudioChunk { data };
+                        match serde_json::to_string(&event) {
+                            Ok(json) => {
+                                if write.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Some(event) = control_rx.recv() => {
+                        let should_close = matches!(event, AudioClientEvent::Cancel);
+                        tracing::debug!(?event, "sending audio control event");
+                        match serde_json::to_string(&event) {
+                            Ok(json) => {
+                                if write.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                        if should_close {
+                            break;
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        match serde_json::from_str::<AudioServerEvent>(&text) {
+                            Ok(event) => {
+                                tracing::debug!(
+                                    ?event,
+                                    "received audio server event"
+                                );
+                                let terminal = matches!(
+                                    event,
+                                    AudioServerEvent::Stopped
+                                        | AudioServerEvent::Error { .. }
+                                );
+                                if event_tx.send(event).is_err() || terminal {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ =
+                                    event_tx.send(AudioServerEvent::Error {
+                                        message: format!(
+                                            "Audio protocol error: {e}"
+                                        ),
+                                    });
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(frame)) => {
+                        let reason = frame
+                            .map(|f| {
+                                format!("code={} reason={}", f.code, f.reason)
+                            })
+                            .unwrap_or_else(|| "no close frame".into());
+                        tracing::warn!(%reason, "audio websocket closed by server");
+                        let _ = event_tx.send(AudioServerEvent::Error {
+                            message: format!(
+                                "Audio transcription websocket closed by server ({reason})"
+                            ),
+                        });
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("audio websocket read error: {e}");
+                        let _ = event_tx.send(AudioServerEvent::Error {
+                            message: format!("Audio websocket read error: {e}"),
+                        });
+                        break;
+                    }
+                    Ok(_) => {}
+                }
+            }
+            tracing::debug!("audio websocket reader task ended");
+        });
+
+        Ok(AudioTranscriptionStream {
+            rx: event_rx,
+            audio_tx,
+            control_tx,
+        })
     }
 }
 

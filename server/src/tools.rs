@@ -409,6 +409,7 @@ impl Tool for GrepTool {
                 if let Some(inc) = include {
                     cmd.arg("--glob").arg(inc);
                 }
+                cmd.kill_on_drop(true);
                 cmd.output().await.context("Failed to run ripgrep")?
             }
             GrepBackend::Grep => {
@@ -419,6 +420,7 @@ impl Tool for GrepTool {
                     cmd.arg("--include").arg(inc);
                 }
                 cmd.arg(&dir);
+                cmd.kill_on_drop(true);
                 cmd.output().await.context("Failed to run grep")?
             }
         };
@@ -1067,9 +1069,9 @@ impl Tool for SubagentTool {
 use std::sync::Arc;
 
 pub struct AgentSubagentRunner {
-    pub provider: Arc<dyn crate::llm::LlmProvider>,
     pub tools: Arc<Vec<Box<dyn crate::llm::Tool>>>,
     pub config: crate::config::Config,
+    pub auth: crate::auth::Auth,
     pub merged_agents:
         std::collections::HashMap<String, crate::config::AgentConfig>,
     pub repo_agents_md: Option<String>,
@@ -1110,54 +1112,22 @@ impl SubagentRunner for AgentSubagentRunner {
         } else {
             anyhow::bail!("Unknown sub-agent: '{}'", agent_name);
         }
-        let agent_model = agent_cfg.and_then(|a| a.model.as_deref());
-
-        let eff_provider_name = if let Some(model_str) = agent_model {
-            if let Some((provider, _)) = model_str.split_once('/') {
-                provider.to_string()
-            } else {
-                self.config.effective_provider(agent_model)
-            }
-        } else {
-            self.config.effective_provider(agent_model)
+        let req_ctx = crate::RequestContext {
+            workspace: workspace.clone(),
+            workspace_display: workspace.display().to_string(),
+            runtime_session_key: "subagent".into(),
+            repo_agents_md: self.repo_agents_md.clone(),
         };
-
-        // Use the same provider for subagents (they share the LLM backend)
-        let provider = Arc::clone(&self.provider);
-
-        // Build system prompt for the subagent (blocking filesystem I/O)
-        let eff_model_id = self.config.effective_model_id(agent_model);
-        let prompt =
-            crate::prompt::PromptAssembler::for_agent(&self.config, agent_cfg)
-                .with_workspace_context(
-                    Some(workspace.clone()),
-                    self.repo_agents_md.clone(),
-                );
-        let has_roles = agent_cfg
-            .and_then(|a| a.roles.as_ref())
-            .map_or(false, |r| !r.is_empty());
-        let provider_for_prompt = eff_provider_name.clone();
-        let model_for_prompt = eff_model_id.clone();
-        let system_layers = tokio::task::spawn_blocking(move || {
-            if has_roles {
-                prompt.assemble_shared_layers(
-                    &provider_for_prompt,
-                    &model_for_prompt,
-                )
-            } else {
-                prompt.assemble(&provider_for_prompt, &model_for_prompt)
-            }
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Prompt assembly panicked: {:#}", e))??;
-
-        let eff_temperature = self
-            .config
-            .effective_temperature(agent_cfg.and_then(|a| a.temperature));
-        let eff_max_tokens = self.config.effective_max_tokens(
-            agent_cfg.and_then(|a| a.max_tokens),
-            &eff_provider_name,
-        );
+        let context = crate::resolve_agent_context(
+            &self.config,
+            &self.auth,
+            &self.merged_agents,
+            &req_ctx,
+            agent_name,
+            None,
+            None,
+        )
+        .await?;
 
         // Build permission map using the shared helper.
         // Subagent remaps "ask" → "allow" (no TUI for subagent permission prompts).
@@ -1175,21 +1145,16 @@ impl SubagentRunner for AgentSubagentRunner {
             }
         }
 
-        let opts = crate::llm::ChatOptions {
-            model_id: eff_model_id,
-            temperature: eff_temperature,
-            max_tokens: eff_max_tokens,
-            // Only advertise tools that are allowed — denied tools are invisible to the subagent LLM
-            tools: self
-                .tools
-                .iter()
-                .filter(|t| {
-                    perms.get(&t.def().function.name).copied()
-                        != Some(crate::config::Permission::Deny)
-                })
-                .map(|t| t.def())
-                .collect(),
-        };
+        let mut opts = context.opts;
+        opts.tools = self
+            .tools
+            .iter()
+            .filter(|t| {
+                perms.get(&t.def().function.name).copied()
+                    != Some(crate::config::Permission::Deny)
+            })
+            .map(|t| t.def())
+            .collect();
 
         // Create channels for the subagent
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1210,73 +1175,16 @@ impl SubagentRunner for AgentSubagentRunner {
         let user_msg = task.to_string();
         let history: Vec<crate::llm::ChatMessage> = Vec::new();
         let t2 = Arc::clone(&self.tools);
-        let p2 = Arc::clone(&provider);
+        let p2 = Arc::clone(&context.provider);
         let workspace_display = workspace.display().to_string();
 
-        // Resolve role_loop_config for role-aware subagents.
-        // In subagent mode, all roles share the parent's provider (they use the
-        // same LLM backend) but can have different model_ids. Cross-provider role
-        // switching is not supported for subagents in the MVP.
-        let role_config: Option<crate::agent::RoleLoopConfig> = if let (
-            Some(cfg),
-            Some(roles),
-        ) =
-            (agent_cfg, agent_cfg.and_then(|a| a.roles.as_ref()))
-        {
-            // Validate roles before building — treat invalid config as
-            // legacy mode (no roles) so run_loop doesn't panic on empty list.
-            if let Err(e) = cfg.validate_roles() {
-                tracing::warn!(
-                    "Subagent '{}' has invalid roles, falling back to legacy mode: {e}",
-                    agent_name
-                );
-                None
-            } else {
-                let effective_agent_model: Option<String> =
-                    agent_model.map(|s| s.to_string());
-                let mut resolved_roles = Vec::with_capacity(roles.len());
-                for role in roles {
-                    let (role_prov_name, role_model_id) =
-                        self.config.effective_role_model(
-                            role.model.as_deref(),
-                            effective_agent_model.as_deref(),
-                        );
-                    // Subagent roles all use the parent's provider
-                    let provider = Arc::clone(&provider);
-                    let instructions = agent_cfg
-                        .and_then(|a| a.effective_role_instructions(role))
-                        .unwrap_or_default();
-                    let temperature = self.config.effective_temperature(
-                        role.temperature
-                            .or(agent_cfg.and_then(|a| a.temperature)),
-                    );
-                    let max_tokens = self.config.effective_max_tokens(
-                        role.max_tokens
-                            .or(agent_cfg.and_then(|a| a.max_tokens)),
-                        &role_prov_name,
-                    );
-                    resolved_roles.push(crate::agent::ResolvedRole {
-                        name: role.name.clone(),
-                        instructions,
-                        provider,
-                        model_id: role_model_id,
-                        temperature: Some(temperature),
-                        max_tokens: Some(max_tokens),
-                    });
-                }
-                Some(crate::agent::RoleLoopConfig {
-                    roles: resolved_roles,
-                })
-            }
-        } else {
-            None
-        };
+        let role_config = context.role_loop_config;
 
         tokio::spawn(async move {
             crate::agent::run_loop(
                 p2,
                 t2,
-                system_layers,
+                context.system_layers,
                 user_msg,
                 history,
                 opts,

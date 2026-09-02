@@ -21,6 +21,11 @@ jobs:
         with:
           tool: ripgrep
 
+      - name: Install ALSA development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
       - name: Build
         run: cargo build --verbose
       - name: Run tests

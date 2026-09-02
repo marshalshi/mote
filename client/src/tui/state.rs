@@ -55,6 +55,8 @@ pub struct App {
     pub messages: Vec<DisplayMessage>,
     pub input: String,
     pub input_cursor: usize,
+    /// Scroll offset from the bottom for overflowing input drafts. 0 = newest lines visible.
+    pub input_scroll_offset: usize,
     /// Scroll offset from the bottom in lines. 0 = at bottom (showing newest content).
     pub scroll_offset: usize,
     pub auto_scroll: bool,
@@ -100,6 +102,15 @@ pub struct App {
 
     /// Pending async slash action (e.g., fetching models).
     pub pending_slash: Option<SlashAction>,
+
+    /// Pending push-to-talk toggle requested by keybinding.
+    pub pending_audio_toggle: bool,
+
+    /// Current audio transcription UI state.
+    pub audio_state: AudioState,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u16,
+    pub push_to_talk_label: String,
 
     /// Queued user messages (entered while agent was running).
     pub input_queue: VecDeque<String>,
@@ -268,6 +279,15 @@ pub enum AppState {
     Quitting,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioState {
+    Idle,
+    Connecting,
+    Recording,
+    Transcribing,
+    Error(String),
+}
+
 // ── Built-in commands ─────────────────────────────────────
 
 const AUTO_COMPACT_CHAR_THRESHOLD: usize = 100_000;
@@ -293,6 +313,7 @@ const LOGIN_PROVIDERS: &[(&str, &str, &str)] = &[
         "MiniMax",
         "https://platform.minimax.io/user-center/basic-information/interface-key",
     ),
+    ("openai", "OpenAI", "https://platform.openai.com/api-keys"),
 ];
 
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -353,6 +374,7 @@ impl App {
             messages: Vec::new(),
             input: String::new(),
             input_cursor: 0,
+            input_scroll_offset: 0,
             scroll_offset: 0,
             auto_scroll: true,
             model_info: agent_model_info
@@ -382,6 +404,11 @@ impl App {
             input_accent,
             user_accent: parse_ui_color(&ui_config.user_accent),
             pending_slash: None,
+            pending_audio_toggle: false,
+            audio_state: AudioState::Idle,
+            audio_sample_rate: ui_config.audio.sample_rate,
+            audio_channels: ui_config.audio.channels,
+            push_to_talk_label: "Ctrl+M".into(),
             input_queue: VecDeque::new(),
             loading_progress: None,
             loading_label: None,
@@ -574,6 +601,7 @@ impl App {
     pub fn submit_input(&mut self) -> String {
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.auto_scroll = true;
 
         if self.pending_secret_login.is_some() {
@@ -602,6 +630,7 @@ impl App {
     pub fn submit_input_to_queue(&mut self) {
         let text = std::mem::take(&mut self.input);
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.auto_scroll = true;
 
         if self.pending_secret_login.is_some() {
@@ -975,7 +1004,8 @@ impl App {
             "- `Esc` — Press twice within 2s to stop running agent".to_string(),
             "- `Ctrl+C` — Quit / cancel immediately".to_string(),
             "- `Tab` — Cycle agent".to_string(),
-            "- `Up/Down` — Input history".to_string(),
+            "- `Up/Down` — Input history, or scroll overflowing draft"
+                .to_string(),
             "- `PgUp/PgDn, Ctrl+↑/↓` — Scroll".to_string(),
             "- `Ctrl+P` — Agent command".to_string(),
             "- `F5` — Cycle subagent views".to_string(),
@@ -1501,6 +1531,7 @@ impl App {
         self.input_queue.push_back(text.to_string());
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
     }
 
     pub fn pop_queued_input_as_message(&mut self) -> bool {
@@ -1524,6 +1555,7 @@ impl App {
     pub fn insert_newline(&mut self) {
         self.input.insert(self.input_cursor, '\n');
         self.input_cursor += 1;
+        self.reset_input_scroll();
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -1532,6 +1564,35 @@ impl App {
         }
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
+        self.reset_input_scroll();
+        self.update_suggestions();
+    }
+
+    pub fn insert_transcript(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let needs_leading_space = self
+            .input
+            .get(..self.input_cursor)
+            .and_then(|s| s.chars().next_back())
+            .is_some_and(|c| !c.is_whitespace());
+        let needs_trailing_space = self
+            .input
+            .get(self.input_cursor..)
+            .and_then(|s| s.chars().next())
+            .is_some_and(|c| !c.is_whitespace());
+        let mut insert = String::new();
+        if needs_leading_space {
+            insert.push(' ');
+        }
+        insert.push_str(trimmed);
+        if needs_trailing_space {
+            insert.push(' ');
+        }
+        self.input.insert_str(self.input_cursor, &insert);
+        self.input_cursor += insert.len();
         self.update_suggestions();
     }
 
@@ -1544,6 +1605,7 @@ impl App {
                 .unwrap_or(1);
             self.input_cursor -= prev;
             self.input.remove(self.input_cursor);
+            self.reset_input_scroll();
             self.update_suggestions();
         }
     }
@@ -1551,6 +1613,7 @@ impl App {
     pub fn delete_after(&mut self) {
         if self.input_cursor < self.input.len() {
             self.input.remove(self.input_cursor);
+            self.reset_input_scroll();
             self.update_suggestions();
         }
     }
@@ -1558,6 +1621,7 @@ impl App {
     pub fn kill_line(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.update_suggestions();
     }
 
@@ -1585,9 +1649,11 @@ impl App {
 
     pub fn cursor_home(&mut self) {
         self.input_cursor = 0;
+        self.reset_input_scroll();
     }
     pub fn cursor_end(&mut self) {
         self.input_cursor = self.input.len();
+        self.reset_input_scroll();
     }
 
     pub fn history_up(&mut self) {
@@ -1602,6 +1668,7 @@ impl App {
         self.input_history_idx = Some(idx);
         self.input = self.input_history[idx].clone();
         self.input_cursor = self.input.len();
+        self.reset_input_scroll();
     }
 
     pub fn history_down(&mut self) {
@@ -1611,13 +1678,31 @@ impl App {
                 self.input_history_idx = Some(i + 1);
                 self.input = self.input_history[i + 1].clone();
                 self.input_cursor = self.input.len();
+                self.reset_input_scroll();
             }
             Some(_) => {
                 self.input_history_idx = None;
                 self.input.clear();
                 self.input_cursor = 0;
+                self.reset_input_scroll();
             }
         }
+    }
+
+    pub fn input_scroll_up(&mut self, amount: usize, max_offset: usize) {
+        self.input_scroll_offset = self
+            .input_scroll_offset
+            .saturating_add(amount)
+            .min(max_offset);
+    }
+
+    pub fn input_scroll_down(&mut self, amount: usize) {
+        self.input_scroll_offset =
+            self.input_scroll_offset.saturating_sub(amount);
+    }
+
+    pub fn reset_input_scroll(&mut self) {
+        self.input_scroll_offset = 0;
     }
 
     pub fn cycle_agent(&mut self) {
@@ -1727,6 +1812,7 @@ impl App {
         });
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.reset_suggestions();
         self.push_command_message(
             Role::Assistant,
@@ -1823,6 +1909,7 @@ impl App {
         self.input_queue.clear();
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.suggestions.clear();
         self.suggestion_index = 0;
         self.handled_slash_command = false;
@@ -1860,6 +1947,7 @@ impl App {
         self.input_queue.clear();
         self.input.clear();
         self.input_cursor = 0;
+        self.reset_input_scroll();
         self.suggestions.clear();
         self.suggestion_index = 0;
         self.handled_slash_command = false;
@@ -1984,6 +2072,7 @@ impl App {
         if let Some(cmd) = self.selected_suggestion() {
             self.input = cmd.to_string();
             self.input_cursor = self.input.len();
+            self.reset_input_scroll();
             self.suggestions.clear();
             self.suggestion_index = 0;
         }
@@ -2122,6 +2211,7 @@ mod tests {
             model_info: "test/test-model".into(),
             agent_model_info,
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         }
     }
 
@@ -2270,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_empty_quits() {
+    fn test_submit_empty_is_ignored() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
         let text = app.submit_input();
@@ -2777,6 +2867,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
 
@@ -2947,6 +3038,24 @@ mod tests {
     }
 
     #[test]
+    fn test_input_scroll_helpers() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        app.input_scroll_up(3, 5);
+        assert_eq!(app.input_scroll_offset, 3);
+
+        app.input_scroll_up(10, 5);
+        assert_eq!(app.input_scroll_offset, 5);
+
+        app.input_scroll_down(2);
+        assert_eq!(app.input_scroll_offset, 3);
+
+        app.reset_input_scroll();
+        assert_eq!(app.input_scroll_offset, 0);
+    }
+
+    #[test]
     fn test_insert_newline() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
@@ -2982,6 +3091,17 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_transcript_adds_word_boundaries() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        app.input = "fixbug".into();
+        app.input_cursor = 3;
+        app.insert_transcript(" the ");
+        assert_eq!(app.input, "fix the bug");
+        assert_eq!(app.input_cursor, "fix the ".len());
+    }
+
+    #[test]
     fn test_cycle_agent_updates_agent_without_echo_message() {
         let cfg = marshaling_protocol::UiConfig {
             input_accent: "cyan".into(),
@@ -2995,6 +3115,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.current_agent, "build");
@@ -3042,6 +3163,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         assert_eq!(app.model_info, "test/test-model");
@@ -3067,6 +3189,7 @@ mod tests {
                 ("review".into(), "kimi/review-model".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         };
         let mut app = App::new(&cfg, cfg.model_info.clone());
         app.cycle_agent();

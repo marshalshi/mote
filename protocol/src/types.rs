@@ -109,6 +109,48 @@ pub enum ClientEvent {
     },
 }
 
+// ── Client ↔ Server (audio transcription) ─────────────────
+
+/// Initial audio format metadata for a transcription websocket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioStartConfig {
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Events sent from client to server over `/audio/transcribe`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AudioClientEvent {
+    #[serde(rename = "start")]
+    Start { config: AudioStartConfig },
+    /// Base64-encoded little-endian signed 16-bit PCM audio.
+    #[serde(rename = "audio_chunk")]
+    AudioChunk { data: String },
+    #[serde(rename = "stop")]
+    Stop,
+    #[serde(rename = "cancel")]
+    Cancel,
+}
+
+/// Events sent from server to client over `/audio/transcribe`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AudioServerEvent {
+    #[serde(rename = "started")]
+    Started,
+    #[serde(rename = "transcript_delta")]
+    TranscriptDelta { text: String },
+    #[serde(rename = "transcript_final")]
+    TranscriptFinal { text: String },
+    #[serde(rename = "stopped")]
+    Stopped,
+    #[serde(rename = "error")]
+    Error { message: String },
+    #[serde(other)]
+    Unknown,
+}
+
 // ── Server → Client (streaming events) ──────────────────
 
 /// Events sent from server to client during a streaming chat.
@@ -282,6 +324,41 @@ pub struct UiConfig {
     /// The agent name used when no agent is specified.
     #[serde(default = "default_agent_name")]
     pub default_agent: String,
+    /// Audio transcription settings the TUI needs for microphone capture.
+    #[serde(default)]
+    pub audio: AudioUiConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioUiConfig {
+    #[serde(default = "default_audio_model")]
+    pub model: String,
+    #[serde(default = "default_audio_sample_rate")]
+    pub sample_rate: u32,
+    #[serde(default = "default_audio_channels")]
+    pub channels: u16,
+}
+
+impl Default for AudioUiConfig {
+    fn default() -> Self {
+        Self {
+            model: default_audio_model(),
+            sample_rate: default_audio_sample_rate(),
+            channels: default_audio_channels(),
+        }
+    }
+}
+
+fn default_audio_model() -> String {
+    "gpt-realtime-whisper".into()
+}
+
+fn default_audio_sample_rate() -> u32 {
+    24_000
+}
+
+fn default_audio_channels() -> u16 {
+    1
 }
 
 fn default_agent_name() -> String {
@@ -448,5 +525,26 @@ mod tests {
             }
             _ => panic!("unexpected variant"),
         }
+    }
+
+    #[test]
+    fn test_audio_client_event_roundtrip() {
+        let event = AudioClientEvent::Start {
+            config: AudioStartConfig {
+                sample_rate: 24_000,
+                channels: 1,
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("start"));
+        let decoded: AudioClientEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn test_audio_server_event_unknown_variant() {
+        let json = r#"{"type":"future_audio_event","foo":1}"#;
+        let event: AudioServerEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event, AudioServerEvent::Unknown);
     }
 }

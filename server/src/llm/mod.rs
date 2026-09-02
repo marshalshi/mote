@@ -73,6 +73,9 @@ pub struct ChatMessage {
     /// Must be passed back in subsequent requests when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Loop-only metadata. This must never be sent to a provider or persisted.
+    #[serde(skip)]
+    pub internal_role_task: bool,
 }
 
 impl ChatMessage {
@@ -83,6 +86,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            internal_role_task: false,
         }
     }
 
@@ -93,6 +97,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            internal_role_task: false,
         }
     }
 
@@ -104,6 +109,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            internal_role_task: false,
         }
     }
 
@@ -121,6 +127,7 @@ impl ChatMessage {
             tool_calls: Some(calls),
             tool_call_id: None,
             reasoning_content: None,
+            internal_role_task: false,
         }
     }
 
@@ -134,7 +141,15 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             reasoning_content: None,
+            internal_role_task: false,
         }
+    }
+
+    /// Create a user message used internally to hand work to a role.
+    pub fn role_task(content: impl Into<String>) -> Self {
+        let mut message = Self::user(content);
+        message.internal_role_task = true;
+        message
     }
 }
 
@@ -380,6 +395,17 @@ mod tests {
 
         let deserialized: ChatMessage = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.content, Some("hello world".into()));
+    }
+
+    #[test]
+    fn test_role_task_marker_is_not_serialized() {
+        let msg = ChatMessage::role_task("inspect it");
+        let json = serde_json::to_value(&msg).unwrap();
+
+        assert!(msg.internal_role_task);
+        assert!(json.get("internal_role_task").is_none());
+        let deserialized: ChatMessage = serde_json::from_value(json).unwrap();
+        assert!(!deserialized.internal_role_task);
     }
 
     #[test]

@@ -15,8 +15,9 @@ use ratatui::layout::Rect;
 use tokio::time::MissedTickBehavior;
 
 use self::keybinding::{Action, Keybindings};
-use self::state::{App, AppState, ServerHealth, SlashAction};
-use crate::client::{ChatStream, MoteClient};
+use self::state::{App, AppState, AudioState, ServerHealth, SlashAction};
+use crate::audio::AudioCapture;
+use crate::client::{AudioTranscriptionStream, ChatStream, MoteClient};
 
 enum BackgroundEvent {
     CompactFinished(anyhow::Result<marshaling_protocol::CompactResponse>),
@@ -40,10 +41,15 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
     // Build keybinding map from keybindings.toml (optional)
     let raw_bindings = crate::config::load_keybindings();
     let keybindings = Keybindings::from_config(raw_bindings.as_ref());
+    if let Some(label) = keybindings.display_label(Action::PushToTalk) {
+        app.push_to_talk_label = label.to_string();
+    }
     let mut reader = EventStream::new();
 
     // Agent / WS chat channels
     let mut chat_stream: Option<ChatStream> = None;
+    let mut audio_stream: Option<AudioTranscriptionStream> = None;
+    let mut audio_capture: Option<AudioCapture> = None;
     let (background_tx, mut background_rx) =
         tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
 
@@ -78,6 +84,14 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     }
                 }
                 _ = animation_interval.tick(), if animate_loading => {}
+                audio_event = async {
+                    match audio_stream.as_mut() {
+                        Some(stream) => stream.rx.recv().await,
+                        None => None,
+                    }
+                }, if audio_stream.is_some() => {
+                    handle_audio_event(&mut app, audio_event, &mut audio_stream, &mut audio_capture);
+                }
                 server_event = stream.rx.recv() => {
                     match server_event {
                         Some(event) => handle_server_event(&mut app, event, &mut chat_stream),
@@ -123,6 +137,14 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     }
                 }
                 _ = animation_interval.tick(), if animate_loading => {}
+                audio_event = async {
+                    match audio_stream.as_mut() {
+                        Some(stream) => stream.rx.recv().await,
+                        None => None,
+                    }
+                }, if audio_stream.is_some() => {
+                    handle_audio_event(&mut app, audio_event, &mut audio_stream, &mut audio_capture);
+                }
                 _ = health_interval.tick() => {
                     let healthy = client.health().await;
                     app.server_health = if healthy {
@@ -140,6 +162,25 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                         handle_background_event(&mut app, event);
                     }
                 }
+            }
+        }
+
+        if app.pending_audio_toggle {
+            app.pending_audio_toggle = false;
+            if audio_stream.is_some() || audio_capture.is_some() {
+                stop_audio_transcription(
+                    &mut app,
+                    &audio_stream,
+                    &mut audio_capture,
+                );
+            } else {
+                start_audio_transcription(
+                    client,
+                    &mut app,
+                    &mut audio_stream,
+                    &mut audio_capture,
+                )
+                .await;
             }
         }
 
@@ -800,6 +841,185 @@ fn handle_server_event(
     }
 }
 
+async fn start_audio_transcription(
+    client: &MoteClient,
+    app: &mut App,
+    audio_stream: &mut Option<AudioTranscriptionStream>,
+    audio_capture: &mut Option<AudioCapture>,
+) {
+    if app.state != AppState::Idle {
+        app.messages.push(self::state::DisplayMessage::command(
+            crate::llm::Role::Assistant,
+            "Audio input is only available while the agent is idle.".into(),
+        ));
+        return;
+    }
+    app.audio_state = AudioState::Connecting;
+    let config = marshaling_protocol::AudioStartConfig {
+        sample_rate: app.audio_sample_rate,
+        channels: app.audio_channels,
+    };
+    tracing::debug!(
+        sample_rate = config.sample_rate,
+        channels = config.channels,
+        "starting audio transcription"
+    );
+    match client.audio_transcription_stream(config).await {
+        Ok(mut stream) => {
+            tracing::debug!("audio transcription websocket connected");
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                stream.rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(marshaling_protocol::AudioServerEvent::Started)) => {
+                    tracing::debug!("audio transcription server is ready")
+                }
+                Ok(Some(marshaling_protocol::AudioServerEvent::Error {
+                    message,
+                })) => {
+                    tracing::warn!(
+                        "audio transcription failed before recording: {message}"
+                    );
+                    stream.cancel();
+                    app.audio_state = AudioState::Error(message.clone());
+                    return;
+                }
+                Ok(Some(event)) => {
+                    tracing::warn!(
+                        ?event,
+                        "unexpected audio event before recording"
+                    );
+                    stream.cancel();
+                    app.audio_state = AudioState::Error(
+                        "Unexpected audio server event before recording".into(),
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "audio transcription websocket closed before server ready"
+                    );
+                    app.audio_state = AudioState::Error(
+                        "Audio transcription connection closed before recording started".into(),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "timed out waiting for audio transcription server readiness"
+                    );
+                    stream.cancel();
+                    app.audio_state = AudioState::Error(
+                        "Timed out waiting for audio transcription server"
+                            .into(),
+                    );
+                    return;
+                }
+            }
+            match AudioCapture::start(app.audio_sample_rate) {
+                Ok(capture) => {
+                    tracing::info!("microphone recording started");
+                    *audio_capture = Some(capture);
+                    *audio_stream = Some(stream);
+                    app.audio_state = AudioState::Recording;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to start microphone recording: {e:#}"
+                    );
+                    stream.cancel();
+                    app.audio_state = AudioState::Error(format!("{e:#}"));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to start audio transcription: {e:#}");
+            app.audio_state = AudioState::Error(format!("{e:#}"));
+        }
+    }
+}
+
+fn stop_audio_transcription(
+    app: &mut App,
+    audio_stream: &Option<AudioTranscriptionStream>,
+    audio_capture: &mut Option<AudioCapture>,
+) {
+    if let Some(stream) = audio_stream {
+        let audio = audio_capture
+            .as_ref()
+            .map(AudioCapture::recorded_pcm)
+            .unwrap_or_default();
+        tracing::info!(
+            bytes = audio.len(),
+            "microphone recording stopped; submitting completed recording"
+        );
+        *audio_capture = None;
+        stream.stop_with_audio(audio);
+        app.audio_state = AudioState::Transcribing;
+    } else {
+        *audio_capture = None;
+        tracing::debug!("audio stop requested without an active stream");
+        app.audio_state = AudioState::Idle;
+    }
+}
+
+fn handle_audio_event(
+    app: &mut App,
+    event: Option<marshaling_protocol::AudioServerEvent>,
+    audio_stream: &mut Option<AudioTranscriptionStream>,
+    audio_capture: &mut Option<AudioCapture>,
+) {
+    match event {
+        Some(marshaling_protocol::AudioServerEvent::Started) => {
+            tracing::debug!("audio transcription server reported started");
+            app.audio_state = AudioState::Recording;
+        }
+        Some(marshaling_protocol::AudioServerEvent::TranscriptDelta {
+            ..
+        }) => {}
+        Some(marshaling_protocol::AudioServerEvent::TranscriptFinal {
+            text,
+        }) => {
+            tracing::debug!(
+                chars = text.chars().count(),
+                "audio transcript finalized"
+            );
+            app.insert_transcript(&text);
+            app.audio_state = AudioState::Idle;
+            *audio_stream = None;
+            *audio_capture = None;
+        }
+        Some(marshaling_protocol::AudioServerEvent::Stopped) => {
+            tracing::warn!(
+                "audio transcription stopped without a final transcript"
+            );
+            app.audio_state = AudioState::Idle;
+            *audio_stream = None;
+            *audio_capture = None;
+            app.touch_response_render();
+        }
+        None => {
+            tracing::warn!(
+                "audio transcription channel closed without a final event"
+            );
+            app.audio_state = AudioState::Idle;
+            *audio_stream = None;
+            *audio_capture = None;
+            app.touch_response_render();
+        }
+        Some(marshaling_protocol::AudioServerEvent::Error { message }) => {
+            tracing::warn!("audio transcription error: {message}");
+            app.audio_state = AudioState::Error(message.clone());
+            *audio_stream = None;
+            *audio_capture = None;
+            app.touch_response_render();
+        }
+        Some(marshaling_protocol::AudioServerEvent::Unknown) => {}
+    }
+}
+
 /// Handle keyboard and mouse events.
 fn handle_key_event(
     app: &mut App,
@@ -1059,6 +1279,10 @@ fn handle_action(
             app.scroll_to_bottom();
             return;
         }
+        Some(Action::PushToTalk) => {
+            app.pending_audio_toggle = true;
+            return;
+        }
         Some(Action::SwitchView) => {
             // Cycle through views: primary → subagent 0 → subagent 1 → ... → primary
             if app.subagent_views.is_empty() {
@@ -1106,8 +1330,16 @@ fn handle_action(
             Some(Action::KillLine) => app.kill_line(),
             Some(Action::DeleteBefore) => app.delete_before(),
             Some(Action::DeleteAfter) => app.delete_after(),
-            Some(Action::HistoryUp) => app.history_up(),
-            Some(Action::HistoryDown) => app.history_down(),
+            Some(Action::HistoryUp) => {
+                if !handle_input_vertical_scroll(app, true) {
+                    app.history_up();
+                }
+            }
+            Some(Action::HistoryDown) => {
+                if !handle_input_vertical_scroll(app, false) {
+                    app.history_down();
+                }
+            }
             None => {
                 if let crossterm::event::KeyCode::Char(c) = code {
                     let clean = modifiers == KeyModifiers::NONE
@@ -1125,8 +1357,16 @@ fn handle_action(
     // During waiting response, still allow input history navigation
     if app.state == AppState::WaitingResponse {
         match action {
-            Some(Action::HistoryUp) => app.history_up(),
-            Some(Action::HistoryDown) => app.history_down(),
+            Some(Action::HistoryUp) => {
+                if !handle_input_vertical_scroll(app, true) {
+                    app.history_up();
+                }
+            }
+            Some(Action::HistoryDown) => {
+                if !handle_input_vertical_scroll(app, false) {
+                    app.history_down();
+                }
+            }
             _ => {}
         }
         return;
@@ -1212,10 +1452,7 @@ fn normal_action(
 ) {
     match action {
         Some(Action::SendMessage) => {
-            let text = app.submit_input();
-            if text.is_empty() && !app.handled_slash_command {
-                app.state = AppState::Quitting;
-            }
+            app.submit_input();
         }
         Some(Action::InsertNewline) => app.insert_newline(),
         Some(Action::CursorLeft) => app.cursor_left(),
@@ -1225,8 +1462,16 @@ fn normal_action(
         Some(Action::KillLine) => app.kill_line(),
         Some(Action::DeleteBefore) => app.delete_before(),
         Some(Action::DeleteAfter) => app.delete_after(),
-        Some(Action::HistoryUp) => app.history_up(),
-        Some(Action::HistoryDown) => app.history_down(),
+        Some(Action::HistoryUp) => {
+            if !handle_input_vertical_scroll(app, true) {
+                app.history_up();
+            }
+        }
+        Some(Action::HistoryDown) => {
+            if !handle_input_vertical_scroll(app, false) {
+                app.history_down();
+            }
+        }
         Some(Action::AgentCommand) => {
             if app.input.is_empty() {
                 app.input.push('/');
@@ -1250,6 +1495,25 @@ fn normal_action(
         }
         _ => {}
     }
+}
+
+fn handle_input_vertical_scroll(app: &mut App, upward: bool) -> bool {
+    let Some((term_width, term_height)) = crossterm::terminal::size().ok()
+    else {
+        return false;
+    };
+    let full_area = Rect::new(0, 0, term_width, term_height);
+    let max_offset = render::input_scroll_capacity(full_area, app);
+    if max_offset == 0 && app.input_scroll_offset == 0 {
+        return false;
+    }
+
+    if upward {
+        app.input_scroll_up(1, max_offset);
+    } else {
+        app.input_scroll_down(1);
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1532,6 +1796,7 @@ mod tests {
                 ("review".into(), "kimi/kimi-k2.6".into()),
             ]),
             default_agent: "build".into(),
+            audio: marshaling_protocol::AudioUiConfig::default(),
         }
     }
 
@@ -1556,6 +1821,41 @@ mod tests {
         let req = build_chat_request(&app, "hello".into());
         assert_eq!(req.session_id.as_deref(), Some("sess-abc"));
         assert_eq!(req.runtime_session_key.as_deref(), Some("runtime-key"));
+    }
+
+    #[test]
+    fn test_empty_submit_does_not_quit() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+
+        normal_action(
+            &mut app,
+            Some(Action::SendMessage),
+            crossterm::event::KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+
+        assert_eq!(app.state, AppState::Idle);
+    }
+
+    #[test]
+    fn test_configured_quit_action_still_quits() {
+        let cfg = test_ui_config();
+        let mut app = App::new(&cfg, cfg.model_info.clone());
+        let keys = Keybindings::from_config(None);
+        let mut chat_stream = None;
+
+        handle_key_event(
+            &mut app,
+            &keys,
+            Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )),
+            &mut chat_stream,
+        );
+
+        assert_eq!(app.state, AppState::Quitting);
     }
 
     #[test]

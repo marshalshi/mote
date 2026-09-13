@@ -74,6 +74,24 @@ channels = 1
 [prompts]
 default = "prompts/system/mote.md"
 
+# --- Optional: Google Sheets sync (read-only, service account) ---
+# Syncs an activity/job spreadsheet tab into PM. Disabled by default.
+# Requires:
+#   1. A Google service-account JSON credential file (credentials_path),
+#   2. The sheet shared with the service-account email as Viewer,
+#   3. The read-only scope is hard-coded (spreadsheets.readonly).
+# Import is MANUAL and explicit through the pm agent tools:
+#   - pm_preview_google_sheet_site_jobs_import  (dry run, returns import_run_id + preview_hash)
+#   - pm_apply_google_sheet_site_jobs_import     (applies only the reviewed preview; refuses if the sheet changed)
+#   - pm_list_google_sheet_import_conflicts / pm_list_imported_google_sheet_jobs (inspect DB)
+# A daily background scheduler is planned but not implemented yet.
+# [google_sheets]
+# enabled = true                                  # master switch (default: false)
+# spreadsheet_id = "1lE3Mvs_mXsY-..."             # from the sheet URL
+# sheet_name = "US"                               # tab name to read (default: US)
+# credentials_path = "/absolute/path/to/service-account.json"
+# eligible_activity_types = ["Boris Job", "Demo"] # exact activity types to import
+
 # --- Optional: named agents with custom models/prompts ---
 # [agents.plan]
 # model = "ollama/qwen3.5:9b"

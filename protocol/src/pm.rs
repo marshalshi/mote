@@ -291,6 +291,211 @@ pub struct EventLogRecord {
     pub created_at: String,
 }
 
+// ── Imported Google Sheets jobs ─────────────────────────────────
+//
+// These types back the title-keyed Google Sheets import feature. An imported
+// job is keyed by the exact `Title of Activity` cell (`external_job_key`)
+// scoped per `source`, so the same sheet title maps to exactly one local job.
+
+/// Lifecycle status of an imported job in the local PM store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportedJobStatus {
+    /// Active — currently open in the source sheet.
+    Active,
+    /// Completed — the source marked the row Done (or it was completed).
+    Completed,
+    /// Ignored — excluded from local planning.
+    Ignored,
+}
+
+/// Status of a Google Sheets import run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportRunStatus {
+    /// Previewed — dry-run classification produced, nothing mutated.
+    Previewed,
+    /// Applied — mutations were committed to the store.
+    Applied,
+    /// Failed — the apply aborted.
+    Failed,
+}
+
+/// Review status of an import conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportConflictStatus {
+    /// Open — awaiting operator review.
+    Open,
+    /// Resolved — the operator marked it resolved.
+    Resolved,
+}
+
+/// Kind of import conflict recorded for operator review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportConflictType {
+    /// An eligible row had a blank title key.
+    BlankTitle,
+    /// Two or more eligible rows shared the same title.
+    DuplicateTitle,
+    /// An eligible row could not be normalized (e.g. unparseable date).
+    InvalidRow,
+    /// A completed/ignored job reappeared as active.
+    ReopenCompleted,
+}
+
+/// A row in the `imported_jobs` table.
+///
+/// `external_job_key` is the exact source title and is UNIQUE per `source`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedJobRecord {
+    pub id: i64,
+    /// Stable local UUID; preserved across source updates.
+    pub entity_id: EntityId,
+    /// Import source, e.g. `google_sheets`.
+    pub source: String,
+    /// Spreadsheet provenance.
+    pub spreadsheet_id: String,
+    /// Tab provenance.
+    pub sheet_name: String,
+    /// Exact `Title of Activity` cell — the stable external key.
+    pub external_job_key: String,
+    /// Display title (same as the key for Google Sheets).
+    pub title: String,
+    pub location: String,
+    pub activity_type: String,
+    /// Start date `YYYY-MM-DD` (nullable when the source cell is blank).
+    pub start_date: Option<String>,
+    /// End date `YYYY-MM-DD` (nullable when the source cell is blank).
+    pub end_date: Option<String>,
+    pub job_leader: String,
+    pub team_member: String,
+    pub robots: String,
+    pub additional_info: String,
+    /// Whether the source row is currently marked Done.
+    pub source_done: bool,
+    /// Local lifecycle status.
+    pub local_status: ImportedJobStatus,
+    /// Stable hash of the mapped source fields (change detection).
+    pub row_hash: String,
+    /// Raw normalized source payload JSON (provenance).
+    pub source_payload: serde_json::Value,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    /// Import run that last wrote this row.
+    pub last_import_run_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A row in the `import_runs` table (one preview or apply).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRunRecord {
+    /// UUID/string primary key.
+    pub id: String,
+    pub source: String,
+    pub spreadsheet_id: String,
+    pub sheet_name: String,
+    /// Who triggered the run, e.g. `manual`.
+    pub triggered_by: String,
+    /// Whether the run only previewed without mutating.
+    pub dry_run: bool,
+    pub status: ImportRunStatus,
+    /// Stable hash of the classified diff.
+    pub preview_hash: String,
+    pub seen_count: i64,
+    pub created_count: i64,
+    pub updated_count: i64,
+    pub unchanged_count: i64,
+    pub conflict_count: i64,
+    pub invalid_count: i64,
+    pub skipped_count: i64,
+    /// Free-form summary JSON.
+    pub summary: serde_json::Value,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// A row in the `import_conflicts` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportConflictRecord {
+    pub id: i64,
+    /// Import run that recorded the conflict, when known.
+    pub import_run_id: Option<String>,
+    pub source: String,
+    /// External job key involved; empty for row-level normalization errors.
+    pub external_job_key: String,
+    pub conflict_type: ImportConflictType,
+    pub reason: String,
+    /// Extra detail JSON (row numbers, incoming values, ...).
+    pub details: serde_json::Value,
+    pub status: ImportConflictStatus,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+// ── Imported Google Sheets job inputs ───────────────────────────
+
+/// Input for upserting one imported job, keyed by `(source, external_job_key)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedJobInput {
+    pub source: String,
+    pub spreadsheet_id: String,
+    pub sheet_name: String,
+    /// Exact source title — the stable external key.
+    pub external_job_key: String,
+    pub title: String,
+    pub location: String,
+    pub activity_type: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub job_leader: String,
+    pub team_member: String,
+    pub robots: String,
+    pub additional_info: String,
+    pub source_done: bool,
+    pub local_status: ImportedJobStatus,
+    /// Stable hash of the mapped source fields.
+    pub row_hash: String,
+    /// Raw normalized source payload JSON (provenance).
+    pub source_payload: serde_json::Value,
+    /// Import run that wrote this row, when known.
+    pub import_run_id: Option<String>,
+}
+
+/// Input for recording an import run (preview or apply bookkeeping).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRunInput {
+    pub id: String,
+    pub source: String,
+    pub spreadsheet_id: String,
+    pub sheet_name: String,
+    pub triggered_by: String,
+    pub dry_run: bool,
+    pub status: ImportRunStatus,
+    pub preview_hash: String,
+    pub seen_count: i64,
+    pub created_count: i64,
+    pub updated_count: i64,
+    pub unchanged_count: i64,
+    pub conflict_count: i64,
+    pub invalid_count: i64,
+    pub skipped_count: i64,
+    pub summary: serde_json::Value,
+}
+
+/// Input for recording an import conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportConflictInput {
+    pub import_run_id: Option<String>,
+    pub source: String,
+    pub external_job_key: String,
+    pub conflict_type: ImportConflictType,
+    pub reason: String,
+    pub details: serde_json::Value,
+}
+
 // ── Input / mutation structs ─────────────────────────────────
 
 /// Input for creating a new site.
@@ -979,5 +1184,125 @@ mod tests {
         let back: PmBridgeChatResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back.status, "done");
         assert_eq!(back.tokens_output, 20);
+    }
+
+    #[test]
+    fn test_imported_job_status_roundtrip() {
+        let cases = [
+            ImportedJobStatus::Active,
+            ImportedJobStatus::Completed,
+            ImportedJobStatus::Ignored,
+        ];
+        for s in &cases {
+            let json = serde_json::to_string(s).unwrap();
+            let back: ImportedJobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*s, back);
+        }
+        assert_eq!(
+            serde_json::to_string(&ImportedJobStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+    }
+
+    #[test]
+    fn test_import_run_status_roundtrip() {
+        let json = serde_json::to_string(&ImportRunStatus::Applied).unwrap();
+        assert_eq!(json, "\"applied\"");
+        let back: ImportRunStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ImportRunStatus::Applied);
+    }
+
+    #[test]
+    fn test_import_conflict_type_roundtrip() {
+        let json =
+            serde_json::to_string(&ImportConflictType::DuplicateTitle).unwrap();
+        assert_eq!(json, "\"duplicate_title\"");
+        let back: ImportConflictType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ImportConflictType::DuplicateTitle);
+    }
+
+    #[test]
+    fn test_imported_job_record_roundtrip() {
+        let rec = ImportedJobRecord {
+            id: 1,
+            entity_id: "job-uuid".into(),
+            source: "google_sheets".into(),
+            spreadsheet_id: "spreadsheet-1".into(),
+            sheet_name: "US".into(),
+            external_job_key: "Site A install".into(),
+            title: "Site A install".into(),
+            location: "100 Bay St".into(),
+            activity_type: "Boris Job".into(),
+            start_date: Some("2026-08-05".into()),
+            end_date: Some("2026-08-12".into()),
+            job_leader: "Alice".into(),
+            team_member: "Bob".into(),
+            robots: "R1".into(),
+            additional_info: "bring drill".into(),
+            source_done: false,
+            local_status: ImportedJobStatus::Active,
+            row_hash: "abc123".into(),
+            source_payload: serde_json::json!({"office": "Shenzhen"}),
+            first_seen_at: "2026-08-01T00:00:00Z".into(),
+            last_seen_at: "2026-08-02T00:00:00Z".into(),
+            last_import_run_id: Some("run-uuid".into()),
+            created_at: "2026-08-01T00:00:00Z".into(),
+            updated_at: "2026-08-02T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: ImportedJobRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.entity_id, "job-uuid");
+        assert_eq!(back.external_job_key, "Site A install");
+        assert_eq!(back.local_status, ImportedJobStatus::Active);
+        assert_eq!(back.source_payload["office"], "Shenzhen");
+    }
+
+    #[test]
+    fn test_import_run_record_roundtrip() {
+        let rec = ImportRunRecord {
+            id: "run-uuid".into(),
+            source: "google_sheets".into(),
+            spreadsheet_id: "spreadsheet-1".into(),
+            sheet_name: "US".into(),
+            triggered_by: "manual".into(),
+            dry_run: true,
+            status: ImportRunStatus::Previewed,
+            preview_hash: "hash".into(),
+            seen_count: 10,
+            created_count: 2,
+            updated_count: 1,
+            unchanged_count: 5,
+            conflict_count: 1,
+            invalid_count: 1,
+            skipped_count: 0,
+            summary: serde_json::json!({"creates": 2}),
+            created_at: "2026-08-01T00:00:00Z".into(),
+            completed_at: None,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: ImportRunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "run-uuid");
+        assert_eq!(back.status, ImportRunStatus::Previewed);
+        assert!(back.dry_run);
+    }
+
+    #[test]
+    fn test_import_conflict_record_roundtrip() {
+        let rec = ImportConflictRecord {
+            id: 1,
+            import_run_id: Some("run-uuid".into()),
+            source: "google_sheets".into(),
+            external_job_key: "Shared title".into(),
+            conflict_type: ImportConflictType::DuplicateTitle,
+            reason: "Two rows share this title".into(),
+            details: serde_json::json!({"row_numbers": [1, 2]}),
+            status: ImportConflictStatus::Open,
+            created_at: "2026-08-01T00:00:00Z".into(),
+            resolved_at: None,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: ImportConflictRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.conflict_type, ImportConflictType::DuplicateTitle);
+        assert_eq!(back.status, ImportConflictStatus::Open);
     }
 }

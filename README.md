@@ -343,6 +343,27 @@ When a subagent finishes, its output is automatically added to the primary conve
 
 Recursion is limited to 3 levels.
 
+### PM agent and Google Sheets import
+
+Mote ships a built-in `pm` agent (`/agent pm`) for chat-first project
+management backed by a local SQLite store. It also supports **manual** Google
+Sheets imports of site jobs (read-only service-account access, see
+`[google_sheets]` in `config.toml`):
+
+1. `pm_preview_google_sheet_site_jobs_import` — validates config, fetches the
+   configured tab, classifies create/update/unchanged/conflicts, and persists a
+   dry-run import run (returns `import_run_id` + `preview_hash`). Never mutates
+   jobs.
+2. `pm_apply_google_sheet_site_jobs_import` — applies only the reviewed
+   preview; re-checks the source and refuses if the sheet changed since the
+   preview.
+3. `pm_list_google_sheet_import_conflicts` / `pm_list_imported_google_sheet_jobs`
+   — inspect conflicts and the imported jobs in the database.
+
+A daily background scheduler is planned but not yet implemented; syncs are
+operator-triggered through these tools. See `prompts/agents/pm.md` for the
+agent's operating rules.
+
 ### Debug logging
 
 ```bash

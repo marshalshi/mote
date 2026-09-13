@@ -8,12 +8,18 @@
 //! - `schema` — SQLite schema bootstrap / migrations
 //! - `store` — SQLite persistence layer
 //! - `service` — Business rules and validation
+//! - `imports` — Title-keyed Google Sheets import diff/preview/apply
+//! - `google_sheets` — Read-only Google Sheets sync foundation (service-account auth, fetch, normalize)
+//! - `google_sheets_tools` — PM agent tools for manual preview/apply/list of sheet imports
 //! - `events` — Audit log helpers
 //! - `tools` — PM tool adapters for the agent loop
 //! - `alerts` — Lead-time and blocker engine
 
 pub mod alerts;
 pub mod events;
+pub mod google_sheets;
+pub mod google_sheets_tools;
+pub mod imports;
 pub mod schema;
 pub mod service;
 pub mod store;
@@ -26,6 +32,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 pub use service::PmService;
 pub use store::Store;
+
+/// Import source key used by the Google Sheets import tools and store.
+pub const GOOGLE_SHEETS_IMPORT_SOURCE: &str = "google_sheets";
 
 /// PM runtime context holding the SQLite store.
 #[derive(Debug, Clone)]
@@ -104,12 +113,22 @@ pub const PM_TOOL_NAMES: &[&str] = &[
     "pm_check_deploy_readiness",
     "pm_check_alerts",
     "pm_list_blockers",
+    "pm_preview_google_sheet_site_jobs_import",
+    "pm_apply_google_sheet_site_jobs_import",
+    "pm_list_google_sheet_import_conflicts",
+    "pm_list_imported_google_sheet_jobs",
 ];
 
 /// Build the PM tool set backed by the real service layer.
-pub fn pm_tools(ctx: PmContext) -> Vec<Box<dyn crate::llm::Tool>> {
+///
+/// `gs_config` carries the optional `[google_sheets]` config into the import
+/// tools; it only ever holds a credential *path*, never credential contents.
+pub fn pm_tools(
+    ctx: PmContext,
+    gs_config: crate::config::GoogleSheetsConfig,
+) -> Vec<Box<dyn crate::llm::Tool>> {
     let service = Arc::new(PmService::new(ctx.store));
-    vec![
+    let mut tools: Vec<Box<dyn crate::llm::Tool>> = vec![
         Box::new(tools::PmGetStatusTool::new(Arc::clone(&service))),
         Box::new(tools::PmListSitesTool::new(Arc::clone(&service))),
         Box::new(tools::PmListBatchesTool::new(Arc::clone(&service))),
@@ -131,5 +150,7 @@ pub fn pm_tools(ctx: PmContext) -> Vec<Box<dyn crate::llm::Tool>> {
         Box::new(tools::PmCheckDeployReadinessTool::new(Arc::clone(&service))),
         Box::new(tools::PmCheckAlertsTool::new(Arc::clone(&service))),
         Box::new(tools::PmListBlockersTool::new(Arc::clone(&service))),
-    ]
+    ];
+    tools.extend(google_sheets_tools::google_sheets_tools(service, gs_config));
+    tools
 }

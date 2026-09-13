@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 use marshaling_protocol::pm::{
     AlertRecord, AssignmentRecord, BatchRecord, EventLogRecord,
+    ImportConflictInput, ImportConflictRecord, ImportConflictStatus,
+    ImportConflictType, ImportRunInput, ImportRunRecord, ImportRunStatus,
+    ImportedJobInput, ImportedJobRecord, ImportedJobStatus,
     InventoryItemRecord, PersonRecord, ProcurementOrderRecord, SiteRecord,
 };
 
@@ -1849,6 +1852,673 @@ impl Store {
     }
 }
 
+// ── Imported Google Sheets jobs (title-keyed) ─────────────────
+
+/// Shared SELECT column list for `imported_jobs`.
+const IMPORTED_JOB_COLUMNS: &str = "id, entity_id, source, spreadsheet_id, sheet_name, external_job_key, title, location, activity_type, start_date, end_date, job_leader, team_member, robots, additional_info, source_done, local_status, row_hash, source_payload, first_seen_at, last_seen_at, last_import_run_id, created_at, updated_at";
+
+/// Shared SELECT column list for `import_conflicts`.
+const IMPORT_CONFLICT_COLUMNS: &str = "id, import_run_id, source, external_job_key, conflict_type, reason, details, status, created_at, resolved_at";
+
+#[allow(dead_code)]
+fn imported_job_status_from_str(s: &str) -> ImportedJobStatus {
+    match s {
+        "completed" => ImportedJobStatus::Completed,
+        "ignored" => ImportedJobStatus::Ignored,
+        // Unknown/corrupt values fall back to active so a legacy row never
+        // breaks a reader.
+        _ => ImportedJobStatus::Active,
+    }
+}
+
+#[allow(dead_code)]
+fn imported_job_status_to_str(status: &ImportedJobStatus) -> &'static str {
+    match status {
+        ImportedJobStatus::Active => "active",
+        ImportedJobStatus::Completed => "completed",
+        ImportedJobStatus::Ignored => "ignored",
+    }
+}
+
+#[allow(dead_code)]
+fn import_run_status_from_str(s: &str) -> ImportRunStatus {
+    match s {
+        "applied" => ImportRunStatus::Applied,
+        "failed" => ImportRunStatus::Failed,
+        _ => ImportRunStatus::Previewed,
+    }
+}
+
+#[allow(dead_code)]
+fn import_run_status_to_str(status: &ImportRunStatus) -> &'static str {
+    match status {
+        ImportRunStatus::Previewed => "previewed",
+        ImportRunStatus::Applied => "applied",
+        ImportRunStatus::Failed => "failed",
+    }
+}
+
+#[allow(dead_code)]
+fn import_conflict_status_from_str(s: &str) -> ImportConflictStatus {
+    if s == "resolved" {
+        ImportConflictStatus::Resolved
+    } else {
+        ImportConflictStatus::Open
+    }
+}
+
+#[allow(dead_code)]
+fn import_conflict_status_to_str(
+    status: &ImportConflictStatus,
+) -> &'static str {
+    match status {
+        ImportConflictStatus::Open => "open",
+        ImportConflictStatus::Resolved => "resolved",
+    }
+}
+
+#[allow(dead_code)]
+fn import_conflict_type_from_str(s: &str) -> ImportConflictType {
+    match s {
+        "blank_title" => ImportConflictType::BlankTitle,
+        "duplicate_title" => ImportConflictType::DuplicateTitle,
+        "invalid_row" => ImportConflictType::InvalidRow,
+        _ => ImportConflictType::ReopenCompleted,
+    }
+}
+
+#[allow(dead_code)]
+fn import_conflict_type_to_str(t: &ImportConflictType) -> &'static str {
+    match t {
+        ImportConflictType::BlankTitle => "blank_title",
+        ImportConflictType::DuplicateTitle => "duplicate_title",
+        ImportConflictType::InvalidRow => "invalid_row",
+        ImportConflictType::ReopenCompleted => "reopen_completed",
+    }
+}
+
+/// Map a `imported_jobs` row to a typed record.
+fn imported_job_from_row(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<ImportedJobRecord> {
+    let source_done: i32 = row.get(15)?;
+    let local_status: String = row.get(16)?;
+    let source_payload: String = row.get(18)?;
+    Ok(ImportedJobRecord {
+        id: row.get(0)?,
+        entity_id: row.get(1)?,
+        source: row.get(2)?,
+        spreadsheet_id: row.get(3)?,
+        sheet_name: row.get(4)?,
+        external_job_key: row.get(5)?,
+        title: row.get(6)?,
+        location: row.get(7)?,
+        activity_type: row.get(8)?,
+        start_date: row.get(9)?,
+        end_date: row.get(10)?,
+        job_leader: row.get(11)?,
+        team_member: row.get(12)?,
+        robots: row.get(13)?,
+        additional_info: row.get(14)?,
+        source_done: int_to_bool(source_done),
+        local_status: imported_job_status_from_str(&local_status),
+        row_hash: row.get(17)?,
+        source_payload: serde_json::from_str(&source_payload)
+            .unwrap_or_default(),
+        first_seen_at: row.get(19)?,
+        last_seen_at: row.get(20)?,
+        last_import_run_id: row.get(21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
+    })
+}
+
+/// Insert or update one imported job on a connection.
+///
+/// On conflict the stable `entity_id` and `first_seen_at` are preserved; every
+/// mapped source field plus `last_seen_at`/`last_import_run_id` are refreshed.
+#[allow(dead_code)]
+fn upsert_imported_job_on(
+    conn: &Connection,
+    input: &ImportedJobInput,
+    now: &str,
+) -> Result<()> {
+    let entity_id = Store::generate_id();
+    conn.execute(
+        "INSERT INTO imported_jobs (
+            entity_id, source, spreadsheet_id, sheet_name, external_job_key,
+            title, location, activity_type, start_date, end_date,
+            job_leader, team_member, robots, additional_info,
+            source_done, local_status, row_hash, source_payload,
+            first_seen_at, last_seen_at, last_import_run_id, created_at, updated_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18,
+            ?19, ?20, ?21, ?22, ?23
+        )
+        ON CONFLICT (source, external_job_key) DO UPDATE SET
+            spreadsheet_id = excluded.spreadsheet_id,
+            sheet_name = excluded.sheet_name,
+            title = excluded.title,
+            location = excluded.location,
+            activity_type = excluded.activity_type,
+            start_date = excluded.start_date,
+            end_date = excluded.end_date,
+            job_leader = excluded.job_leader,
+            team_member = excluded.team_member,
+            robots = excluded.robots,
+            additional_info = excluded.additional_info,
+            source_done = excluded.source_done,
+            local_status = excluded.local_status,
+            row_hash = excluded.row_hash,
+            source_payload = excluded.source_payload,
+            last_seen_at = excluded.last_seen_at,
+            last_import_run_id = excluded.last_import_run_id,
+            updated_at = excluded.updated_at",
+        params![
+            entity_id,
+            input.source,
+            input.spreadsheet_id,
+            input.sheet_name,
+            input.external_job_key,
+            input.title,
+            input.location,
+            input.activity_type,
+            input.start_date,
+            input.end_date,
+            input.job_leader,
+            input.team_member,
+            input.robots,
+            input.additional_info,
+            bool_to_int(input.source_done),
+            imported_job_status_to_str(&input.local_status),
+            input.row_hash,
+            input.source_payload.to_string(),
+            now,
+            now,
+            input.import_run_id,
+            now,
+            now,
+        ],
+    )
+    .context("upserting imported job")?;
+    Ok(())
+}
+
+/// Read one imported job by `(source, external_job_key)`.
+#[allow(dead_code)]
+fn read_imported_job(
+    conn: &Connection,
+    source: &str,
+    external_job_key: &str,
+) -> Result<Option<ImportedJobRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {IMPORTED_JOB_COLUMNS} FROM imported_jobs WHERE source = ?1 AND external_job_key = ?2"
+    ))?;
+    let mut rows = stmt
+        .query_map(params![source, external_job_key], imported_job_from_row)?;
+    match rows.next() {
+        Some(Ok(rec)) => Ok(Some(rec)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Insert an `import_runs` row on a connection.
+#[allow(dead_code)]
+fn insert_import_run_on(
+    conn: &Connection,
+    input: &ImportRunInput,
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO import_runs (
+            id, source, spreadsheet_id, sheet_name, triggered_by,
+            dry_run, status, preview_hash,
+            seen_count, created_count, updated_count, unchanged_count,
+            conflict_count, invalid_count, skipped_count,
+            summary, created_at, completed_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18
+        )",
+        params![
+            input.id,
+            input.source,
+            input.spreadsheet_id,
+            input.sheet_name,
+            input.triggered_by,
+            bool_to_int(input.dry_run),
+            import_run_status_to_str(&input.status),
+            input.preview_hash,
+            input.seen_count,
+            input.created_count,
+            input.updated_count,
+            input.unchanged_count,
+            input.conflict_count,
+            input.invalid_count,
+            input.skipped_count,
+            input.summary.to_string(),
+            now,
+            now,
+        ],
+    )
+    .context("inserting import run")?;
+    Ok(())
+}
+
+/// Map an `import_runs` row to a typed record.
+fn import_run_from_row(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<ImportRunRecord> {
+    let dry_run: i32 = row.get(5)?;
+    let status: String = row.get(6)?;
+    let summary: String = row.get(15)?;
+    Ok(ImportRunRecord {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        spreadsheet_id: row.get(2)?,
+        sheet_name: row.get(3)?,
+        triggered_by: row.get(4)?,
+        dry_run: int_to_bool(dry_run),
+        status: import_run_status_from_str(&status),
+        preview_hash: row.get(7)?,
+        seen_count: row.get(8)?,
+        created_count: row.get(9)?,
+        updated_count: row.get(10)?,
+        unchanged_count: row.get(11)?,
+        conflict_count: row.get(12)?,
+        invalid_count: row.get(13)?,
+        skipped_count: row.get(14)?,
+        summary: serde_json::from_str(&summary).unwrap_or_default(),
+        created_at: row.get(16)?,
+        completed_at: row.get(17)?,
+    })
+}
+
+/// Read one import run by id.
+#[allow(dead_code)]
+fn read_import_run(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<ImportRunRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source, spreadsheet_id, sheet_name, triggered_by, dry_run, status, preview_hash,
+                seen_count, created_count, updated_count, unchanged_count, conflict_count, invalid_count, skipped_count,
+                summary, created_at, completed_at
+         FROM import_runs WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![id], import_run_from_row)?;
+    match rows.next() {
+        Some(Ok(rec)) => Ok(Some(rec)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Insert an `import_conflicts` row on a connection; returns its row id.
+#[allow(dead_code)]
+fn insert_import_conflict_on(
+    conn: &Connection,
+    input: &ImportConflictInput,
+    now: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO import_conflicts (
+            import_run_id, source, external_job_key, conflict_type,
+            reason, details, status, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)",
+        params![
+            input.import_run_id,
+            input.source,
+            input.external_job_key,
+            import_conflict_type_to_str(&input.conflict_type),
+            input.reason,
+            input.details.to_string(),
+            now,
+        ],
+    )
+    .context("inserting import conflict")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Map an `import_conflicts` row to a typed record.
+fn import_conflict_from_row(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<ImportConflictRecord> {
+    let conflict_type: String = row.get(4)?;
+    let details: String = row.get(6)?;
+    let status: String = row.get(7)?;
+    Ok(ImportConflictRecord {
+        id: row.get(0)?,
+        import_run_id: row.get(1)?,
+        source: row.get(2)?,
+        external_job_key: row.get(3)?,
+        conflict_type: import_conflict_type_from_str(&conflict_type),
+        reason: row.get(5)?,
+        details: serde_json::from_str(&details).unwrap_or_default(),
+        status: import_conflict_status_from_str(&status),
+        created_at: row.get(8)?,
+        resolved_at: row.get(9)?,
+    })
+}
+
+/// Read one import conflict by id.
+#[allow(dead_code)]
+fn read_import_conflict(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<ImportConflictRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {IMPORT_CONFLICT_COLUMNS} FROM import_conflicts WHERE id = ?1"
+    ))?;
+    let mut rows = stmt.query_map(params![id], import_conflict_from_row)?;
+    match rows.next() {
+        Some(Ok(rec)) => Ok(Some(rec)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+// ── Imported job CRUD ────────────────────────────────────────
+
+#[allow(dead_code)] // entry points are wired by slice 3 tools
+impl Store {
+    /// Upsert one imported job keyed by `(source, external_job_key)`.
+    ///
+    /// New keys get a fresh stable `entity_id`; existing keys keep their
+    /// `entity_id` and `first_seen_at` while every mapped source field is
+    /// refreshed.
+    pub fn upsert_imported_job(
+        &self,
+        input: &ImportedJobInput,
+    ) -> Result<ImportedJobRecord> {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        upsert_imported_job_on(&conn, input, &now)?;
+        match read_imported_job(&conn, &input.source, &input.external_job_key)?
+        {
+            Some(rec) => Ok(rec),
+            None => anyhow::bail!("imported job disappeared after upsert"),
+        }
+    }
+
+    /// Get one imported job by `(source, external_job_key)`.
+    pub fn get_imported_job(
+        &self,
+        source: &str,
+        external_job_key: &str,
+    ) -> Result<Option<ImportedJobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        read_imported_job(&conn, source, external_job_key)
+    }
+
+    /// Get one imported job by its stable local UUID.
+    pub fn get_imported_job_by_entity_id(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<ImportedJobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {IMPORTED_JOB_COLUMNS} FROM imported_jobs WHERE entity_id = ?1"
+        ))?;
+        let mut rows =
+            stmt.query_map(params![entity_id], imported_job_from_row)?;
+        match rows.next() {
+            Some(Ok(rec)) => Ok(Some(rec)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// List all imported jobs for a source, ordered by title.
+    pub fn list_imported_jobs(
+        &self,
+        source: &str,
+    ) -> Result<Vec<ImportedJobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {IMPORTED_JOB_COLUMNS} FROM imported_jobs WHERE source = ?1 ORDER BY title"
+        ))?;
+        let rows = stmt.query_map(params![source], imported_job_from_row)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// List imported jobs for a source filtered by local status.
+    pub fn list_imported_jobs_by_status(
+        &self,
+        source: &str,
+        status: ImportedJobStatus,
+    ) -> Result<Vec<ImportedJobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {IMPORTED_JOB_COLUMNS} FROM imported_jobs WHERE source = ?1 AND local_status = ?2 ORDER BY title"
+        ))?;
+        let rows = stmt.query_map(
+            params![source, imported_job_status_to_str(&status)],
+            imported_job_from_row,
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Mark an imported job completed from the source (`Done = TRUE`).
+    ///
+    /// Sets `source_done = 1` and `local_status = 'completed'`. Returns `None`
+    /// when no such job exists.
+    pub fn mark_imported_job_completed(
+        &self,
+        source: &str,
+        external_job_key: &str,
+        import_run_id: Option<&str>,
+    ) -> Result<Option<ImportedJobRecord>> {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE imported_jobs
+                 SET source_done = 1, local_status = 'completed',
+                     last_seen_at = ?3, last_import_run_id = ?4, updated_at = ?3
+                 WHERE source = ?1 AND external_job_key = ?2",
+                params![source, external_job_key, now, import_run_id],
+            )
+            .context("marking imported job completed")?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        read_imported_job(&conn, source, external_job_key)
+    }
+
+    /// Mark an imported job ignored locally.
+    pub fn mark_imported_job_ignored(
+        &self,
+        source: &str,
+        external_job_key: &str,
+    ) -> Result<Option<ImportedJobRecord>> {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE imported_jobs
+                 SET local_status = 'ignored', updated_at = ?3
+                 WHERE source = ?1 AND external_job_key = ?2",
+                params![source, external_job_key, now],
+            )
+            .context("marking imported job ignored")?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        read_imported_job(&conn, source, external_job_key)
+    }
+}
+
+// ── Import runs and conflicts ───────────────────────────────
+
+#[allow(dead_code)] // entry points are wired by slice 3 tools
+impl Store {
+    /// Insert an import run record (preview or apply bookkeeping).
+    pub fn create_import_run(
+        &self,
+        input: &ImportRunInput,
+    ) -> Result<ImportRunRecord> {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        insert_import_run_on(&conn, input, &now)?;
+        match read_import_run(&conn, &input.id)? {
+            Some(rec) => Ok(rec),
+            None => anyhow::bail!("import run disappeared after insert"),
+        }
+    }
+
+    /// Get one import run by id.
+    pub fn get_import_run(&self, id: &str) -> Result<Option<ImportRunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        read_import_run(&conn, id)
+    }
+
+    /// List recent import runs for a source, newest first.
+    pub fn list_import_runs(
+        &self,
+        source: &str,
+        limit: i64,
+    ) -> Result<Vec<ImportRunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, spreadsheet_id, sheet_name, triggered_by, dry_run, status, preview_hash,
+                    seen_count, created_count, updated_count, unchanged_count, conflict_count, invalid_count, skipped_count,
+                    summary, created_at, completed_at
+             FROM import_runs WHERE source = ?1 ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let rows =
+            stmt.query_map(params![source, limit], import_run_from_row)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Insert an open import conflict for operator review.
+    pub fn insert_import_conflict(
+        &self,
+        input: &ImportConflictInput,
+    ) -> Result<ImportConflictRecord> {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        let id = insert_import_conflict_on(&conn, input, &now)?;
+        match read_import_conflict(&conn, id)? {
+            Some(rec) => Ok(rec),
+            None => anyhow::bail!("import conflict disappeared after insert"),
+        }
+    }
+
+    /// List import conflicts for a source filtered by review status.
+    pub fn list_import_conflicts(
+        &self,
+        source: &str,
+        status: ImportConflictStatus,
+    ) -> Result<Vec<ImportConflictRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {IMPORT_CONFLICT_COLUMNS} FROM import_conflicts WHERE source = ?1 AND status = ?2 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(
+            params![source, import_conflict_status_to_str(&status)],
+            import_conflict_from_row,
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Resolve an open import conflict. Returns `None` if it is not open.
+    pub fn resolve_import_conflict(
+        &self,
+        id: i64,
+    ) -> Result<Option<ImportConflictRecord>> {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE import_conflicts
+                 SET status = 'resolved', resolved_at = ?2
+                 WHERE id = ?1 AND status = 'open'",
+                params![id, now],
+            )
+            .context("resolving import conflict")?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        read_import_conflict(&conn, id)
+    }
+
+    /// Atomically apply an import in one SQLite transaction.
+    ///
+    /// Inserts the `import_runs` row, upserts `creates`/`updates`, marks each
+    /// key in `complete_keys` completed from the source, records conflicts,
+    /// and commits — or rolls everything back on any error.
+    pub fn apply_import(
+        &self,
+        run: &ImportRunInput,
+        creates: &[ImportedJobInput],
+        updates: &[ImportedJobInput],
+        complete_keys: &[String],
+        conflict_inputs: &[ImportConflictInput],
+    ) -> Result<ImportRunRecord> {
+        let now = Self::now();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().context("beginning import transaction")?;
+
+        insert_import_run_on(&tx, run, &now).context("inserting import run")?;
+        for input in creates {
+            upsert_imported_job_on(&tx, input, &now).with_context(|| {
+                format!("applying create for '{}'", input.external_job_key)
+            })?;
+        }
+        for input in updates {
+            upsert_imported_job_on(&tx, input, &now).with_context(|| {
+                format!("applying update for '{}'", input.external_job_key)
+            })?;
+        }
+        for key in complete_keys {
+            let changed = tx
+                .execute(
+                    "UPDATE imported_jobs
+                     SET source_done = 1, local_status = 'completed',
+                         last_seen_at = ?3, last_import_run_id = ?4, updated_at = ?3
+                     WHERE source = ?1 AND external_job_key = ?2",
+                    params![run.source, key, now, run.id],
+                )
+                .with_context(|| format!("marking imported job completed for '{key}'"))?;
+            if changed == 0 {
+                anyhow::bail!("cannot complete missing imported job: {key}");
+            }
+        }
+        for input in conflict_inputs {
+            insert_import_conflict_on(&tx, input, &now).with_context(|| {
+                format!("recording conflict for '{}'", input.external_job_key)
+            })?;
+        }
+
+        let record = read_import_run(&tx, &run.id)?
+            .context("import run disappeared during apply")?;
+        tx.commit().context("committing import transaction")?;
+        Ok(record)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2323,5 +2993,374 @@ mod tests {
         assert_eq!(batch.target_site_id, Some(site.id));
         let fetched = store.get_batch(&batch.entity_id).expect("get");
         assert_eq!(fetched.unwrap().target_site_id, Some(site.id));
+    }
+
+    // ── Imported Google Sheets job tests ──
+
+    fn job_input(
+        key: &str,
+        title: &str,
+        location: &str,
+        row_hash: &str,
+    ) -> ImportedJobInput {
+        ImportedJobInput {
+            source: "google_sheets".into(),
+            spreadsheet_id: "spreadsheet-1".into(),
+            sheet_name: "US".into(),
+            external_job_key: key.into(),
+            title: title.into(),
+            location: location.into(),
+            activity_type: "Boris Job".into(),
+            start_date: Some("2026-08-05".into()),
+            end_date: None,
+            job_leader: "Alice".into(),
+            team_member: "".into(),
+            robots: "R1".into(),
+            additional_info: "".into(),
+            source_done: false,
+            local_status: ImportedJobStatus::Active,
+            row_hash: row_hash.into(),
+            source_payload: serde_json::json!({"title": title}),
+            import_run_id: None,
+        }
+    }
+
+    #[test]
+    fn test_upsert_imported_job_creates_and_gets() {
+        let store = create_store();
+        let created = store
+            .upsert_imported_job(&job_input(
+                "Site A",
+                "Site A",
+                "100 Bay St",
+                "h1",
+            ))
+            .expect("upsert create");
+        assert!(created.id > 0);
+        assert!(!created.entity_id.is_empty());
+        assert_eq!(created.external_job_key, "Site A");
+        assert_eq!(created.local_status, ImportedJobStatus::Active);
+        assert_eq!(created.start_date.as_deref(), Some("2026-08-05"));
+
+        let fetched = store
+            .get_imported_job("google_sheets", "Site A")
+            .expect("get")
+            .expect("job exists");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.entity_id, created.entity_id);
+
+        let missing = store
+            .get_imported_job("google_sheets", "Nope")
+            .expect("get missing");
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_upsert_imported_job_updates_preserve_entity_id() {
+        let store = create_store();
+        let first = store
+            .upsert_imported_job(&job_input(
+                "Site A",
+                "Site A",
+                "100 Bay St",
+                "h1",
+            ))
+            .expect("first upsert");
+        let second = store
+            .upsert_imported_job(&job_input(
+                "Site A",
+                "Site A (renamed)",
+                "200 New Rd",
+                "h2",
+            ))
+            .expect("second upsert");
+        // Same stable identity, refreshed mapped fields.
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.entity_id, first.entity_id);
+        assert_eq!(second.title, "Site A (renamed)");
+        assert_eq!(second.location, "200 New Rd");
+        assert_eq!(second.row_hash, "h2");
+        assert_eq!(second.local_status, ImportedJobStatus::Active);
+        // first_seen_at is preserved on update.
+        assert_eq!(second.first_seen_at, first.first_seen_at);
+    }
+
+    #[test]
+    fn test_list_imported_jobs_and_by_status() {
+        let store = create_store();
+        store
+            .upsert_imported_job(&job_input("A", "A", "loc", "h1"))
+            .unwrap();
+        store
+            .upsert_imported_job(&job_input("B", "B", "loc", "h2"))
+            .unwrap();
+        store
+            .mark_imported_job_completed("google_sheets", "B", None)
+            .unwrap();
+
+        let all = store.list_imported_jobs("google_sheets").unwrap();
+        assert_eq!(all.len(), 2);
+
+        let active = store
+            .list_imported_jobs_by_status(
+                "google_sheets",
+                ImportedJobStatus::Active,
+            )
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].external_job_key, "A");
+
+        let completed = store
+            .list_imported_jobs_by_status(
+                "google_sheets",
+                ImportedJobStatus::Completed,
+            )
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].external_job_key, "B");
+    }
+
+    #[test]
+    fn test_mark_imported_job_completed_and_ignored() {
+        let store = create_store();
+        store
+            .upsert_imported_job(&job_input("Site A", "Site A", "loc", "h1"))
+            .unwrap();
+
+        let completed = store
+            .mark_imported_job_completed(
+                "google_sheets",
+                "Site A",
+                Some("run-1"),
+            )
+            .expect("complete")
+            .expect("job exists");
+        assert!(completed.source_done);
+        assert_eq!(completed.local_status, ImportedJobStatus::Completed);
+        assert_eq!(completed.last_import_run_id.as_deref(), Some("run-1"));
+
+        // Job still exists after completion (no deletion).
+        let still_there =
+            store.get_imported_job("google_sheets", "Site A").unwrap();
+        assert!(still_there.is_some());
+
+        let ignored = store
+            .mark_imported_job_ignored("google_sheets", "Site A")
+            .expect("ignore")
+            .expect("job exists");
+        assert_eq!(ignored.local_status, ImportedJobStatus::Ignored);
+
+        // Missing keys return None.
+        assert!(
+            store
+                .mark_imported_job_completed("google_sheets", "Nope", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_imported_job_never_deleted_when_missing() {
+        let store = create_store();
+        store
+            .upsert_imported_job(&job_input("Gone", "Gone", "loc", "h1"))
+            .unwrap();
+        // A later read simply has no create/update/complete for the job; the
+        // store must not delete it. There is no delete API, so list must still
+        // contain it after any import bookkeeping.
+        let all = store.list_imported_jobs("google_sheets").unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].external_job_key, "Gone");
+    }
+
+    // ── Import run tests ──
+
+    fn run_input(
+        id: &str,
+        dry_run: bool,
+        status: ImportRunStatus,
+    ) -> ImportRunInput {
+        ImportRunInput {
+            id: id.into(),
+            source: "google_sheets".into(),
+            spreadsheet_id: "spreadsheet-1".into(),
+            sheet_name: "US".into(),
+            triggered_by: "manual".into(),
+            dry_run,
+            status,
+            preview_hash: "hash-123".into(),
+            seen_count: 5,
+            created_count: 1,
+            updated_count: 1,
+            unchanged_count: 2,
+            conflict_count: 1,
+            invalid_count: 0,
+            skipped_count: 0,
+            summary: serde_json::json!({"creates": 1}),
+        }
+    }
+
+    #[test]
+    fn test_create_and_read_import_run() {
+        let store = create_store();
+        let rec = store
+            .create_import_run(&run_input(
+                "run-1",
+                true,
+                ImportRunStatus::Previewed,
+            ))
+            .expect("create run");
+        assert_eq!(rec.id, "run-1");
+        assert!(rec.dry_run);
+        assert_eq!(rec.status, ImportRunStatus::Previewed);
+        assert_eq!(rec.created_count, 1);
+        assert_eq!(rec.summary["creates"], 1);
+
+        let fetched =
+            store.get_import_run("run-1").unwrap().expect("run exists");
+        assert_eq!(fetched.id, "run-1");
+
+        assert!(store.get_import_run("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_list_import_runs_newest_first() {
+        let store = create_store();
+        store
+            .create_import_run(&run_input(
+                "run-1",
+                false,
+                ImportRunStatus::Applied,
+            ))
+            .unwrap();
+        store
+            .create_import_run(&run_input(
+                "run-2",
+                false,
+                ImportRunStatus::Applied,
+            ))
+            .unwrap();
+        let runs = store.list_import_runs("google_sheets", 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, "run-2");
+        assert_eq!(runs[1].id, "run-1");
+
+        let limited = store.list_import_runs("google_sheets", 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "run-2");
+    }
+
+    // ── Import conflict tests ──
+
+    #[test]
+    fn test_insert_list_and_resolve_import_conflict() {
+        let store = create_store();
+        let conflict = store
+            .insert_import_conflict(&ImportConflictInput {
+                import_run_id: Some("run-1".into()),
+                source: "google_sheets".into(),
+                external_job_key: "Shared title".into(),
+                conflict_type: ImportConflictType::DuplicateTitle,
+                reason: "Two rows share this title".into(),
+                details: serde_json::json!({"row_numbers": [1, 2]}),
+            })
+            .expect("insert conflict");
+        assert_eq!(conflict.status, ImportConflictStatus::Open);
+        assert_eq!(conflict.details["row_numbers"][0], 1);
+
+        let open = store
+            .list_import_conflicts("google_sheets", ImportConflictStatus::Open)
+            .unwrap();
+        assert_eq!(open.len(), 1);
+
+        let resolved = store
+            .resolve_import_conflict(conflict.id)
+            .expect("resolve")
+            .expect("conflict exists");
+        assert_eq!(resolved.status, ImportConflictStatus::Resolved);
+        assert!(resolved.resolved_at.is_some());
+
+        let open_after = store
+            .list_import_conflicts("google_sheets", ImportConflictStatus::Open)
+            .unwrap();
+        assert!(open_after.is_empty());
+
+        // Resolving again is a no-op (already resolved).
+        assert!(
+            store
+                .resolve_import_conflict(conflict.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ── Atomic apply tests ──
+
+    #[test]
+    fn test_apply_import_atomic() {
+        let store = create_store();
+        let run = run_input("run-apply", false, ImportRunStatus::Applied);
+        let creates = vec![job_input("New A", "New A", "loc1", "ha")];
+        let updates = vec![job_input("Existing", "Existing v2", "loc2", "hb")];
+        let complete_keys = vec!["Done job".to_string()];
+        let conflicts = vec![ImportConflictInput {
+            import_run_id: Some("run-apply".into()),
+            source: "google_sheets".into(),
+            external_job_key: "Shared".into(),
+            conflict_type: ImportConflictType::DuplicateTitle,
+            reason: "dup".into(),
+            details: serde_json::json!({"row_numbers": [1, 2]}),
+        }];
+
+        // Seed one existing job and one job to be completed.
+        store
+            .upsert_imported_job(&job_input(
+                "Existing",
+                "Existing v1",
+                "loc",
+                "h0",
+            ))
+            .unwrap();
+        store
+            .upsert_imported_job(&job_input(
+                "Done job", "Done job", "loc", "h0",
+            ))
+            .unwrap();
+
+        let record = store
+            .apply_import(&run, &creates, &updates, &complete_keys, &conflicts)
+            .expect("apply import");
+        assert_eq!(record.id, "run-apply");
+        assert_eq!(record.status, ImportRunStatus::Applied);
+        assert!(!record.dry_run);
+
+        // New job created.
+        let new_job = store
+            .get_imported_job("google_sheets", "New A")
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_job.title, "New A");
+        // Existing job updated, identity preserved.
+        let updated_job = store
+            .get_imported_job("google_sheets", "Existing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_job.title, "Existing v2");
+        // Done job completed from source.
+        let done_job = store
+            .get_imported_job("google_sheets", "Done job")
+            .unwrap()
+            .unwrap();
+        assert!(done_job.source_done);
+        assert_eq!(done_job.local_status, ImportedJobStatus::Completed);
+        assert_eq!(done_job.last_import_run_id.as_deref(), Some("run-apply"));
+        // Conflicts recorded.
+        let open = store
+            .list_import_conflicts("google_sheets", ImportConflictStatus::Open)
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].external_job_key, "Shared");
+        // Run persisted.
+        assert!(store.get_import_run("run-apply").unwrap().is_some());
     }
 }

@@ -98,7 +98,6 @@ impl PmService {
     }
 
     /// Access the underlying store for read-only queries.
-    #[allow(dead_code)]
     pub fn store(&self) -> &Store {
         &self.store
     }

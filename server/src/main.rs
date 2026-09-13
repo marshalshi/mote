@@ -1223,7 +1223,8 @@ fn build_augmented_tools(
 
     // PM-specific tools — only for the pm agent
     if agent_name == "pm" {
-        augmented.extend(pm::pm_tools(pm_ctx.clone()));
+        augmented
+            .extend(pm::pm_tools(pm_ctx.clone(), config.google_sheets.clone()));
     }
 
     Arc::new(augmented)
@@ -2945,7 +2946,7 @@ base_url = "http://localhost:11434"
     #[test]
     fn test_pm_tool_names_are_registered() {
         let ctx = open_pm_ctx();
-        let tools = pm::pm_tools(ctx);
+        let tools = pm::pm_tools(ctx, config::GoogleSheetsConfig::default());
         assert_eq!(tools.len(), pm::PM_TOOL_NAMES.len());
         for (tool, expected_name) in tools.iter().zip(pm::PM_TOOL_NAMES.iter())
         {
@@ -2956,7 +2957,7 @@ base_url = "http://localhost:11434"
     #[test]
     fn test_pm_tool_names_all_have_schemas() {
         let ctx = open_pm_ctx();
-        for tool in pm::pm_tools(ctx) {
+        for tool in pm::pm_tools(ctx, config::GoogleSheetsConfig::default()) {
             let def = tool.def();
             assert_eq!(def.def_type, "function");
             assert!(!def.function.description.is_empty());

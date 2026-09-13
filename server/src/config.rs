@@ -56,6 +56,10 @@ pub struct Config {
     /// Audio transcription configuration.
     #[serde(default)]
     pub audio: AudioConfig,
+
+    /// Optional Google Sheets sync configuration (defaults to disabled).
+    #[serde(default)]
+    pub google_sheets: GoogleSheetsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,6 +175,50 @@ impl Default for AudioConfig {
             sample_rate: default_audio_sample_rate(),
             channels: default_audio_channels(),
             realtime_url: default_audio_realtime_url(),
+        }
+    }
+}
+
+/// Optional Google Sheets sync configuration.
+///
+/// Slice 1: read-only service-account access to a spreadsheet tab plus the
+/// eligibility/filter rules applied during normalization. When `enabled` is
+/// false (the default), no sync runs and no credentials are loaded.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GoogleSheetsConfig {
+    /// Master switch. Default: false (sync disabled).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Spreadsheet ID from the Google Sheets URL. Required when enabled.
+    #[serde(default)]
+    pub spreadsheet_id: Option<String>,
+    /// Tab name to read. Default: "US".
+    #[serde(default = "default_google_sheets_sheet_name")]
+    pub sheet_name: String,
+    /// Path to the service-account JSON credential file. Required when enabled.
+    #[serde(default)]
+    pub credentials_path: Option<PathBuf>,
+    /// Exact activity types eligible for import. Default: ["Boris Job", "Demo"].
+    #[serde(default = "default_eligible_activity_types")]
+    pub eligible_activity_types: Vec<String>,
+}
+
+fn default_google_sheets_sheet_name() -> String {
+    "US".into()
+}
+
+fn default_eligible_activity_types() -> Vec<String> {
+    vec!["Boris Job".into(), "Demo".into()]
+}
+
+impl Default for GoogleSheetsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            spreadsheet_id: None,
+            sheet_name: default_google_sheets_sheet_name(),
+            credentials_path: None,
+            eligible_activity_types: default_eligible_activity_types(),
         }
     }
 }
@@ -1635,6 +1683,85 @@ dir = "/tmp/mote-logs"
         )
         .unwrap();
         assert_eq!(config.logging.dir, PathBuf::from("/tmp/mote-logs"));
+    }
+
+    #[test]
+    fn test_google_sheets_config_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "x"
+[providers.ollama]
+base_url = "http://localhost:11434"
+"#,
+        )
+        .unwrap();
+        let gs = &config.google_sheets;
+        assert!(!gs.enabled, "google_sheets should be disabled by default");
+        assert!(gs.spreadsheet_id.is_none());
+        assert_eq!(gs.sheet_name, "US");
+        assert!(gs.credentials_path.is_none());
+        assert_eq!(
+            gs.eligible_activity_types,
+            vec!["Boris Job".to_string(), "Demo".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_google_sheets_config_parses_explicit() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "x"
+[providers.ollama]
+base_url = "http://localhost:11434"
+[google_sheets]
+enabled = true
+spreadsheet_id = "1lE3Mvs_mXsY-LskbCyE9Z3Y8de4_71pcJHB3YRQXJ4Y"
+sheet_name = "Master Jobs"
+credentials_path = "/tmp/service-account.json"
+eligible_activity_types = ["Boris Job", "Demo", "Installation"]
+"#,
+        )
+        .unwrap();
+        let gs = &config.google_sheets;
+        assert!(gs.enabled);
+        assert_eq!(
+            gs.spreadsheet_id.as_deref(),
+            Some("1lE3Mvs_mXsY-LskbCyE9Z3Y8de4_71pcJHB3YRQXJ4Y")
+        );
+        assert_eq!(gs.sheet_name, "Master Jobs");
+        assert_eq!(
+            gs.credentials_path.as_deref(),
+            Some(Path::new("/tmp/service-account.json"))
+        );
+        assert_eq!(
+            gs.eligible_activity_types,
+            vec![
+                "Boris Job".to_string(),
+                "Demo".to_string(),
+                "Installation".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_google_sheets_config_empty_section_uses_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+[model]
+provider = "test"
+model_id = "x"
+[providers.ollama]
+base_url = "http://localhost:11434"
+[google_sheets]
+"#,
+        )
+        .unwrap();
+        assert!(!config.google_sheets.enabled);
+        assert_eq!(config.google_sheets.sheet_name, "US");
     }
 
     // ── Role-based loop tests ──────────────────────────────────────────────

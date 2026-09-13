@@ -39,6 +39,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+# Google Sheets service-account sync (JWT bearer grant + read-only REST)
+# `rust_crypto` selects the pure-Rust RSA backend (no C toolchain needed);
+# `use_pem` (default) enables parsing PEM-encoded private keys.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# URL percent-encoding for Sheets API range paths (sheet names may contain spaces)
+url = "2"
+
 # SQLite (bundled for cross-platform compatibility)
 rusqlite = { version = "0.31", features = ["bundled"] }
 

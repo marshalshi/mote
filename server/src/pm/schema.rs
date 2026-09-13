@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 
 /// Current schema version. Bump when adding new migrations.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Bootstrap (or migrate) the PM database schema.
 ///
@@ -55,6 +55,7 @@ pub fn bootstrap(conn: &rusqlite::Connection) -> Result<()> {
 fn run_migration(conn: &rusqlite::Connection, version: i64) -> Result<()> {
     match version {
         1 => migration_001_initial(conn)?,
+        2 => migration_002_google_sheets_imports(conn)?,
         _ => anyhow::bail!("Unknown schema version: {}", version),
     }
     Ok(())
@@ -209,6 +210,97 @@ fn migration_001_initial(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration v2: title-keyed Google Sheets job imports.
+///
+/// Adds the manual preview/apply store for the Google Sheets sync:
+/// - `imported_jobs` — one row per exact `Title of Activity` (keyed per
+///   `source`), with all mapped source fields, done/local lifecycle state,
+///   a stable row hash for change detection, and source provenance.
+/// - `import_runs` — one row per preview or apply, with preview hash, status,
+///   and per-class counts.
+/// - `import_conflicts` — open/resolved conflicts surfaced for operator
+///   review (blank/duplicate titles, completed jobs reopening, ...).
+fn migration_002_google_sheets_imports(
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Imported Google Sheets jobs, keyed by exact title per source.
+        CREATE TABLE IF NOT EXISTS imported_jobs (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id           TEXT NOT NULL UNIQUE,
+            source              TEXT NOT NULL,
+            spreadsheet_id      TEXT NOT NULL DEFAULT '',
+            sheet_name          TEXT NOT NULL DEFAULT '',
+            external_job_key    TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            location            TEXT NOT NULL DEFAULT '',
+            activity_type       TEXT NOT NULL DEFAULT '',
+            start_date          TEXT,
+            end_date            TEXT,
+            job_leader          TEXT NOT NULL DEFAULT '',
+            team_member         TEXT NOT NULL DEFAULT '',
+            robots              TEXT NOT NULL DEFAULT '',
+            additional_info     TEXT NOT NULL DEFAULT '',
+            source_done         INTEGER NOT NULL DEFAULT 0,
+            local_status        TEXT NOT NULL DEFAULT 'active',
+            row_hash            TEXT NOT NULL DEFAULT '',
+            source_payload      TEXT NOT NULL DEFAULT '{}',
+            first_seen_at       TEXT NOT NULL,
+            last_seen_at        TEXT NOT NULL,
+            last_import_run_id  TEXT,
+            created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (source, external_job_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_imported_jobs_source_status ON imported_jobs(source, local_status);
+        CREATE INDEX IF NOT EXISTS idx_imported_jobs_source_key ON imported_jobs(source, external_job_key);
+
+        -- Google Sheets import runs (preview or apply bookkeeping).
+        CREATE TABLE IF NOT EXISTS import_runs (
+            id              TEXT PRIMARY KEY,
+            source          TEXT NOT NULL,
+            spreadsheet_id  TEXT NOT NULL DEFAULT '',
+            sheet_name      TEXT NOT NULL DEFAULT '',
+            triggered_by    TEXT NOT NULL DEFAULT 'manual',
+            dry_run         INTEGER NOT NULL DEFAULT 0,
+            status          TEXT NOT NULL DEFAULT 'previewed',
+            preview_hash    TEXT NOT NULL DEFAULT '',
+            seen_count      INTEGER NOT NULL DEFAULT 0,
+            created_count   INTEGER NOT NULL DEFAULT 0,
+            updated_count   INTEGER NOT NULL DEFAULT 0,
+            unchanged_count INTEGER NOT NULL DEFAULT 0,
+            conflict_count  INTEGER NOT NULL DEFAULT 0,
+            invalid_count   INTEGER NOT NULL DEFAULT 0,
+            skipped_count   INTEGER NOT NULL DEFAULT 0,
+            summary         TEXT NOT NULL DEFAULT '{}',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_runs_source ON import_runs(source);
+
+        -- Google Sheets import conflicts (operator review).
+        CREATE TABLE IF NOT EXISTS import_conflicts (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_run_id   TEXT,
+            source          TEXT NOT NULL,
+            external_job_key TEXT NOT NULL DEFAULT '',
+            conflict_type   TEXT NOT NULL DEFAULT '',
+            reason          TEXT NOT NULL DEFAULT '',
+            details         TEXT NOT NULL DEFAULT '{}',
+            status          TEXT NOT NULL DEFAULT 'open',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            resolved_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_conflicts_status ON import_conflicts(status);
+        CREATE INDEX IF NOT EXISTS idx_import_conflicts_source ON import_conflicts(source);
+        ",
+    )
+    .context("running google sheets imports migration")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +335,9 @@ mod tests {
             "procurement_orders",
             "alerts",
             "event_logs",
+            "imported_jobs",
+            "import_runs",
+            "import_conflicts",
         ] {
             assert!(
                 tables.contains(&table.to_string()),
@@ -277,5 +372,68 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_bootstrap_migrates_v1_to_v2() {
+        let conn = create_temp_db().expect("temp db");
+        // Simulate a v1 database: create the version table, apply only the
+        // initial migration, and record version 1 (as the old bootstrap
+        // would have done).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .expect("create schema_version");
+        run_migration(&conn, 1).expect("migration 1");
+        conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])
+            .expect("record v1");
+
+        let before: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, 1);
+
+        // A later bootstrap must run only the pending migration (v2).
+        bootstrap(&conn).expect("bootstrap upgrades v1 -> v2");
+
+        let after: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, SCHEMA_VERSION);
+
+        // v2 tables must exist with the expected unique constraint.
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('imported_jobs', 'import_runs', 'import_conflicts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 3);
+
+        // The title key uniqueness must be enforceable.
+        conn.execute(
+            "INSERT INTO imported_jobs (entity_id, source, external_job_key, title, first_seen_at, last_seen_at)
+             VALUES ('e1', 'google_sheets', 'Same title', 'Same title', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .expect("insert job");
+        let dup = conn.execute(
+            "INSERT INTO imported_jobs (entity_id, source, external_job_key, title, first_seen_at, last_seen_at)
+             VALUES ('e2', 'google_sheets', 'Same title', 'Same title', '2026-01-01', '2026-01-01')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (source, external_job_key) must fail"
+        );
     }
 }

@@ -15,7 +15,7 @@ use axum::{
 };
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, info};
+use tracing::{Instrument, debug, info};
 
 mod agent;
 mod audio;
@@ -688,6 +688,9 @@ async fn record_run_event(
     event: marshaling_protocol::ServerEvent,
 ) {
     let terminal = is_terminal_event(&event);
+    if let Some(status) = terminal_status(&event) {
+        tracing::info!(run_id, ?status, "agent run reached terminal state");
+    }
     let mut runs = state.runs.lock().await;
     let Some(run) = runs.get_mut(run_id) else {
         return;
@@ -1369,24 +1372,28 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     )
     .await;
 
-    tokio::spawn(async move {
-        agent::run_loop(
-            prov_spawn,
-            augmented_tools_spawn,
-            ctx.system_layers,
-            user_msg,
-            history,
-            opts,
-            agent_tx,
-            cancel_rx,
-            permission_rx,
-            perms,
-            max_steps,
-            workspace_display,
-            ctx.role_loop_config,
-        )
-        .await;
-    });
+    let agent_span = tracing::info_span!("agent_run", run_id = %run_id);
+    tokio::spawn(
+        async move {
+            agent::run_loop(
+                prov_spawn,
+                augmented_tools_spawn,
+                ctx.system_layers,
+                user_msg,
+                history,
+                opts,
+                agent_tx,
+                cancel_rx,
+                permission_rx,
+                perms,
+                max_steps,
+                workspace_display,
+                ctx.role_loop_config,
+            )
+            .await;
+        }
+        .instrument(agent_span),
+    );
 
     let state_for_events = Arc::clone(&state);
     let run_id_for_events = run_id.clone();
@@ -1531,6 +1538,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     .await;
                 }
                 Err(e) => {
+                    tracing::error!(
+                        run_id = %run_id_for_events,
+                        error_kind = "agent_stream_error",
+                        "agent run failed"
+                    );
                     record_run_event(
                         &state_for_events,
                         &run_id_for_events,

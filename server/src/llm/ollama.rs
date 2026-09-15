@@ -235,15 +235,15 @@ impl LlmProvider for OllamaProvider {
         let mut buf: Vec<u8> = Vec::new();
         let mut text_content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut usage = Usage::default();
-        let mut saw_done = false;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = sender
-                        .send(Err(anyhow::anyhow!("Stream read error: {}", e)));
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = sender.send(Err(anyhow::anyhow!(
+                        "Stream read error: {}",
+                        error
+                    )));
                     return;
                 }
             };
@@ -256,7 +256,12 @@ impl LlmProvider for OllamaProvider {
                         buf.drain(..1);
                         let line = match std::str::from_utf8(&line_bytes) {
                             Ok(s) => s.trim(),
-                            Err(_) => continue,
+                            Err(error) => {
+                                let _ = sender.send(Err(anyhow::anyhow!(
+                                    "Invalid UTF-8 in Ollama stream record: {error}"
+                                )));
+                                return;
+                            }
                         };
                         if line.is_empty() {
                             continue;
@@ -299,8 +304,7 @@ impl LlmProvider for OllamaProvider {
                                     }
                                 }
                                 if chunk.done {
-                                    saw_done = true;
-                                    usage = Usage {
+                                    let usage = Usage {
                                         prompt_tokens: chunk
                                             .prompt_eval_count
                                             .unwrap_or(0),
@@ -309,11 +313,22 @@ impl LlmProvider for OllamaProvider {
                                             .unwrap_or(0),
                                         total_tokens: 0,
                                     };
+                                    let result = finalize_ollama(
+                                        &mut text_content,
+                                        &mut tool_calls,
+                                        usage,
+                                    );
+                                    let _ = sender
+                                        .send(Ok(StreamEvent::Done(result)));
+                                    return;
                                 }
                             }
-                            Err(e) => tracing::warn!(
-                                "Failed to parse Ollama chunk: {e} | line: {line}"
-                            ),
+                            Err(error) => {
+                                let _ = sender.send(Err(anyhow::anyhow!(
+                                    "Failed to parse Ollama stream record: {error}"
+                                )));
+                                return;
+                            }
                         }
                     }
                     None => break,
@@ -321,20 +336,8 @@ impl LlmProvider for OllamaProvider {
             }
         }
 
-        if !saw_done {
-            let _ = sender.send(Err(anyhow::anyhow!(
-                "Ollama stream ended before done=true"
-            )));
-            return;
-        }
-
-        let result = finalize_ollama(&mut text_content, &mut tool_calls, usage);
-        tracing::debug!(
-            "Ollama stream result finalized: content_len={}, tool_calls={}",
-            result.content.as_ref().map_or(0, String::len),
-            result.tool_calls.len()
-        );
-        let _ = sender.send(Ok(StreamEvent::Done(result)));
+        let _ = sender
+            .send(Err(anyhow::anyhow!("Ollama stream ended before done=true")));
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {

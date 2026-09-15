@@ -11,6 +11,7 @@ pub use marshaling_protocol::{FileChange, ToolCallDisplay, ToolStatus};
 
 /// Default max steps if not configured.
 pub const DEFAULT_MAX_STEPS: usize = 30;
+const MAX_STREAM_RETRIES: usize = 5;
 
 /// A fully resolved role ready for use in the agent loop.
 /// Owns all data needed to switch the active role per turn.
@@ -97,6 +98,87 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+fn role_brief(instructions: &str) -> String {
+    let Some(line) = instructions.lines().find(|line| !line.trim().is_empty())
+    else {
+        return "(no description)".to_string();
+    };
+    let trimmed = line.trim();
+    if trimmed.chars().count() > 80 {
+        format!("{}…", trimmed.chars().take(77).collect::<String>())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_retryable_stream_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "rate limit",
+        "too many requests",
+        "overloaded",
+        "service unavailable",
+        "connection refused",
+        "connection reset",
+        "connection lost",
+        "connection closed",
+        "socket hang up",
+        "timed out",
+        "timeout",
+        "network error",
+        "stream read error",
+        "stream ended before completion marker",
+        "stream ended before done=true",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+}
+
+fn stream_retry_delay(retry: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(1_u64 << retry.saturating_sub(1).min(4))
+}
+
+fn reap_stream_task(
+    mut stream_handle: tokio::task::JoinHandle<()>,
+    abort: bool,
+) {
+    if abort {
+        stream_handle.abort();
+    }
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            &mut stream_handle,
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Err(error)) => {
+                tracing::warn!("agent stream task ended unexpectedly: {error}");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "agent stream task did not stop within five seconds; aborting it"
+                );
+                stream_handle.abort();
+                if let Err(error) = stream_handle.await {
+                    if !error.is_cancelled() {
+                        tracing::warn!(
+                            "agent stream task ended unexpectedly after abort: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn advertised_tool_defs(
@@ -355,19 +437,7 @@ pub async fn run_loop(
             let mut roster = String::from("Available roles in this agent:\n");
             for role in &rc.roles {
                 // Brief description: first non-empty line of instructions (up to 80 chars)
-                let brief = role
-                    .instructions
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .map(|l| {
-                        let trimmed = l.trim();
-                        if trimmed.len() > 80 {
-                            format!("{}…", &trimmed[..77])
-                        } else {
-                            trimmed.to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "(no description)".to_string());
+                let brief = role_brief(&role.instructions);
                 roster.push_str(&format!("  {} — {}\n", role.name, brief));
             }
             roster
@@ -431,9 +501,8 @@ pub async fn run_loop(
         } else {
             tool_defs
         };
-
-        // Create channel for stream events
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let model_id = opts.model_id.clone();
+        let max_tokens = opts.max_tokens;
 
         // Clone the Arc for the spawned task
         let prov = if let Some(ref rc) = role_config {
@@ -441,20 +510,44 @@ pub async fn run_loop(
         } else {
             Arc::clone(&provider)
         };
-        let stream_handle = tokio::spawn(async move {
-            prov.chat_stream(&messages, &opts, stream_tx).await;
-        });
-
         // Process stream events
         let mut text_buf = String::new();
-        let mut result: Option<ChatResult> = None;
+        let mut emitted_stream_data = false;
+        let mut retries = 0;
+        let result = 'stream_attempt: loop {
+            // Each retry gets a fresh channel and task. Retrying only before any
+            // streamed output avoids duplicating visible assistant text.
+            let (stream_tx, mut stream_rx) =
+                tokio::sync::mpsc::unbounded_channel();
+            let provider = Arc::clone(&prov);
+            let attempt_messages = messages.clone();
+            let attempt_opts = opts.clone();
+            let stream_handle = tokio::spawn(async move {
+                provider
+                    .chat_stream(&attempt_messages, &attempt_opts, stream_tx)
+                    .await;
+            });
 
-        loop {
-            let event = tokio::select! {
-                event = stream_rx.recv() => event,
-                changed = cancel_rx.changed() => {
-                    if changed.is_ok() && *cancel_rx.borrow() {
-                        stream_handle.abort();
+            loop {
+                let event = tokio::select! {
+                    event = stream_rx.recv() => event,
+                    changed = cancel_rx.changed() => {
+                        if changed.is_ok() && *cancel_rx.borrow() {
+                            reap_stream_task(stream_handle, true);
+                            let _ = events_tx.send(Ok(AgentEvent::Cancelled {
+                                content: "(cancelled)".into(),
+                                tokens_input: total_input,
+                                tokens_output: total_output,
+                                history,
+                            }));
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                let Some(event) = event else {
+                    reap_stream_task(stream_handle, false);
+                    if *cancel_rx.borrow() {
                         let _ = events_tx.send(Ok(AgentEvent::Cancelled {
                             content: "(cancelled)".into(),
                             tokens_input: total_input,
@@ -463,48 +556,89 @@ pub async fn run_loop(
                         }));
                         return;
                     }
-                    continue;
-                }
-            };
-            let Some(event) = event else {
-                break;
-            };
-            match event {
-                Ok(StreamEvent::Chunk(text)) => {
-                    text_buf.push_str(&text);
-                    let _ = events_tx.send(Ok(AgentEvent::TextDelta(text)));
-                }
-                Ok(StreamEvent::ReasoningChunk(text)) => {
-                    let _ =
-                        events_tx.send(Ok(AgentEvent::ReasoningDelta(text)));
-                }
-                Ok(StreamEvent::Done(r)) => {
-                    result = Some(r);
-                    break;
-                }
-                Err(e) => {
-                    let _ = events_tx.send(Err(e));
+                    tracing::warn!(
+                        step,
+                        streamed_chars = text_buf.len(),
+                        "agent stream closed without a completion result"
+                    );
+                    let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
+                        content: text_buf,
+                        tokens_input: total_input,
+                        tokens_output: total_output,
+                        history,
+                    }));
                     return;
+                };
+                match event {
+                    Ok(StreamEvent::Chunk(text)) => {
+                        emitted_stream_data = true;
+                        text_buf.push_str(&text);
+                        let _ = events_tx.send(Ok(AgentEvent::TextDelta(text)));
+                    }
+                    Ok(StreamEvent::ReasoningChunk(text)) => {
+                        emitted_stream_data = true;
+                        let _ = events_tx
+                            .send(Ok(AgentEvent::ReasoningDelta(text)));
+                    }
+                    Ok(StreamEvent::Done(result)) => {
+                        reap_stream_task(stream_handle, true);
+                        break 'stream_attempt result;
+                    }
+                    Err(error)
+                        if !emitted_stream_data
+                            && is_retryable_stream_error(&error)
+                            && retries < MAX_STREAM_RETRIES =>
+                    {
+                        reap_stream_task(stream_handle, true);
+                        retries += 1;
+                        let delay = stream_retry_delay(retries);
+                        tracing::warn!(
+                            step,
+                            retry = retries,
+                            max_retries = MAX_STREAM_RETRIES,
+                            retry_delay_ms = delay.as_millis(),
+                            "retrying transient agent stream failure before output"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            changed = cancel_rx.changed() => {
+                                if changed.is_ok() && *cancel_rx.borrow() {
+                                    let _ = events_tx.send(Ok(AgentEvent::Cancelled {
+                                        content: "(cancelled)".into(),
+                                        tokens_input: total_input,
+                                        tokens_output: total_output,
+                                        history,
+                                    }));
+                                    return;
+                                }
+                            }
+                        }
+                        continue 'stream_attempt;
+                    }
+                    Err(error) => {
+                        reap_stream_task(stream_handle, true);
+                        let _ = events_tx.send(Err(error));
+                        return;
+                    }
                 }
-            }
-        }
-
-        let result = match result {
-            Some(r) => r,
-            None => {
-                let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
-                    content: text_buf,
-                    tokens_input: total_input,
-                    tokens_output: total_output,
-                    history,
-                }));
-                return;
             }
         };
 
         // Accumulate token usage
         total_input += result.usage.prompt_tokens;
         total_output += result.usage.completion_tokens;
+        tracing::debug!(
+            step,
+            model_id = %model_id,
+            max_tokens,
+            finish_reason = ?result.finish_reason,
+            tool_calls = result.tool_calls.len(),
+            prompt_tokens = result.usage.prompt_tokens,
+            completion_tokens = result.usage.completion_tokens,
+            total_input,
+            total_output,
+            "agent LLM turn completed"
+        );
 
         // Match OpenCode's stop semantics: only end the task when this
         // assistant turn is actually finished *and* there is no pending tool
@@ -515,6 +649,25 @@ pub async fn run_loop(
             let content = assistant_result_text(&result, &text_buf);
             history.push(ChatMessage::assistant_text(content.clone()));
             if turn_finished {
+                if result.finish_reason.as_deref() == Some("length") {
+                    tracing::warn!(
+                        step,
+                        model_id = %model_id,
+                        max_tokens,
+                        completion_tokens = result.usage.completion_tokens,
+                        total_output,
+                        "agent completed because the model reached its output token limit"
+                    );
+                } else {
+                    tracing::info!(
+                        step,
+                        model_id = %model_id,
+                        finish_reason = ?result.finish_reason,
+                        total_input,
+                        total_output,
+                        "agent completed"
+                    );
+                }
                 let _ = events_tx.send(Ok(AgentEvent::Done {
                     content,
                     tokens_input: total_input,
@@ -524,6 +677,13 @@ pub async fn run_loop(
                 return;
             }
             if final_text_only_step {
+                tracing::warn!(
+                    step,
+                    finish_reason = ?result.finish_reason,
+                    total_input,
+                    total_output,
+                    "agent reached its final text-only step without a terminal finish reason"
+                );
                 let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
                     content,
                     tokens_input: total_input,
@@ -542,6 +702,13 @@ pub async fn run_loop(
         if final_text_only_step {
             let content = assistant_result_text(&result, &text_buf);
             history.push(ChatMessage::assistant_text(content.clone()));
+            tracing::warn!(
+                step,
+                tool_calls = result.tool_calls.len(),
+                total_input,
+                total_output,
+                "agent requested tools during its final text-only step"
+            );
             let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
                 content: if content.is_empty() {
                     "(max steps reached)".into()
@@ -942,6 +1109,12 @@ pub async fn run_loop(
             finish_task_answer.filter(|_| !tool_batch_failed)
         {
             history.push(ChatMessage::assistant_text(final_answer.clone()));
+            tracing::info!(
+                step,
+                total_input,
+                total_output,
+                "agent completed via finish_task"
+            );
             let _ = events_tx.send(Ok(AgentEvent::Done {
                 content: final_answer,
                 tokens_input: total_input,
@@ -1314,6 +1487,48 @@ mod tests {
         responses: Arc<Mutex<std::collections::VecDeque<ChatResult>>>,
     }
 
+    struct RetryOnceProvider {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RetryOnceProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+        ) -> Result<ChatResult> {
+            unreachable!("run_loop uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+            sender: tokio::sync::mpsc::UnboundedSender<Result<StreamEvent>>,
+        ) {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                let _ = sender.send(Err(anyhow::anyhow!(
+                    "provider API error (503): temporarily unavailable"
+                )));
+                return;
+            }
+            let _ = sender.send(Ok(StreamEvent::Done(ChatResult {
+                content: Some("recovered".into()),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                finish_reason: Some("stop".into()),
+                reasoning_content: None,
+            })));
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
     #[async_trait]
     impl LlmProvider for ScriptedProvider {
         async fn chat(
@@ -1601,6 +1816,48 @@ mod tests {
         }
         assert_eq!(done_content.as_deref(), Some("all done"));
         assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_retries_transient_pre_output_stream_failure() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let provider: Arc<dyn LlmProvider> = Arc::new(RetryOnceProvider {
+            calls: Arc::clone(&calls),
+        });
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_loop(
+                provider,
+                Arc::new(Vec::new()),
+                Vec::new(),
+                "hi".into(),
+                Vec::new(),
+                ChatOptions::default(),
+                events_tx,
+                cancel_rx,
+                perm_rx,
+                std::collections::HashMap::new(),
+                2,
+                "/tmp".into(),
+                None,
+            ),
+        )
+        .await
+        .expect("retry should complete before the timeout");
+
+        let mut done_content = None;
+        while let Some(event) = events_rx.recv().await {
+            if let AgentEvent::Done { content, .. } = event.unwrap() {
+                done_content = Some(content);
+                break;
+            }
+        }
+        assert_eq!(done_content.as_deref(), Some("recovered"));
+        assert_eq!(*calls.lock().unwrap(), 2);
     }
 
     /// Even if a provider mislabels the finish reason as "stop", pending tool
@@ -2306,6 +2563,23 @@ mod tests {
         assert_eq!(safe_truncate(s, 5), "€"); // can't split mid-char, backs up to 3
         assert_eq!(safe_truncate(s, 3), "€");
         assert_eq!(safe_truncate(s, 2), ""); // can't fit even one '€'
+    }
+
+    #[test]
+    fn test_role_brief_truncates_multibyte_text_at_character_boundary() {
+        let instructions = "你".repeat(81);
+
+        let brief = role_brief(&instructions);
+
+        assert_eq!(brief, format!("{}…", "你".repeat(77)));
+        assert_eq!(brief.chars().count(), 78);
+    }
+
+    #[test]
+    fn test_role_brief_preserves_exactly_eighty_multibyte_characters() {
+        let instructions = "你".repeat(80);
+
+        assert_eq!(role_brief(&instructions), instructions);
     }
 
     #[test]

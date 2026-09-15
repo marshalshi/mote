@@ -271,14 +271,44 @@ fn request_item_count(body: &serde_json::Value, key: &str) -> usize {
 }
 
 fn find_event_separator(buf: &[u8]) -> Option<(usize, usize)> {
-    let lf = buf.windows(2).position(|w| w == b"\n\n");
-    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(l), Some(c)) if c < l => Some((c, 4)),
-        (Some(l), _) => Some((l, 2)),
-        (None, Some(c)) => Some((c, 4)),
-        (None, None) => None,
+    for index in 0..buf.len() {
+        let first_len = match buf[index] {
+            b'\n' => 1,
+            b'\r' if buf.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' => 1,
+            _ => continue,
+        };
+        let second = index + first_len;
+        let second_len = match buf.get(second) {
+            Some(b'\n' | b'\r') => {
+                if buf.get(second) == Some(&b'\r')
+                    && buf.get(second + 1) == Some(&b'\n')
+                {
+                    2
+                } else {
+                    1
+                }
+            }
+            _ => continue,
+        };
+        return Some((index, first_len + second_len));
     }
+    None
+}
+
+fn sse_event_data(event: &str) -> Option<String> {
+    let normalized = event
+        .strip_prefix('\u{feff}')
+        .unwrap_or(event)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let data = normalized
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!data.is_empty()).then_some(data)
 }
 
 fn finish_reason_signals_completion(reason: &str) -> bool {
@@ -443,10 +473,12 @@ impl LlmProvider for DeepSeekProvider {
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = sender
-                        .send(Err(anyhow::anyhow!("Stream read error: {}", e)));
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = sender.send(Err(anyhow::anyhow!(
+                        "Stream read error: {}",
+                        error
+                    )));
                     return;
                 }
             };
@@ -457,92 +489,83 @@ impl LlmProvider for DeepSeekProvider {
                 buf.drain(..sep_len);
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(error) => {
+                        let _ = sender.send(Err(anyhow::anyhow!(
+                            "Invalid UTF-8 in SSE event: {error}"
+                        )));
+                        return;
+                    }
                 };
 
-                for line in event_str.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        let data = data.trim();
-                        if data == "[DONE]" {
-                            let result = finalize(
-                                &mut text_content,
-                                &mut tool_call_acc,
-                                usage,
-                                finish_reason.take(),
-                                &mut reasoning_content,
-                            );
-                            let _ = sender.send(Ok(StreamEvent::Done(result)));
-                            return;
-                        }
-                        if let Ok(chunk) =
-                            serde_json::from_str::<StreamChunk>(data)
-                        {
-                            if let Some(choice) =
-                                chunk.choices.into_iter().next()
+                let Some(data) = sse_event_data(event_str) else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    let result = finalize(
+                        &mut text_content,
+                        &mut tool_call_acc,
+                        usage,
+                        finish_reason.take(),
+                        &mut reasoning_content,
+                    );
+                    let _ = sender.send(Ok(StreamEvent::Done(result)));
+                    return;
+                }
+                match serde_json::from_str::<StreamChunk>(data) {
+                    Ok(chunk) => {
+                        if let Some(choice) = chunk.choices.into_iter().next() {
+                            if let Some(text) = choice.delta.content {
+                                text_content.push_str(&text);
+                                let _ =
+                                    sender.send(Ok(StreamEvent::Chunk(text)));
+                            }
+                            if let Some(ref rc) = choice.delta.reasoning_content
                             {
-                                // Accumulate text content
-                                if let Some(text) = choice.delta.content {
-                                    text_content.push_str(&text);
-                                    let _ = sender
-                                        .send(Ok(StreamEvent::Chunk(text)));
-                                }
-                                // Accumulate reasoning content (DeepSeek r1/v4 flash thinking)
-                                if let Some(ref rc) =
-                                    choice.delta.reasoning_content
-                                {
-                                    reasoning_content
-                                        .get_or_insert(String::new())
-                                        .push_str(rc);
-                                    let _ = sender.send(Ok(
-                                        StreamEvent::ReasoningChunk(rc.clone()),
-                                    ));
-                                }
-                                // Accumulate tool call deltas
-                                if let Some(tcs) = choice.delta.tool_calls {
-                                    for tc in tcs {
-                                        let entry = tool_call_acc
-                                            .entry(tc.index)
-                                            .or_insert(PendingToolCall {
-                                                id: None,
-                                                name: None,
-                                                arguments: String::new(),
-                                            });
-                                        if let Some(id) = tc.id {
-                                            entry.id = Some(id);
-                                        }
-                                        if let Some(name) = tc
-                                            .function
-                                            .as_ref()
-                                            .and_then(|f| f.name.clone())
-                                        {
-                                            entry.name = Some(name);
-                                        }
-                                        if let Some(args) = tc
-                                            .function
-                                            .as_ref()
-                                            .and_then(|f| f.arguments.clone())
-                                        {
-                                            entry.arguments.push_str(&args);
-                                        }
+                                reasoning_content
+                                    .get_or_insert(String::new())
+                                    .push_str(rc);
+                                let _ = sender.send(Ok(
+                                    StreamEvent::ReasoningChunk(rc.clone()),
+                                ));
+                            }
+                            if let Some(tcs) = choice.delta.tool_calls {
+                                for tc in tcs {
+                                    let entry = tool_call_acc
+                                        .entry(tc.index)
+                                        .or_insert(PendingToolCall {
+                                            id: None,
+                                            name: None,
+                                            arguments: String::new(),
+                                        });
+                                    if let Some(id) = tc.id {
+                                        entry.id = Some(id);
+                                    }
+                                    if let Some(name) = tc
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.name.clone())
+                                    {
+                                        entry.name = Some(name);
+                                    }
+                                    if let Some(args) = tc
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.arguments.clone())
+                                    {
+                                        entry.arguments.push_str(&args);
                                     }
                                 }
-                                // Handle finish_reason
-                                if let Some(ref reason) = choice.finish_reason {
-                                    finish_reason = Some(reason.clone());
-                                    saw_completion |=
-                                        finish_reason_signals_completion(
-                                            reason,
-                                        );
-                                }
-                                if let Some(u) = choice.usage {
-                                    usage = Usage {
-                                        prompt_tokens: u.prompt_tokens,
-                                        completion_tokens: u.completion_tokens,
-                                        total_tokens: u.total_tokens,
-                                    };
-                                }
                             }
-                            if let Some(u) = chunk.usage {
+                            if let Some(ref reason) = choice.finish_reason {
+                                finish_reason = Some(reason.clone());
+                                saw_completion |=
+                                    finish_reason_signals_completion(reason);
+                            }
+                            if let Some(u) = choice.usage {
                                 usage = Usage {
                                     prompt_tokens: u.prompt_tokens,
                                     completion_tokens: u.completion_tokens,
@@ -550,6 +573,19 @@ impl LlmProvider for DeepSeekProvider {
                                 };
                             }
                         }
+                        if let Some(u) = chunk.usage {
+                            usage = Usage {
+                                prompt_tokens: u.prompt_tokens,
+                                completion_tokens: u.completion_tokens,
+                                total_tokens: u.total_tokens,
+                            };
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(anyhow::anyhow!(
+                            "Failed to parse SSE data event: {error}"
+                        )));
+                        return;
                     }
                 }
             }
@@ -797,6 +833,22 @@ mod tests {
             Some((9, 4))
         );
         assert_eq!(find_event_separator(b"data: one"), None);
+        assert_eq!(find_event_separator(b"data: one\r\rrest"), Some((9, 2)));
+        assert_eq!(find_event_separator(b"data: one\r\n\nrest"), Some((9, 3)));
+    }
+
+    #[test]
+    fn test_sse_event_data_supports_no_space_and_multiple_data_lines() {
+        assert_eq!(
+            sse_event_data("event: message\ndata:{\ndata:}\n"),
+            Some("{\n}".into())
+        );
+        assert_eq!(
+            sse_event_data("event: message\rdata: [DONE]\r"),
+            Some("[DONE]".into())
+        );
+        assert_eq!(sse_event_data("\u{feff}data: first"), Some("first".into()));
+        assert_eq!(sse_event_data("event: ping\n"), None);
     }
 
     #[test]

@@ -1755,7 +1755,31 @@ async fn forward_agent_event(
             }
             false
         }
-        Ok(agent::AgentEvent::Failed { error: e }) | Err(e) => {
+        Ok(agent::AgentEvent::Failed {
+            error,
+            tokens_input,
+            tokens_output,
+            history,
+        }) => {
+            // Keep the work done so far: a failure late in a long run must
+            // not lose every earlier turn.
+            save_ctx.save(history, tokens_input, tokens_output);
+            tracing::error!(
+                run_id = %run_id,
+                error_kind = "agent_stream_error",
+                "agent run failed: {error:#}"
+            );
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::Error {
+                    message: format!("{:#}", error),
+                },
+            )
+            .await;
+            true
+        }
+        Err(e) => {
             tracing::error!(
                 run_id = %run_id,
                 error_kind = "agent_stream_error",
@@ -2154,6 +2178,28 @@ fn agent_event_to_server_event(
                 message: format!("{error:#}"),
             }
         }
+        AgentEvent::SubagentRetrying {
+            id,
+            reason,
+            discarded_output,
+        } => marshaling_protocol::ServerEvent::SubagentRetrying {
+            id,
+            reason,
+            discarded_output,
+        },
+        AgentEvent::Retrying {
+            attempt,
+            max_attempts,
+            delay,
+            reason,
+            discarded_output,
+        } => marshaling_protocol::ServerEvent::Retrying {
+            attempt: u32::try_from(attempt).unwrap_or(u32::MAX),
+            max_attempts: u32::try_from(max_attempts).unwrap_or(u32::MAX),
+            delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            reason,
+            discarded_output,
+        },
         AgentEvent::TextDelta(text) => {
             marshaling_protocol::ServerEvent::TextDelta { data: text }
         }
@@ -3091,17 +3137,43 @@ read = "allow"
             &test_save_ctx(dir.path()),
             Ok(agent::AgentEvent::Failed {
                 error: anyhow::anyhow!("provider API error (401)"),
+                tokens_input: 3,
+                tokens_output: 4,
+                history: vec![
+                    llm::ChatMessage::user("do the thing"),
+                    llm::ChatMessage::assistant_text("working on it"),
+                ],
             }),
         )
         .await;
         assert!(terminal);
-        let runs = state.runs.lock().await;
-        assert!(runs["run_1"].finished);
-        assert!(matches!(
-            runs["run_1"].events.last(),
-            Some(marshaling_protocol::ServerEvent::Error { message })
-                if message.contains("401")
-        ));
+        {
+            let runs = state.runs.lock().await;
+            assert!(runs["run_1"].finished);
+            assert!(matches!(
+                runs["run_1"].events.last(),
+                Some(marshaling_protocol::ServerEvent::Error { message })
+                    if message.contains("401")
+            ));
+        }
+        // The work done before the failure is saved (written in the
+        // background, so poll briefly).
+        let session_dir =
+            history_dir_for_session(&dir.path().join("history"), "sess");
+        let mut saved = false;
+        for _ in 0..50 {
+            saved = std::fs::read_dir(&session_dir).is_ok_and(|entries| {
+                entries.flatten().any(|e| {
+                    std::fs::read_to_string(e.path())
+                        .is_ok_and(|text| text.contains("working on it"))
+                })
+            });
+            if saved {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saved, "failed run's history should be saved");
     }
 
     #[tokio::test]

@@ -243,6 +243,14 @@ pub enum ServerEvent {
         sub_id: String,
         error: String,
     },
+    /// A subagent's provider request is being retried. With
+    /// `discarded_output`, text it streamed for its current turn is void.
+    #[serde(rename = "sub_retrying")]
+    SubagentRetrying {
+        id: String,
+        reason: String,
+        discarded_output: bool,
+    },
     #[serde(rename = "sub_done")]
     SubagentDone { id: String, content: String },
     #[serde(rename = "done")]
@@ -262,6 +270,17 @@ pub enum ServerEvent {
         content: String,
         tokens_input: u64,
         tokens_output: u64,
+    },
+    /// A provider request failed and is retried after `delay_ms`. When
+    /// `discarded_output` is set, the text streamed so far for the current
+    /// turn is void and must be discarded: the retry regenerates the turn.
+    #[serde(rename = "retrying")]
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: String,
+        discarded_output: bool,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -630,5 +649,29 @@ mod tests {
         );
         // Unknown (newer server) events are logged server-side, so count them.
         assert!(ServerEvent::Unknown.is_run_log_event());
+    }
+
+    #[test]
+    fn retrying_event_roundtrips_and_is_logged() {
+        let evt = ServerEvent::Retrying {
+            attempt: 2,
+            max_attempts: 5,
+            delay_ms: 4000,
+            reason: "overloaded".into(),
+            discarded_output: true,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains(r#""type":"retrying""#));
+        let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            ServerEvent::Retrying {
+                attempt: 2,
+                discarded_output: true,
+                ..
+            }
+        ));
+        // Part of the run log, so a reattaching client replays it in order.
+        assert!(parsed.is_run_log_event());
     }
 }

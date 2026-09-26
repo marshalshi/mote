@@ -117,29 +117,67 @@ fn role_brief(instructions: &str) -> String {
     }
 }
 
-fn is_retryable_stream_error(error: &anyhow::Error) -> bool {
+/// First retry delay; doubles on each further retry.
+const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Upper bound for the exponential backoff delay.
+const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+/// Shortest wait before a retry, even when a provider says `Retry-After: 0`,
+/// so retries never go out as a burst.
+const RETRY_MIN_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+/// Longest `Retry-After` honored. A provider asking for longer (e.g. a quota
+/// exhausted for hours) fails the run instead of silently stalling it.
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Delay before the `retry`-th retry (1-based) of a failed provider step, or
+/// `None` if the failure must not be retried.
+fn retry_delay(
+    error: &anyhow::Error,
+    retry: usize,
+) -> Option<std::time::Duration> {
+    match error.downcast_ref::<ProviderError>() {
+        Some(provider_error) => match provider_error.kind {
+            ProviderErrorKind::RateLimited | ProviderErrorKind::Transient => {
+                match provider_error.retry_after {
+                    Some(wait) if wait > MAX_RETRY_AFTER => None,
+                    Some(wait) => Some(wait.max(RETRY_MIN_DELAY)),
+                    None => Some(backoff_delay(retry)),
+                }
+            }
+            ProviderErrorKind::ContextOverflow | ProviderErrorKind::Fatal => {
+                None
+            }
+        },
+        // Errors not produced by a provider (should be rare): retry only
+        // clear network failures, matched by phrase, never by bare digits.
+        None => is_network_failure(error).then(|| backoff_delay(retry)),
+    }
+}
+
+/// Exponential backoff with up to 25% jitter, so parallel runs hitting the
+/// same rate limit do not retry in lockstep.
+fn backoff_delay(retry: usize) -> std::time::Duration {
+    let exponent = retry.saturating_sub(1).min(16) as u32;
+    let base = RETRY_BASE_DELAY
+        .saturating_mul(1 << exponent)
+        .min(RETRY_MAX_DELAY);
+    // Sub-second clock noise is plenty for jitter; no RNG dependency needed.
+    let noise = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos()) as f64
+        / 1e9;
+    base.mul_f64(1.0 + 0.25 * noise).min(RETRY_MAX_DELAY)
+}
+
+fn is_network_failure(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
     [
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-        "rate limit",
-        "too many requests",
-        "overloaded",
-        "service unavailable",
         "connection refused",
         "connection reset",
-        "connection lost",
         "connection closed",
         "socket hang up",
         "timed out",
-        "timeout",
         "network error",
-        "stream read error",
-        "stream ended before completion marker",
-        "stream ended before done=true",
     ]
     .iter()
     .any(|pattern| message.contains(pattern))
@@ -227,10 +265,6 @@ pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         .map(|s| (*s).to_string())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic".to_string())
-}
-
-fn stream_retry_delay(retry: usize) -> std::time::Duration {
-    std::time::Duration::from_secs(1_u64 << retry.saturating_sub(1).min(4))
 }
 
 fn reap_stream_task(
@@ -368,11 +402,34 @@ pub enum AgentEvent {
         sub_id: String,
         error: String,
     },
+    /// A subagent's provider request is being retried; with
+    /// `discarded_output`, its partial output for the current turn is void.
+    SubagentRetrying {
+        id: String,
+        reason: String,
+        discarded_output: bool,
+    },
     /// A subagent has finished.
     SubagentDone { id: String, content: String },
+    /// A provider step failed and will be retried after `delay`. When
+    /// `discarded_output` is set, text already streamed for this turn is
+    /// void: the retry regenerates the whole turn.
+    Retrying {
+        attempt: usize,
+        max_attempts: usize,
+        delay: std::time::Duration,
+        reason: String,
+        discarded_output: bool,
+    },
     /// The run failed with an unrecoverable error (e.g. a provider error
-    /// that cannot be retried).
-    Failed { error: anyhow::Error },
+    /// that cannot be retried). Carries the history so far so it can be
+    /// saved.
+    Failed {
+        error: anyhow::Error,
+        tokens_input: u64,
+        tokens_output: u64,
+        history: Vec<ChatMessage>,
+    },
     /// The agent loop has finished.
     Done {
         content: String,
@@ -607,7 +664,12 @@ impl AgentRun {
                     history,
                 }
             }
-            Terminal::Failed(error) => AgentEvent::Failed { error },
+            Terminal::Failed(error) => AgentEvent::Failed {
+                error,
+                tokens_input,
+                tokens_output,
+                history,
+            },
         };
         let _ = events_tx.send(Ok(event));
     }
@@ -840,21 +902,42 @@ impl AgentRun {
                             streamed_text: text_buf,
                         });
                     }
-                    Err(error)
-                        if !emitted_stream_data
-                            && is_retryable_stream_error(&error)
-                            && retries < MAX_STREAM_RETRIES =>
-                    {
+                    Err(error) => {
                         reap_stream_task(stream_handle, true);
+                        let delay = if retries < MAX_STREAM_RETRIES {
+                            retry_delay(&error, retries + 1)
+                        } else {
+                            None
+                        };
+                        let Some(delay) = delay else {
+                            return Err(Terminal::Failed(error));
+                        };
                         retries += 1;
-                        let delay = stream_retry_delay(retries);
+                        // Output already shown for this attempt is dropped:
+                        // the retry regenerates the whole turn, and the
+                        // client discards its partial copy on `Retrying`.
+                        let discarded_output = emitted_stream_data;
+                        text_buf.clear();
+                        emitted_stream_data = false;
+                        let reason = format!("{error:#}");
                         tracing::warn!(
                             step,
                             retry = retries,
                             max_retries = MAX_STREAM_RETRIES,
                             retry_delay_ms = delay.as_millis(),
-                            "retrying transient agent stream failure before output"
+                            status = error
+                                .downcast_ref::<ProviderError>()
+                                .and_then(|e| e.status),
+                            discarded_output,
+                            "retrying failed agent stream: {reason}"
                         );
+                        self.emit(AgentEvent::Retrying {
+                            attempt: retries,
+                            max_attempts: MAX_STREAM_RETRIES,
+                            delay,
+                            reason: safe_truncate(&reason, 300).to_string(),
+                            discarded_output,
+                        });
                         tokio::select! {
                             _ = tokio::time::sleep(delay) => {}
                             _ = wait_for_cancel(&mut self.cancel_rx, &mut self.cancel_open) => {
@@ -862,10 +945,6 @@ impl AgentRun {
                             }
                         }
                         continue 'stream_attempt;
-                    }
-                    Err(error) => {
-                        reap_stream_task(stream_handle, true);
-                        return Err(Terminal::Failed(error));
                     }
                 }
             }
@@ -1830,11 +1909,251 @@ mod tests {
             last = Some(event.unwrap());
         }
         match last {
-            Some(AgentEvent::Failed { error }) => {
+            Some(AgentEvent::Failed { error, history, .. }) => {
                 assert!(format!("{error:#}").contains("invalid api key"));
+                // History up to the failure travels with it so it can be saved.
+                assert_eq!(
+                    history.last().and_then(|m| m.content.as_deref()),
+                    Some("hi")
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    type AttemptScript =
+        Vec<Box<dyn Fn() -> Result<StreamEvent> + Send + Sync>>;
+
+    /// Replays one scripted list of stream events per attempt.
+    struct StreamScriptProvider {
+        calls: Arc<Mutex<usize>>,
+        attempts: Mutex<std::collections::VecDeque<AttemptScript>>,
+        /// Script reused once `attempts` runs out.
+        repeat: Option<AttemptScript>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamScriptProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+        ) -> Result<ChatResult> {
+            unreachable!("run_loop uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+            sender: tokio::sync::mpsc::UnboundedSender<Result<StreamEvent>>,
+        ) {
+            *self.calls.lock().unwrap() += 1;
+            let script = self.attempts.lock().unwrap().pop_front();
+            let script = script.as_ref().or(self.repeat.as_ref());
+            for event in script.expect("attempt script missing") {
+                let _ = sender.send(event());
+            }
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn provider_error(
+        kind: ProviderErrorKind,
+        retry_after_ms: Option<u64>,
+    ) -> anyhow::Error {
+        let mut error = ProviderError::new(kind, format!("{kind:?} failure"));
+        error.retry_after =
+            retry_after_ms.map(std::time::Duration::from_millis);
+        error.into()
+    }
+
+    fn done_with(text: &'static str) -> Result<StreamEvent> {
+        Ok(StreamEvent::Done(ChatResult {
+            content: Some(text.into()),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            finish_reason: Some("stop".into()),
+            reasoning_content: None,
+        }))
+    }
+
+    /// Run a tool-less loop against `provider` and collect every event.
+    async fn run_scripted(provider: StreamScriptProvider) -> Vec<AgentEvent> {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_loop(
+                RunConfig {
+                    provider: Arc::new(provider),
+                    tools: Arc::new(ToolRegistry::new(Vec::new())),
+                    system_layers: Vec::new(),
+                    options: ChatOptions::default(),
+                    permissions: std::collections::HashMap::new(),
+                    max_steps: 5,
+                    working_directory: "/tmp".into(),
+                    role_config: None,
+                },
+                RunChannels {
+                    events_tx,
+                    cancel_rx,
+                    permission_broker: PermissionBroker::default(),
+                },
+                "hi".into(),
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("run must finish");
+        let mut events = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event.unwrap());
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_partial_output_discards_it_and_regenerates() {
+        let calls = Arc::new(Mutex::new(0));
+        let attempts: Vec<AttemptScript> = vec![
+            vec![
+                Box::new(|| Ok(StreamEvent::Chunk("partial ".into()))),
+                Box::new(|| {
+                    Err(provider_error(ProviderErrorKind::Transient, Some(5)))
+                }),
+            ],
+            vec![
+                Box::new(|| Ok(StreamEvent::Chunk("full answer".into()))),
+                Box::new(|| done_with("full answer")),
+            ],
+        ];
+        let events = run_scripted(StreamScriptProvider {
+            calls: Arc::clone(&calls),
+            attempts: Mutex::new(attempts.into()),
+            repeat: None,
+        })
+        .await;
+        assert_eq!(*calls.lock().unwrap(), 2);
+        let retry = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    AgentEvent::Retrying {
+                        attempt: 1,
+                        max_attempts: MAX_STREAM_RETRIES,
+                        discarded_output: true,
+                        ..
+                    }
+                )
+            })
+            .expect("a Retrying event");
+        assert!(
+            matches!(&events[retry - 1], AgentEvent::TextDelta(t) if t == "partial ")
+        );
+        assert!(
+            matches!(&events[retry + 1], AgentEvent::TextDelta(t) if t == "full answer")
+        );
+        match events.last() {
+            Some(AgentEvent::Done {
+                content, history, ..
+            }) => {
+                assert_eq!(content, "full answer");
+                assert!(!history.iter().any(|m| {
+                    m.content.as_deref().is_some_and(|c| c.contains("partial"))
+                }));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_overflow_and_long_retry_after_are_not_retried() {
+        for (kind, retry_after_ms) in [
+            (ProviderErrorKind::ContextOverflow, None),
+            (ProviderErrorKind::Fatal, None),
+            // Asking for longer than MAX_RETRY_AFTER fails fast.
+            (ProviderErrorKind::RateLimited, Some(120_000)),
+        ] {
+            let calls = Arc::new(Mutex::new(0));
+            let events = run_scripted(StreamScriptProvider {
+                calls: Arc::clone(&calls),
+                attempts: Mutex::new(Default::default()),
+                repeat: Some(vec![Box::new(move || {
+                    Err(provider_error(kind, retry_after_ms))
+                })]),
+            })
+            .await;
+            assert_eq!(*calls.lock().unwrap(), 1, "{kind:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Retrying { .. })),
+                "{kind:?}"
+            );
+            assert!(matches!(events.last(), Some(AgentEvent::Failed { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retries_stop_after_max_attempts() {
+        let calls = Arc::new(Mutex::new(0));
+        let events = run_scripted(StreamScriptProvider {
+            calls: Arc::clone(&calls),
+            attempts: Mutex::new(Default::default()),
+            repeat: Some(vec![Box::new(|| {
+                Err(provider_error(ProviderErrorKind::RateLimited, Some(1)))
+            })]),
+        })
+        .await;
+        assert_eq!(*calls.lock().unwrap(), MAX_STREAM_RETRIES + 1);
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Retrying { .. }))
+            .count();
+        assert_eq!(retries, MAX_STREAM_RETRIES);
+        assert!(matches!(events.last(), Some(AgentEvent::Failed { .. })));
+    }
+
+    #[test]
+    fn test_retry_delay_policy() {
+        // Untyped errors: retried only for clear network failures, never
+        // because of digits such as "500" inside "70500".
+        assert_eq!(
+            retry_delay(&anyhow::anyhow!("bad parameter value 70500"), 1),
+            None
+        );
+        assert!(
+            retry_delay(&anyhow::anyhow!("connection reset by peer"), 1)
+                .is_some()
+        );
+        // Retry-After wins over backoff.
+        assert_eq!(
+            retry_delay(
+                &provider_error(ProviderErrorKind::RateLimited, Some(1500)),
+                3
+            ),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        // `Retry-After: 0` still waits a little, never a burst.
+        assert_eq!(
+            retry_delay(
+                &provider_error(ProviderErrorKind::Transient, Some(0)),
+                1
+            ),
+            Some(RETRY_MIN_DELAY)
+        );
+        let first = backoff_delay(1);
+        assert!(
+            first >= RETRY_BASE_DELAY
+                && first <= RETRY_BASE_DELAY.mul_f64(1.25)
+        );
+        assert!(backoff_delay(3) >= RETRY_BASE_DELAY * 4);
+        assert!(backoff_delay(50) <= RETRY_MAX_DELAY);
     }
 
     struct RetryOnceProvider {
@@ -1860,9 +2179,11 @@ mod tests {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             if *calls == 1 {
-                let _ = sender.send(Err(anyhow::anyhow!(
-                    "provider API error (503): temporarily unavailable"
-                )));
+                let mut error = ProviderError::transient(
+                    "provider API error (503): temporarily unavailable",
+                );
+                error.retry_after = Some(std::time::Duration::from_millis(10));
+                let _ = sender.send(Err(error.into()));
                 return;
             }
             let _ = sender.send(Ok(StreamEvent::Done(ChatResult {

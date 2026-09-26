@@ -1495,6 +1495,36 @@ impl App {
         self.invalidate_response_render_cache();
     }
 
+    /// The server is retrying a failed provider request. Text streamed for
+    /// the current turn is dropped when the server says the retry will
+    /// regenerate it, so it is not shown twice.
+    pub fn agent_retrying(
+        &mut self,
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: &str,
+        discarded_output: bool,
+    ) {
+        if discarded_output {
+            self.stream_buffer.clear();
+            self.reasoning_buffer.clear();
+        }
+        let discarded = if discarded_output {
+            "; partial response discarded"
+        } else {
+            ""
+        };
+        self.messages.push(DisplayMessage::command(
+            Role::Assistant,
+            format!(
+                "Provider error: {reason}\nRetrying in {:.1}s (attempt {attempt}/{max_attempts}){discarded}.",
+                delay_ms as f64 / 1000.0
+            ),
+        ));
+        self.invalidate_response_render_cache();
+    }
+
     /// Called when the agent loop finishes entirely.
     pub fn agent_done(&mut self, content: &str) {
         let thinking = if self.reasoning_buffer.is_empty() {

@@ -12,21 +12,11 @@ use crate::llm::{
     ToolFunctionDef,
 };
 
-/// Maximum bytes returned from tool output before truncation.
-const MAX_OUTPUT_BYTES: usize = 51200; // 50 KiB
-
-/// Truncate tool output if it exceeds MAX_OUTPUT_BYTES.
-fn truncate_output(output: String) -> String {
-    if output.len() <= MAX_OUTPUT_BYTES {
-        return output;
-    }
-    let truncated = crate::agent::safe_truncate(&output, MAX_OUTPUT_BYTES);
-    format!(
-        "{}\n\n[output truncated — {} bytes total]",
-        truncated,
-        output.len()
-    )
-}
+/// Lines `read` returns when the caller gives no limit.
+const DEFAULT_READ_LINES: usize = 2000;
+/// Bytes `read` returns at most; kept below the registry's 50 KiB output cap
+/// so the paging note is never truncated away.
+const MAX_READ_BYTES: usize = 48 * 1024;
 
 const MAX_DIFF_LINES_PER_FILE: usize = 40;
 const DIFF_CONTEXT_LINES: usize = 3;
@@ -210,17 +200,56 @@ impl Tool for ReadTool {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        if offset == 0 && limit.is_none() {
+        let lines: Vec<&str> = content.lines().collect();
+        if offset == 0
+            && limit.is_none()
+            && lines.len() <= DEFAULT_READ_LINES
+            && content.len() <= MAX_READ_BYTES
+        {
             return Ok(result_no_changes(content));
         }
 
-        let lines: Vec<&str> = content.lines().collect();
         let start = offset.saturating_sub(1).min(lines.len());
+        if offset > lines.len() && !lines.is_empty() {
+            // Distinguish "nothing there" from an empty file.
+            return Ok(result_no_changes(format!(
+                "[offset {offset} is past the end of the file ({} lines).]",
+                lines.len()
+            )));
+        }
         let end = limit
             .map(|l| start.saturating_add(l))
             .unwrap_or(lines.len())
             .min(lines.len());
-        Ok(result_no_changes(lines[start..end].join("\n")))
+        // Without an explicit limit, a read returns at most
+        // DEFAULT_READ_LINES lines; every read stays under MAX_READ_BYTES so
+        // the registry's generic output cap never cuts off the note below.
+        let line_cap = match limit {
+            Some(_) => end,
+            None => end.min(start.saturating_add(DEFAULT_READ_LINES)),
+        };
+        let mut shown_end = start;
+        let mut bytes = 0;
+        for line in &lines[start..line_cap] {
+            let size = line.len() + 1;
+            if bytes + size > MAX_READ_BYTES && shown_end > start {
+                break;
+            }
+            bytes += size;
+            shown_end += 1;
+        }
+
+        let mut output = lines[start..shown_end].join("\n");
+        if shown_end < end {
+            output.push_str(&format!(
+                "\n\n[Showing lines {}-{} of {}. Use offset={} to continue.]",
+                start + 1,
+                shown_end,
+                lines.len(),
+                shown_end + 1
+            ));
+        }
+        Ok(result_no_changes(output))
     }
 }
 
@@ -429,7 +458,8 @@ impl Tool for GrepTool {
         if stdout.is_empty() {
             return Ok(result_no_changes("No matches found.".into()));
         }
-        Ok(result_no_changes(truncate_output(stdout)))
+        // Output size is limited centrally by `ToolRegistry::execute`.
+        Ok(result_no_changes(stdout))
     }
 }
 
@@ -863,7 +893,8 @@ impl Tool for BashTool {
         if result.is_empty() {
             result = "(no output)".into();
         }
-        Ok(result_no_changes(truncate_output(result)))
+        // Output size is limited centrally by `ToolRegistry::execute`.
+        Ok(result_no_changes(result))
     }
 }
 
@@ -1224,22 +1255,30 @@ impl SubagentRunner for AgentSubagentRunner {
         ));
 
         // Collect the result while forwarding events to the parent.
-        // Subagent has a 5-minute budget to prevent blocking the parent
+        // Subagent has a time budget (`server.subagent_timeout_secs`) to prevent blocking the parent
         // indefinitely. Time spent waiting for the user to answer a forwarded
         // permission prompt does not count against it: the subagent is idle
         // then, and the parent run's own detached-permission watchdog covers
         // a user who never answers.
         let mut content = String::new();
         let mut tool_log = String::new();
-        let subagent_timeout = std::time::Duration::from_secs(300);
-        let mut deadline = tokio::time::Instant::now() + subagent_timeout;
+        let budget_secs = self.config.server.subagent_timeout_secs;
+        // 0 disables the budget; an overflowing deadline means "none".
+        let mut deadline = (budget_secs > 0)
+            .then(|| {
+                tokio::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(budget_secs))
+            })
+            .flatten();
         let mut awaiting_permission_since: Option<tokio::time::Instant> = None;
         let mut timed_out = false;
+        // Length of `content` when the current turn started, so a retry that
+        // discards partial output can drop just this turn's text.
+        let mut turn_start = 0;
 
         loop {
-            let next = match awaiting_permission_since {
-                Some(_) => agent_rx.recv().await,
-                None => {
+            let next = match (awaiting_permission_since, deadline) {
+                (None, Some(deadline)) => {
                     match tokio::time::timeout_at(deadline, agent_rx.recv())
                         .await
                     {
@@ -1250,6 +1289,7 @@ impl SubagentRunner for AgentSubagentRunner {
                         }
                     }
                 }
+                _ => agent_rx.recv().await,
             };
             let Some(event) = next else {
                 break;
@@ -1257,7 +1297,8 @@ impl SubagentRunner for AgentSubagentRunner {
             // The first event after a prompt is normally `PermissionResolved`
             // (or `Cancelled`); give the waiting time back to the budget.
             if let Some(since) = awaiting_permission_since.take() {
-                deadline += since.elapsed();
+                deadline =
+                    deadline.and_then(|d| d.checked_add(since.elapsed()));
             }
             match event {
                 Ok(crate::agent::AgentEvent::Done { content: c, .. })
@@ -1359,7 +1400,27 @@ impl SubagentRunner for AgentSubagentRunner {
                 ) => {
                     let _ = self.parent_events_tx.send(Ok(event));
                 }
-                Ok(crate::agent::AgentEvent::Failed { error: e }) | Err(e) => {
+                Ok(crate::agent::AgentEvent::TurnDone { .. }) => {
+                    turn_start = content.len();
+                }
+                Ok(crate::agent::AgentEvent::Retrying {
+                    reason,
+                    discarded_output,
+                    ..
+                }) => {
+                    if discarded_output {
+                        content.truncate(turn_start);
+                    }
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentRetrying {
+                            id: sub_id.clone(),
+                            reason,
+                            discarded_output,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::Failed { error: e, .. })
+                | Err(e) => {
                     content = format!("[Sub-agent error: {:#}]", e);
                     break;
                 }
@@ -1372,13 +1433,13 @@ impl SubagentRunner for AgentSubagentRunner {
             tracing::warn!(
                 "Sub-agent '{}' timed out after {}s",
                 agent_name,
-                subagent_timeout.as_secs()
+                budget_secs
             );
             let _ = timeout_cancel_tx.send(true);
             anyhow::bail!(
                 "Sub-agent '{}' timed out after {}s",
                 agent_name,
-                subagent_timeout.as_secs()
+                budget_secs
             );
         }
 
@@ -1454,7 +1515,10 @@ mod tests {
             .execute(serde_json::json!({"file_path": "f.txt", "offset": 99, "limit": u64::MAX}))
             .await
             .unwrap();
-        assert_eq!(r.output, "");
+        assert_eq!(
+            r.output,
+            "[offset 99 is past the end of the file (3 lines).]"
+        );
     }
 
     #[tokio::test]
@@ -1820,25 +1884,67 @@ Actual skill content here."#,
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_truncate_output_short() {
-        let short = "hello world".to_string();
-        assert_eq!(truncate_output(short.clone()), short);
+    #[tokio::test]
+    async fn test_read_stops_at_byte_budget_with_accurate_note() {
+        let (_tmp, ws) = tmp_workspace();
+        // 1000 lines of 100 bytes: under the line cap, over the byte cap.
+        let line = "x".repeat(99);
+        let body = vec![line.as_str(); 1000].join("\n");
+        std::fs::write(ws.join("wide.txt"), &body).unwrap();
+        let tool = ReadTool::new(ws);
+        for args in [
+            serde_json::json!({"file_path": "wide.txt"}),
+            serde_json::json!({"file_path": "wide.txt", "offset": 1, "limit": 5000}),
+        ] {
+            let out = tool.execute(args).await.unwrap().output;
+            let shown = MAX_READ_BYTES / 100;
+            assert!(out.len() < 50 * 1024, "stays under the registry cap");
+            assert!(
+                out.ends_with(&format!(
+                    "[Showing lines 1-{shown} of 1000. Use offset={} to continue.]",
+                    shown + 1
+                )),
+                "{}",
+                &out[out.len() - 120..]
+            );
+        }
     }
 
-    #[test]
-    fn test_truncate_output_long() {
-        let long = "x".repeat(MAX_OUTPUT_BYTES + 1000);
-        let result = truncate_output(long.clone());
-        assert!(result.len() < long.len());
-        assert!(result.contains("[output truncated"));
-        assert!(result.contains(&format!("{} bytes total", long.len())));
-    }
-
-    #[test]
-    fn test_truncate_output_exact_boundary() {
-        let exact = "y".repeat(MAX_OUTPUT_BYTES);
-        assert_eq!(truncate_output(exact.clone()), exact);
+    #[tokio::test]
+    async fn test_read_without_range_caps_huge_files() {
+        let (_tmp, ws) = tmp_workspace();
+        let body: Vec<String> = (1..=DEFAULT_READ_LINES + 5)
+            .map(|n| n.to_string())
+            .collect();
+        std::fs::write(ws.join("big.txt"), body.join("\n")).unwrap();
+        let tool = ReadTool::new(ws);
+        let out = tool
+            .execute(serde_json::json!({"file_path": "big.txt"}))
+            .await
+            .unwrap()
+            .output;
+        assert!(out.starts_with("1\n2\n"));
+        assert!(out.contains(&format!("\n{DEFAULT_READ_LINES}\n")));
+        assert!(!out.contains(&format!("\n{}\n", DEFAULT_READ_LINES + 1)));
+        assert!(out.contains(&format!(
+            "[Showing lines 1-{DEFAULT_READ_LINES} of {}. Use offset={} to continue.]",
+            DEFAULT_READ_LINES + 5,
+            DEFAULT_READ_LINES + 1
+        )));
+        // An explicit range is honored beyond the default cap.
+        let out = tool
+            .execute(serde_json::json!({
+                "file_path": "big.txt",
+                "offset": DEFAULT_READ_LINES + 4,
+                "limit": 10
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(
+            out,
+            format!("{}\n{}", DEFAULT_READ_LINES + 4, DEFAULT_READ_LINES + 5)
+        );
     }
 }
 

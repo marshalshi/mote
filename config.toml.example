@@ -47,6 +47,9 @@ default_max_tokens = 65536
 port = 9847                    # port to listen on (default: 9847)
 default_agent = "build"        # agent used when no agent is specified
 # detached_permission_timeout_secs = 600  # cancel a run whose permission prompt stays unanswered with no client attached
+# first_response_timeout_secs = 600       # retry when a provider's first streamed data takes longer (model load, long prompts); 0 disables
+# stream_idle_timeout_secs = 180          # retry when a provider stream sends no data for this long; 0 disables
+# subagent_timeout_secs = 900             # time budget per subagent run (excludes waiting on permission prompts); 0 disables
 
 # --- UI accent colors ---
 [ui]

@@ -255,8 +255,7 @@ pub struct RollbackEntry {
 /// An agent's tool set with definitions computed once and name lookup.
 ///
 /// Also the single place tools are executed, so cross-cutting behavior
-/// (panic isolation today; output limits and timeouts later) applies to every
-/// tool uniformly.
+/// (panic isolation, output limits) applies to every tool uniformly.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     /// `defs[i]` is `tools[i].def()`, in registration order.
@@ -295,16 +294,46 @@ impl ToolRegistry {
         let Some(&i) = self.index.get(name) else {
             anyhow::bail!("Unknown tool: {name}");
         };
-        std::panic::AssertUnwindSafe(self.tools[i].execute(args))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|panic| {
-                Err(anyhow::anyhow!(
-                    "tool '{name}' panicked: {}",
-                    crate::agent::panic_message(panic.as_ref())
-                ))
-            })
+        let mut result =
+            std::panic::AssertUnwindSafe(self.tools[i].execute(args))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    Err(anyhow::anyhow!(
+                        "tool '{name}' panicked: {}",
+                        crate::agent::panic_message(panic.as_ref())
+                    ))
+                })?;
+        result.output = limit_tool_output(result.output);
+        Ok(result)
     }
+}
+
+/// Largest tool output passed to the model, in bytes and in lines.
+const MAX_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
+const MAX_TOOL_OUTPUT_LINES: usize = 2000;
+
+/// Cap a tool's output so one call cannot flood the context window. Keeps
+/// the head and tells the model how to narrow the request.
+fn limit_tool_output(output: String) -> String {
+    let total_lines = output.lines().count();
+    if output.len() <= MAX_TOOL_OUTPUT_BYTES
+        && total_lines <= MAX_TOOL_OUTPUT_LINES
+    {
+        return output;
+    }
+    let line_end = output
+        .match_indices('\n')
+        .nth(MAX_TOOL_OUTPUT_LINES - 1)
+        .map_or(output.len(), |(i, _)| i);
+    let head =
+        crate::agent::safe_truncate(&output[..line_end], MAX_TOOL_OUTPUT_BYTES);
+    format!(
+        "{head}\n\n[output truncated: showing {} of {total_lines} lines ({} of {} bytes). Narrow the request: read with offset/limit, use a more specific grep/glob pattern, or pipe command output through head, tail, or grep.]",
+        head.lines().count(),
+        head.len(),
+        output.len()
+    )
 }
 
 /// Create the default built-in tool set.
@@ -343,7 +372,66 @@ pub trait LlmProvider: Send + Sync {
 }
 
 pub mod deepseek;
+pub mod error;
 pub mod ollama;
+
+pub use error::{ProviderError, ProviderErrorKind};
+
+/// Time allowed to establish a connection to a provider.
+const PROVIDER_CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// HTTP client shared by all providers' constructors: fails fast when a
+/// provider is unreachable instead of hanging a run.
+pub fn provider_http_client() -> Result<reqwest::Client> {
+    use anyhow::Context;
+    reqwest::Client::builder()
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        .build()
+        .context("Failed to create HTTP client")
+}
+
+/// Await `future`, failing with a transient provider error if nothing
+/// arrives within `limit` (`None` waits forever). Applied to waiting for the
+/// response and to every streamed chunk, so a stalled connection cannot
+/// hang a run.
+pub async fn with_idle_timeout<T>(
+    limit: Option<std::time::Duration>,
+    provider: &str,
+    future: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, ProviderError> {
+    let Some(limit) = limit else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout(limit, future).await.map_err(|_| {
+        ProviderError::transient(format!(
+            "{provider} request stalled: no data for {}s",
+            limit.as_secs()
+        ))
+    })
+}
+
+/// Provider response time limits, from `[server]` config. `0` disables one.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderTimeouts {
+    /// Until the first streamed data arrives: covers queueing, model
+    /// loading (Ollama), and prompt evaluation of long contexts.
+    pub first_response: Option<std::time::Duration>,
+    /// Between streamed chunks once data is flowing.
+    pub stream_idle: Option<std::time::Duration>,
+}
+
+impl ProviderTimeouts {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let secs = |value: u64| {
+            (value > 0).then(|| std::time::Duration::from_secs(value))
+        };
+        Self {
+            first_response: secs(config.server.first_response_timeout_secs),
+            stream_idle: secs(config.server.stream_idle_timeout_secs),
+        }
+    }
+}
 
 /// Build a provider by name (useful when an agent overrides the provider).
 pub fn build_provider_for(
@@ -533,6 +621,43 @@ mod tests {
 
     fn echo(name: &'static str, output: &'static str) -> Box<dyn Tool> {
         Box::new(EchoTool { name, output })
+    }
+
+    #[test]
+    fn test_limit_tool_output_keeps_small_output_unchanged() {
+        let exact = "y".repeat(MAX_TOOL_OUTPUT_BYTES);
+        assert_eq!(limit_tool_output(exact.clone()), exact);
+        assert_eq!(limit_tool_output("hello".into()), "hello");
+        let lines = vec!["l"; MAX_TOOL_OUTPUT_LINES].join("\n");
+        assert_eq!(limit_tool_output(lines.clone()), lines);
+    }
+
+    #[test]
+    fn test_limit_tool_output_caps_bytes_and_lines() {
+        let long = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1000);
+        let out = limit_tool_output(long.clone());
+        assert!(out.starts_with(&"x".repeat(MAX_TOOL_OUTPUT_BYTES)));
+        assert!(out.contains(&format!(
+            "({MAX_TOOL_OUTPUT_BYTES} of {} bytes)",
+            long.len()
+        )));
+
+        let many: Vec<String> = (1..=MAX_TOOL_OUTPUT_LINES + 10)
+            .map(|n| n.to_string())
+            .collect();
+        let out = limit_tool_output(many.join("\n"));
+        assert!(out.contains(&format!(
+            "\n{MAX_TOOL_OUTPUT_LINES}\n\n[output truncated"
+        )));
+        assert!(out.contains(&format!(
+            "showing {MAX_TOOL_OUTPUT_LINES} of {} lines",
+            MAX_TOOL_OUTPUT_LINES + 10
+        )));
+
+        // Multi-byte characters are never split.
+        let wide = "é".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let out = limit_tool_output(wide);
+        assert!(out.contains("[output truncated"));
     }
 
     #[tokio::test]

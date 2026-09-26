@@ -15,6 +15,10 @@ pub struct DeepSeekProvider {
     max_tokens_field: MaxTokensField,
     temperature_decimals: Option<u32>,
     reasoning_split: bool,
+    /// Ask for token usage in the final stream chunk
+    /// (`stream_options.include_usage`); only for APIs that document it.
+    include_stream_usage: bool,
+    timeouts: ProviderTimeouts,
     client: reqwest::Client,
 }
 
@@ -38,9 +42,9 @@ impl DeepSeekProvider {
             max_tokens_field: MaxTokensField::MaxTokens,
             temperature_decimals: None,
             reasoning_split: false,
-            client: reqwest::Client::builder()
-                .build()
-                .context("Failed to create HTTP client")?,
+            include_stream_usage: true,
+            timeouts: ProviderTimeouts::from_config(config),
+            client: provider_http_client()?,
         })
     }
 
@@ -64,9 +68,9 @@ impl DeepSeekProvider {
             max_tokens_field,
             temperature_decimals,
             reasoning_split,
-            client: reqwest::Client::builder()
-                .build()
-                .context("Failed to create HTTP client")?,
+            include_stream_usage: false,
+            timeouts: ProviderTimeouts::from_config(config),
+            client: provider_http_client()?,
         })
     }
 
@@ -159,6 +163,9 @@ impl DeepSeekProvider {
         }
         if self.reasoning_split {
             body["reasoning_split"] = serde_json::json!(true);
+        }
+        if stream && self.include_stream_usage {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
         }
         body
     }
@@ -347,14 +354,16 @@ impl LlmProvider for DeepSeekProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
             tracing::error!("← {} {}: {}", self.provider_name, status, text);
-            return Err(anyhow::anyhow!(
-                "{} API error ({}): {}",
+            return Err(ProviderError::from_response(
                 self.provider_name,
                 status,
-                text
-            ));
+                &headers,
+                &text,
+            )
+            .into());
         }
 
         let completion: CompletionResponse = response.json().await?;
@@ -429,36 +438,52 @@ impl LlmProvider for DeepSeekProvider {
             request_item_count(&body, "tools")
         );
 
-        let response = match self
+        let fail = |error: ProviderError| {
+            let _ = sender.send(Err(error.into()));
+        };
+        let timeouts = self.timeouts;
+        let request = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
+            .send();
+        let response = match with_idle_timeout(
+            timeouts.first_response,
+            self.provider_name,
+            request,
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = sender.send(Err(anyhow::anyhow!(
-                    "{} request failed: {}",
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return fail(ProviderError::from_send_error(
                     self.provider_name,
-                    e
-                )));
-                return;
+                    &e,
+                ));
             }
+            Err(stalled) => return fail(stalled),
         };
 
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let _ = sender.send(Err(anyhow::anyhow!(
-                "{} API error ({}): {}",
+            let headers = response.headers().clone();
+            let text = with_idle_timeout(
+                timeouts.stream_idle,
+                self.provider_name,
+                response.text(),
+            )
+            .await
+            .ok()
+            .and_then(|text| text.ok())
+            .unwrap_or_default();
+            return fail(ProviderError::from_response(
                 self.provider_name,
                 status,
-                text
-            )));
-            return;
+                &headers,
+                &text,
+            ));
         }
 
         // Parse streaming SSE events with tool call accumulation
@@ -470,16 +495,34 @@ impl LlmProvider for DeepSeekProvider {
         let mut usage = Usage::default();
         let mut saw_completion = false;
         let mut finish_reason: Option<String> = None;
+        let mut received_data = false;
 
-        while let Some(chunk_result) = stream.next().await {
+        loop {
+            // The first data may be slow (queueing, long prompts); once it
+            // flows, gaps between chunks are held to the idle limit.
+            let limit = if received_data {
+                timeouts.stream_idle
+            } else {
+                timeouts.first_response
+            };
+            let chunk_result = match with_idle_timeout(
+                limit,
+                self.provider_name,
+                stream.next(),
+            )
+            .await
+            {
+                Ok(Some(chunk_result)) => chunk_result,
+                Ok(None) => break,
+                Err(stalled) => return fail(stalled),
+            };
+            received_data = true;
             let chunk = match chunk_result {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    let _ = sender.send(Err(anyhow::anyhow!(
-                        "Stream read error: {}",
-                        error
+                    return fail(ProviderError::transient(format!(
+                        "Stream read error: {error}"
                     )));
-                    return;
                 }
             };
             buf.extend_from_slice(&chunk);
@@ -490,10 +533,9 @@ impl LlmProvider for DeepSeekProvider {
                 let event_str = match std::str::from_utf8(&event_bytes) {
                     Ok(s) => s,
                     Err(error) => {
-                        let _ = sender.send(Err(anyhow::anyhow!(
+                        return fail(ProviderError::fatal(format!(
                             "Invalid UTF-8 in SSE event: {error}"
                         )));
-                        return;
                     }
                 };
 
@@ -582,10 +624,21 @@ impl LlmProvider for DeepSeekProvider {
                         }
                     }
                     Err(error) => {
-                        let _ = sender.send(Err(anyhow::anyhow!(
-                            "Failed to parse SSE data event: {error}"
-                        )));
-                        return;
+                        // Gateways report failures mid-stream as
+                        // `data: {"error": ...}`; surface and classify those.
+                        let payload_error = serde_json::from_str::<Value>(data)
+                            .ok()
+                            .and_then(|payload| {
+                                ProviderError::from_stream_payload(
+                                    self.provider_name,
+                                    &payload,
+                                )
+                            });
+                        return fail(payload_error.unwrap_or_else(|| {
+                            ProviderError::fatal(format!(
+                                "Failed to parse SSE data event: {error}"
+                            ))
+                        }));
                     }
                 }
             }
@@ -603,7 +656,7 @@ impl LlmProvider for DeepSeekProvider {
             return;
         }
 
-        let _ = sender.send(Err(anyhow::anyhow!(
+        fail(ProviderError::transient(format!(
             "{} stream ended before completion marker",
             self.provider_name
         )));
@@ -744,6 +797,11 @@ fn test_glm_provider_uses_live_models_path() {
         max_tokens_field: MaxTokensField::MaxTokens,
         temperature_decimals: Some(2),
         reasoning_split: false,
+        include_stream_usage: false,
+        timeouts: ProviderTimeouts {
+            first_response: None,
+            stream_idle: None,
+        },
         client: reqwest::Client::new(),
     };
 
@@ -862,6 +920,11 @@ mod tests {
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             temperature_decimals: None,
             reasoning_split: false,
+            include_stream_usage: false,
+            timeouts: ProviderTimeouts {
+                first_response: None,
+                stream_idle: None,
+            },
             client: reqwest::Client::new(),
         };
         let options = ChatOptions {
@@ -888,6 +951,11 @@ mod tests {
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             temperature_decimals: None,
             reasoning_split: true,
+            include_stream_usage: false,
+            timeouts: ProviderTimeouts {
+                first_response: None,
+                stream_idle: None,
+            },
             client: reqwest::Client::new(),
         };
 
@@ -911,6 +979,11 @@ mod tests {
             max_tokens_field: MaxTokensField::MaxTokens,
             temperature_decimals: Some(2),
             reasoning_split: false,
+            include_stream_usage: false,
+            timeouts: ProviderTimeouts {
+                first_response: None,
+                stream_idle: None,
+            },
             client: reqwest::Client::new(),
         };
 
@@ -926,6 +999,74 @@ mod tests {
         assert_eq!(body["temperature"], serde_json::json!(0.12));
     }
 
+    fn test_provider(include_stream_usage: bool) -> DeepSeekProvider {
+        DeepSeekProvider {
+            provider_name: "DeepSeek",
+            api_key: "key".into(),
+            base_url: "https://api.example.com".into(),
+            chat_path: "/chat/completions",
+            models_path: "/models",
+            max_tokens_field: MaxTokensField::MaxTokens,
+            temperature_decimals: None,
+            reasoning_split: false,
+            include_stream_usage,
+            timeouts: ProviderTimeouts {
+                first_response: None,
+                stream_idle: None,
+            },
+            client: reqwest::Client::new(),
+        }
+    }
+
+    #[test]
+    fn test_build_request_asks_for_stream_usage_only_when_enabled() {
+        let msgs = [ChatMessage::user("hi")];
+        let options = ChatOptions::default();
+        let body = test_provider(true).build_request(&msgs, &options, true);
+        assert_eq!(
+            body["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+        let body = test_provider(true).build_request(&msgs, &options, false);
+        assert!(body.get("stream_options").is_none());
+        let body = test_provider(false).build_request(&msgs, &options, true);
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn test_finalize_keeps_tool_calls_missing_id_or_name() {
+        let mut acc = HashMap::from([
+            (
+                0,
+                PendingToolCall {
+                    id: None,
+                    name: Some("read".into()),
+                    arguments: "{}".into(),
+                },
+            ),
+            (
+                1,
+                PendingToolCall {
+                    id: Some("call_b".into()),
+                    name: None,
+                    arguments: "{}".into(),
+                },
+            ),
+        ]);
+        let result = finalize(
+            &mut String::new(),
+            &mut acc,
+            Usage::default(),
+            Some("tool_calls".into()),
+            &mut None,
+        );
+        assert_eq!(result.tool_calls.len(), 2);
+        assert!(result.tool_calls[0].id.starts_with("call_mote_"));
+        assert_eq!(result.tool_calls[0].function.name, "read");
+        assert_eq!(result.tool_calls[1].id, "call_b");
+        assert_eq!(result.tool_calls[1].function.name, MISSING_TOOL_NAME);
+    }
+
     #[test]
     fn test_finish_reason_signals_completion_for_terminal_stream_chunks() {
         assert!(finish_reason_signals_completion("stop"));
@@ -936,6 +1077,20 @@ mod tests {
     }
 }
 
+/// Source of ids for streamed tool calls that arrive without one.
+static GENERATED_CALL_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-process prefix for generated ids, so ids from a previous server run
+/// (still in a resumed session's history) cannot collide with new ones.
+static GENERATED_CALL_ID_PREFIX: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!("{:x}", chrono::Utc::now().timestamp_millis())
+    });
+
+/// Name given to a streamed tool call that arrived without a function name.
+const MISSING_TOOL_NAME: &str = "missing_tool_name";
+
 fn finalize(
     text: &mut String,
     acc: &mut HashMap<usize, PendingToolCall>,
@@ -943,12 +1098,27 @@ fn finalize(
     finish_reason: Option<String>,
     reasoning: &mut Option<String>,
 ) -> ChatResult {
+    // Never drop a streamed tool call: some OpenAI-compatible gateways omit
+    // the id, and a silently dropped call leaves a "tool_calls" turn with
+    // nothing to run, so the model repeats itself until max steps. A missing
+    // id is generated; a missing name becomes a placeholder the loop reports
+    // back to the model as an unknown tool.
     let mut tool_calls: Vec<(usize, ToolCall)> = acc
         .drain()
-        .filter_map(|(idx, ptc)| {
-            let id = ptc.id?;
-            let name = ptc.name?;
-            Some((
+        .map(|(idx, ptc)| {
+            let id = ptc.id.filter(|id| !id.is_empty()).unwrap_or_else(|| {
+                format!(
+                    "call_mote_{}_{}",
+                    *GENERATED_CALL_ID_PREFIX,
+                    GENERATED_CALL_ID
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            });
+            let name = ptc
+                .name
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| MISSING_TOOL_NAME.to_string());
+            (
                 idx,
                 ToolCall {
                     id,
@@ -958,7 +1128,7 @@ fn finalize(
                         arguments: ptc.arguments,
                     },
                 },
-            ))
+            )
         })
         .collect();
     tool_calls.sort_by_key(|(idx, _)| *idx);

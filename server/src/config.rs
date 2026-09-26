@@ -245,6 +245,21 @@ pub struct ServerConfig {
     /// attached for this long (default: 600 seconds).
     #[serde(default = "default_detached_permission_timeout_secs")]
     pub detached_permission_timeout_secs: u64,
+    /// Fail (and retry) a provider request when its first streamed data
+    /// takes longer than this: queueing, model loading, prompt evaluation
+    /// (default: 600 seconds; 0 disables).
+    #[serde(default = "default_first_response_timeout_secs")]
+    pub first_response_timeout_secs: u64,
+    /// Fail (and retry) a provider stream when no data arrives for this long
+    /// between chunks (default: 180 seconds; 0 disables).
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    /// Time budget for one subagent run, excluding time spent waiting for
+    /// the user to answer its permission prompts (default: 900 seconds,
+    /// longer than `first_response_timeout_secs` so a slow first response
+    /// is retried before the budget runs out; 0 disables).
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub subagent_timeout_secs: u64,
 }
 
 fn default_server_port() -> u16 {
@@ -259,6 +274,15 @@ fn default_agent_name() -> String {
 fn default_detached_permission_timeout_secs() -> u64 {
     600
 }
+fn default_first_response_timeout_secs() -> u64 {
+    600
+}
+fn default_stream_idle_timeout_secs() -> u64 {
+    180
+}
+fn default_subagent_timeout_secs() -> u64 {
+    900
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -268,6 +292,9 @@ impl Default for ServerConfig {
             default_agent: default_agent_name(),
             detached_permission_timeout_secs:
                 default_detached_permission_timeout_secs(),
+            first_response_timeout_secs: default_first_response_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            subagent_timeout_secs: default_subagent_timeout_secs(),
         }
     }
 }

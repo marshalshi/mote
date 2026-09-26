@@ -923,6 +923,26 @@ fn handle_server_event(
                 tracing::warn!("SubagentToolFailed for unknown id: {}", id);
             }
         }
+        ServerEvent::SubagentRetrying {
+            id,
+            reason,
+            discarded_output,
+        } => {
+            // The pane has no turn boundaries to cut back to, so mark the
+            // retry inline instead of silently showing text twice.
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
+            {
+                let note = if discarded_output {
+                    "the partial response above is discarded"
+                } else {
+                    "retrying"
+                };
+                sv.stream_buffer.push_str(&format!(
+                    "\n[provider error: {reason}; {note}]\n"
+                ));
+                app.touch_response_render();
+            }
+        }
         ServerEvent::SubagentDone { id, content } => {
             if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
             {
@@ -1006,6 +1026,22 @@ fn handle_server_event(
                     self::state::MessageSource::Error
                 },
             });
+            app.touch_response_render();
+        }
+        ServerEvent::Retrying {
+            attempt,
+            max_attempts,
+            delay_ms,
+            reason,
+            discarded_output,
+        } => {
+            app.agent_retrying(
+                attempt,
+                max_attempts,
+                delay_ms,
+                &reason,
+                discarded_output,
+            );
             app.touch_response_render();
         }
         ServerEvent::Error { message } => {
@@ -2725,5 +2761,46 @@ mod tests {
                 .last()
                 .is_some_and(|m| m.content.contains("1 queued message"))
         );
+    }
+
+    #[test]
+    fn test_retrying_discards_partial_turn_only_when_told() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.agent_text_delta("half an ans");
+        app.agent_reasoning_delta("thinking");
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::Retrying {
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: 2000,
+                reason: "DeepSeek API error (503)".into(),
+                discarded_output: false,
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.stream_buffer, "half an ans");
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::Retrying {
+                attempt: 2,
+                max_attempts: 5,
+                delay_ms: 4000,
+                reason: "stream stalled".into(),
+                discarded_output: true,
+            },
+            &mut chat_stream,
+        );
+        assert!(app.stream_buffer.is_empty());
+        assert!(app.reasoning_buffer.is_empty());
+        assert_eq!(app.state, AppState::AgentRunning);
+        let notice = &app.messages.last().unwrap().content;
+        assert!(notice.contains("stream stalled"), "{notice}");
+        assert!(notice.contains("attempt 2/5"), "{notice}");
+        assert!(notice.contains("partial response discarded"), "{notice}");
+        // Notices are not conversation, so they are never sent to the model.
+        assert!(app.pending_user_message_content().is_none());
     }
 }

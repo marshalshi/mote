@@ -1069,7 +1069,7 @@ impl Tool for SubagentTool {
 use std::sync::Arc;
 
 pub struct AgentSubagentRunner {
-    pub tools: Arc<Vec<Box<dyn crate::llm::Tool>>>,
+    pub tools: Arc<crate::llm::ToolRegistry>,
     pub config: crate::config::Config,
     pub auth: crate::auth::Auth,
     pub merged_agents:
@@ -1140,8 +1140,9 @@ impl SubagentRunner for AgentSubagentRunner {
         // collector below), so subagents never bypass user approval.
         let tool_names: Vec<String> = self
             .tools
+            .defs()
             .iter()
-            .map(|t| t.def().function.name.clone())
+            .map(|def| def.function.name.clone())
             .collect();
         let mut perms =
             crate::build_permission_map(&self.config, agent_cfg, &tool_names);
@@ -1156,12 +1157,13 @@ impl SubagentRunner for AgentSubagentRunner {
         let mut opts = context.opts;
         opts.tools = self
             .tools
+            .defs()
             .iter()
-            .filter(|t| {
-                perms.get(&t.def().function.name).copied()
+            .filter(|def| {
+                perms.get(&def.function.name).copied()
                     != Some(crate::config::Permission::Deny)
             })
-            .map(|t| t.def())
+            .cloned()
             .collect();
 
         // Create channels for the subagent
@@ -1190,19 +1192,23 @@ impl SubagentRunner for AgentSubagentRunner {
 
         tokio::spawn(async move {
             crate::agent::run_loop(
-                p2,
-                t2,
-                context.system_layers,
+                crate::agent::RunConfig {
+                    provider: p2,
+                    tools: t2,
+                    system_layers: context.system_layers,
+                    options: opts,
+                    permissions: perms,
+                    max_steps: crate::agent::DEFAULT_MAX_STEPS,
+                    working_directory: workspace_display,
+                    role_config,
+                },
+                crate::agent::RunChannels {
+                    events_tx: agent_tx,
+                    cancel_rx: sub_cancel_rx,
+                    permission_broker,
+                },
                 user_msg,
                 history,
-                opts,
-                agent_tx,
-                sub_cancel_rx,
-                permission_broker,
-                perms,
-                crate::agent::DEFAULT_MAX_STEPS,
-                workspace_display,
-                role_config,
             )
             .await;
         });
@@ -1353,7 +1359,7 @@ impl SubagentRunner for AgentSubagentRunner {
                 ) => {
                     let _ = self.parent_events_tx.send(Ok(event));
                 }
-                Err(e) => {
+                Ok(crate::agent::AgentEvent::Failed { error: e }) | Err(e) => {
                     content = format!("[Sub-agent error: {:#}]", e);
                     break;
                 }

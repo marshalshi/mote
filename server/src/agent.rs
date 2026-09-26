@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use anyhow::Result;
-use futures::FutureExt;
 use tokio::sync::mpsc::UnboundedSender;
+
+use crate::config::Permission;
 
 use crate::llm::*;
 use crate::prompt::ToolResultSummary;
@@ -267,19 +270,20 @@ fn reap_stream_task(
 }
 
 fn advertised_tool_defs(
-    tools: &[Box<dyn Tool>],
-    permissions: &std::collections::HashMap<String, crate::config::Permission>,
+    tools: &ToolRegistry,
+    permissions: &HashMap<String, Permission>,
 ) -> Vec<ToolDef> {
     tools
+        .defs()
         .iter()
-        .filter_map(|tool| {
-            let def = tool.def();
-            let perm = permissions
+        .filter(|def| {
+            permissions
                 .get(&def.function.name)
                 .copied()
-                .unwrap_or(crate::config::Permission::Ask);
-            (perm != crate::config::Permission::Deny).then_some(def)
+                .unwrap_or(Permission::Ask)
+                != Permission::Deny
         })
+        .cloned()
         .collect()
 }
 
@@ -366,6 +370,9 @@ pub enum AgentEvent {
     },
     /// A subagent has finished.
     SubagentDone { id: String, content: String },
+    /// The run failed with an unrecoverable error (e.g. a provider error
+    /// that cannot be retried).
+    Failed { error: anyhow::Error },
     /// The agent loop has finished.
     Done {
         content: String,
@@ -390,128 +397,293 @@ pub enum AgentEvent {
     },
 }
 
+/// Static inputs of one agent run.
+pub struct RunConfig {
+    pub provider: Arc<dyn LlmProvider>,
+    pub tools: Arc<ToolRegistry>,
+    /// Assembled system prompt layers (see `PromptAssembler`).
+    pub system_layers: Vec<String>,
+    pub options: ChatOptions,
+    /// Pre-resolved permission map: tool name → permission.
+    pub permissions: HashMap<String, Permission>,
+    /// Normal tool-capable turn budget; 0 means `DEFAULT_MAX_STEPS`.
+    pub max_steps: usize,
+    /// Workspace shown in the per-turn system reminder.
+    pub working_directory: String,
+    /// Role-aware loop config. When None, runs in single-role mode.
+    pub role_config: Option<RoleLoopConfig>,
+}
+
+/// Channels connecting a run to whoever owns it.
+pub struct RunChannels {
+    pub events_tx: UnboundedSender<Result<AgentEvent>>,
+    pub cancel_rx: tokio::sync::watch::Receiver<bool>,
+    pub permission_broker: PermissionBroker,
+}
+
 /// Run the agent loop.
 ///
-/// Takes the user message, system prompts, tool set, and previous LLM history.
-/// Sends `AgentEvent`s back through `events_tx` for the TUI to render.
-/// Checks `cancel_rx` periodically to abort.
+/// Appends `user_message` to `history`, then alternates LLM turns and tool
+/// execution until the task finishes, is cancelled, fails, or runs out of
+/// steps. Streams `AgentEvent`s through `channels.events_tx`; the last event
+/// is always exactly one terminal event carrying the final history.
 pub async fn run_loop(
-    provider: Arc<dyn LlmProvider>,
-    tools: Arc<Vec<Box<dyn Tool>>>,
-    system_layers: Vec<String>,
+    config: RunConfig,
+    channels: RunChannels,
     user_message: String,
-    mut history: Vec<ChatMessage>,
-    options: ChatOptions,
-    events_tx: UnboundedSender<Result<AgentEvent>>,
-    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-    permission_broker: PermissionBroker,
-    // Pre-resolved permission map: tool_name → Permission
-    permissions: std::collections::HashMap<String, crate::config::Permission>,
-    // Configurable max steps (defaults to DEFAULT_MAX_STEPS if 0)
-    max_steps: usize,
-    // Workspace context for dynamic reminder text.
-    working_directory: String,
-    // Role-aware loop config. When None, runs in legacy (single-role) mode.
-    role_config: Option<RoleLoopConfig>,
+    history: Vec<ChatMessage>,
 ) {
-    let max_steps = if max_steps == 0 {
-        DEFAULT_MAX_STEPS
-    } else {
-        max_steps
-    };
-    // Role-aware loop state: tracks which role is currently active.
-    // When role_config is None (legacy mode), this remains at 0 and is unused.
-    let mut current_role_idx: usize = 0;
-    let role_mode = role_config.is_some();
-    // Add the user message
-    history.push(ChatMessage::user(&user_message));
+    AgentRun::new(config, channels, history)
+        .run(user_message)
+        .await;
+}
 
-    // Emit SkillsLoaded event from system layers
-    let skill_names: Vec<String> = system_layers
+/// How a run ends. [`AgentRun::finish`] turns it into the terminal event.
+enum Terminal {
+    Done(String),
+    Cancelled,
+    NeedsContinuation(String),
+    Failed(anyhow::Error),
+}
+
+/// Everything one step sends to the provider.
+struct StepRequest {
+    provider: Arc<dyn LlmProvider>,
+    messages: Vec<ChatMessage>,
+    options: ChatOptions,
+}
+
+/// A completed provider response plus the text streamed while producing it.
+struct StepResponse {
+    result: ChatResult,
+    streamed_text: String,
+}
+
+/// Outcome of one tool call within a batch.
+struct ToolOutcome {
+    display: ToolCallDisplay,
+    failed: bool,
+    finish_answer: Option<String>,
+    role_switch: Option<(usize, String)>,
+}
+
+impl ToolOutcome {
+    fn succeeded(tc: &ToolCall, name: &str, changes: Vec<FileChange>) -> Self {
+        Self {
+            display: ToolCallDisplay {
+                id: tc.id.clone(),
+                name: name.into(),
+                status: ToolStatus::Success,
+                changes,
+            },
+            failed: false,
+            finish_answer: None,
+            role_switch: None,
+        }
+    }
+}
+
+/// Combined outcome of all tool calls from one assistant message.
+#[derive(Default)]
+struct ToolBatch {
+    displays: Vec<ToolCallDisplay>,
+    /// True if any call in the batch failed.
+    failed: bool,
+    /// The first `finish_task` answer in the batch.
+    finish_answer: Option<String>,
+    /// The last valid `switch_role` request in the batch.
+    role_switch: Option<(usize, String)>,
+}
+
+/// Wait until cancellation is requested. Never resolves once the cancel
+/// sender is gone (`changed()` would then resolve immediately forever, so it
+/// must stop being polled). Cancel-safe, for use in `select!`.
+async fn wait_for_cancel(
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    cancel_open: &mut bool,
+) {
+    loop {
+        if !*cancel_open {
+            return std::future::pending().await;
+        }
+        match cancel_rx.changed().await {
+            Ok(()) if *cancel_rx.borrow() => return,
+            Ok(()) => {}
+            Err(_) => *cancel_open = false,
+        }
+    }
+}
+
+/// Skill names advertised in the "Skills available:" system layer.
+fn skill_names(system_layers: &[String]) -> Vec<String> {
+    system_layers
         .iter()
-        .filter_map(|layer| {
-            if layer.starts_with("Skills available:") {
-                // Extract skill names from lines like "  name — desc"
-                Some(
-                    layer
-                        .lines()
-                        .skip(1)
-                        .filter_map(|line| {
-                            let line = line.trim();
-                            if line.is_empty() || !line.contains(" — ") {
-                                return None;
-                            }
-                            line.split(" — ").next().map(|s| s.to_string())
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            }
+        .filter(|layer| layer.starts_with("Skills available:"))
+        .flat_map(|layer| {
+            // Extract skill names from lines like "  name — desc"
+            layer.lines().skip(1).filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || !line.contains(" — ") {
+                    return None;
+                }
+                line.split(" — ").next().map(|s| s.to_string())
+            })
         })
-        .flatten()
-        .collect();
-    if !skill_names.is_empty() {
-        let _ =
-            events_tx.send(Ok(AgentEvent::SkillsLoaded { names: skill_names }));
+        .collect()
+}
+
+/// State of one running agent loop.
+struct AgentRun {
+    cfg: RunConfig,
+    events_tx: UnboundedSender<Result<AgentEvent>>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    permission_broker: PermissionBroker,
+    history: Vec<ChatMessage>,
+    total_input: u64,
+    total_output: u64,
+    /// False once the cancel sender is dropped (see [`wait_for_cancel`]).
+    cancel_open: bool,
+    /// Active role in role mode; stays 0 in single-role mode.
+    current_role_idx: usize,
+}
+
+impl AgentRun {
+    fn new(
+        mut cfg: RunConfig,
+        channels: RunChannels,
+        history: Vec<ChatMessage>,
+    ) -> Self {
+        if cfg.max_steps == 0 {
+            cfg.max_steps = DEFAULT_MAX_STEPS;
+        }
+        Self {
+            cfg,
+            events_tx: channels.events_tx,
+            cancel_rx: channels.cancel_rx,
+            permission_broker: channels.permission_broker,
+            history,
+            total_input: 0,
+            total_output: 0,
+            cancel_open: true,
+            current_role_idx: 0,
+        }
     }
 
-    let mut total_input: u64 = 0;
-    let mut total_output: u64 = 0;
-    // Becomes false once the cancel sender is dropped. `changed()` then
-    // resolves immediately forever, so every `select!` must stop polling it.
-    let mut cancel_open = true;
+    fn emit(&self, event: AgentEvent) {
+        let _ = self.events_tx.send(Ok(event));
+    }
 
-    let mut step = 0usize;
-    loop {
-        step += 1;
-        tracing::debug!(
-            "agent turn {} (soft budget {}): {} tools, {} history messages",
-            step,
-            max_steps,
-            tools.len(),
-            history.len()
-        );
+    fn cancel_requested(&self) -> bool {
+        *self.cancel_rx.borrow()
+    }
 
-        // Check cancel
-        if *cancel_rx.borrow() {
-            let _ = events_tx.send(Ok(AgentEvent::Cancelled {
-                content: "(cancelled)".into(),
-                tokens_input: total_input,
-                tokens_output: total_output,
+    /// The single exit path: send the terminal event with the final history.
+    fn finish(self, terminal: Terminal) {
+        let AgentRun {
+            events_tx,
+            history,
+            total_input: tokens_input,
+            total_output: tokens_output,
+            ..
+        } = self;
+        let event = match terminal {
+            Terminal::Done(content) => AgentEvent::Done {
+                content,
+                tokens_input,
+                tokens_output,
                 history,
-            }));
-            return;
+            },
+            Terminal::Cancelled => AgentEvent::Cancelled {
+                content: "(cancelled)".into(),
+                tokens_input,
+                tokens_output,
+                history,
+            },
+            Terminal::NeedsContinuation(content) => {
+                AgentEvent::NeedsContinuation {
+                    content,
+                    tokens_input,
+                    tokens_output,
+                    history,
+                }
+            }
+            Terminal::Failed(error) => AgentEvent::Failed { error },
+        };
+        let _ = events_tx.send(Ok(event));
+    }
+
+    async fn run(mut self, user_message: String) {
+        self.history.push(ChatMessage::user(&user_message));
+
+        let skill_names = skill_names(&self.cfg.system_layers);
+        if !skill_names.is_empty() {
+            self.emit(AgentEvent::SkillsLoaded { names: skill_names });
         }
 
-        let soft_final_step = max_steps.saturating_add(1);
+        let max_steps = self.cfg.max_steps;
         // Hard turn budget fallback: after max_steps normal turns, the next
         // turn is a soft, text-only finalization step. If the model still
         // fails to produce a terminal text response there, stop before
         // exceeding the fallback budget.
-        if step > soft_final_step {
-            let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
-                content: "(max steps reached)".into(),
-                tokens_input: total_input,
-                tokens_output: total_output,
-                history,
-            }));
-            return;
-        }
-        let final_text_only_step = step == soft_final_step;
+        let soft_final_step = max_steps.saturating_add(1);
+        let mut step = 0usize;
+        loop {
+            step += 1;
+            tracing::debug!(
+                "agent turn {} (soft budget {}): {} tools, {} history messages",
+                step,
+                max_steps,
+                self.cfg.tools.defs().len(),
+                self.history.len()
+            );
 
-        // ── Phase 1: Build messages and stream from LLM ─────────
+            if self.cancel_requested() {
+                return self.finish(Terminal::Cancelled);
+            }
+            if step > soft_final_step {
+                return self.finish(Terminal::NeedsContinuation(
+                    "(max steps reached)".into(),
+                ));
+            }
+            let final_text_only_step = step == soft_final_step;
+
+            let request = self.build_step_request(step, final_text_only_step);
+            let response = match self.stream_step(step, &request).await {
+                Ok(response) => response,
+                Err(terminal) => return self.finish(terminal),
+            };
+            if let Some(terminal) = self
+                .handle_response(
+                    step,
+                    final_text_only_step,
+                    &request.options,
+                    response,
+                )
+                .await
+            {
+                return self.finish(terminal);
+            }
+        }
+    }
+
+    /// Assemble the messages, options, and provider for one step.
+    fn build_step_request(
+        &self,
+        step: usize,
+        final_text_only_step: bool,
+    ) -> StepRequest {
+        let system_layers = &self.cfg.system_layers;
+        let role_config = self.cfg.role_config.as_ref();
 
         // Build messages: system + reminder + history
-        // Use iter().cloned() to avoid allocating an intermediate Vec from history.clone()
         let mut messages: Vec<ChatMessage> =
-            Vec::with_capacity(system_layers.len() + 2 + history.len());
+            Vec::with_capacity(system_layers.len() + 2 + self.history.len());
 
         // Identify the skills layer (layer 6) so we can inject role layers (5)
         // before it: correct order is shared (1-4), role (5), skills (6), reminder (7).
         let has_skills = system_layers
             .last()
-            .map_or(false, |l| l.starts_with("Skills available:"));
+            .is_some_and(|l| l.starts_with("Skills available:"));
         let pre_skills_count = if has_skills {
             system_layers.len().saturating_sub(1)
         } else {
@@ -520,12 +692,12 @@ pub async fn run_loop(
 
         // Inject shared layers (1-4): env, system prompt, global AGENTS.md,
         // workspace AGENTS.md
-        for i in 0..pre_skills_count {
-            messages.push(ChatMessage::system(&system_layers[i]));
+        for layer in &system_layers[..pre_skills_count] {
+            messages.push(ChatMessage::system(layer));
         }
 
         // Inject role layers (5) — only in role mode
-        if let Some(ref rc) = role_config {
+        if let Some(rc) = role_config {
             // Role roster
             let mut roster = String::from("Available roles in this agent:\n");
             for role in &rc.roles {
@@ -538,7 +710,8 @@ pub async fn run_loop(
             messages.push(ChatMessage::system(&roster));
 
             // Current role's specific instructions
-            let role_instructions = &rc.roles[current_role_idx].instructions;
+            let role_instructions =
+                &rc.roles[self.current_role_idx].instructions;
             if !role_instructions.is_empty() {
                 messages.push(ChatMessage::system(role_instructions));
             }
@@ -552,69 +725,78 @@ pub async fn run_loop(
         }
 
         // Build and inject the dynamic system reminder (Layer 7)
-        let last_user_msg = extract_last_user_message(&history);
-        let last_turn_results = extract_last_turn_results(&history);
-        let mut tool_defs = advertised_tool_defs(&tools, &permissions);
+        let mut tool_defs =
+            advertised_tool_defs(&self.cfg.tools, &self.cfg.permissions);
         // When in role mode, inject the switch_role tool def so the model can
         // delegate to other roles. This is an internal loop tool, not a filesystem tool.
-        if role_mode && !final_text_only_step {
+        if role_config.is_some() && !final_text_only_step {
             tool_defs.push(switch_role_tool_def());
         }
-
         let reminder_ctx = crate::prompt::ReminderContext {
             step,
-            max_steps,
-            working_directory: working_directory.clone(),
+            max_steps: self.cfg.max_steps,
+            working_directory: self.cfg.working_directory.clone(),
             tool_defs: &tool_defs,
-            last_turn_results,
-            last_user_message: last_user_msg,
+            last_turn_results: extract_last_turn_results(&self.history),
+            last_user_message: extract_last_user_message(&self.history),
         };
         let reminder = crate::prompt::build_system_reminder(&reminder_ctx);
         messages.push(ChatMessage::system(&reminder));
 
-        messages.extend(history.iter().cloned());
+        messages.extend(self.history.iter().cloned());
         if final_text_only_step {
             messages.push(ChatMessage::assistant_text(MAX_STEPS_PROMPT));
         }
 
-        // Build tool definitions for the API
-        let mut opts = if let Some(ref rc) = role_config {
-            let role = &rc.roles[current_role_idx];
-            ChatOptions {
-                model_id: role.model_id.clone(),
-                temperature: role.temperature.unwrap_or(options.temperature),
-                max_tokens: role.max_tokens.unwrap_or(options.max_tokens),
-                tools: Vec::new(), // populated below
+        let base = &self.cfg.options;
+        let (mut options, provider) = match role_config {
+            Some(rc) => {
+                let role = &rc.roles[self.current_role_idx];
+                (
+                    ChatOptions {
+                        model_id: role.model_id.clone(),
+                        temperature: role
+                            .temperature
+                            .unwrap_or(base.temperature),
+                        max_tokens: role.max_tokens.unwrap_or(base.max_tokens),
+                        tools: Vec::new(), // populated below
+                    },
+                    Arc::clone(&role.provider),
+                )
             }
-        } else {
-            options.clone()
+            None => (base.clone(), Arc::clone(&self.cfg.provider)),
         };
-        opts.tools = if final_text_only_step {
+        options.tools = if final_text_only_step {
             Vec::new()
         } else {
             tool_defs
         };
-        let model_id = opts.model_id.clone();
-        let max_tokens = opts.max_tokens;
 
-        // Clone the Arc for the spawned task
-        let prov = if let Some(ref rc) = role_config {
-            Arc::clone(&rc.roles[current_role_idx].provider)
-        } else {
-            Arc::clone(&provider)
-        };
-        // Process stream events
+        StepRequest {
+            provider,
+            messages,
+            options,
+        }
+    }
+
+    /// Stream one provider response, forwarding deltas as events. Transient
+    /// failures before any output are retried with backoff.
+    async fn stream_step(
+        &mut self,
+        step: usize,
+        request: &StepRequest,
+    ) -> std::result::Result<StepResponse, Terminal> {
         let mut text_buf = String::new();
         let mut emitted_stream_data = false;
         let mut retries = 0;
-        let result = 'stream_attempt: loop {
+        'stream_attempt: loop {
             // Each retry gets a fresh channel and task. Retrying only before any
             // streamed output avoids duplicating visible assistant text.
             let (stream_tx, mut stream_rx) =
                 tokio::sync::mpsc::unbounded_channel();
-            let provider = Arc::clone(&prov);
-            let attempt_messages = messages.clone();
-            let attempt_opts = opts.clone();
+            let provider = Arc::clone(&request.provider);
+            let attempt_messages = request.messages.clone();
+            let attempt_opts = request.options.clone();
             let stream_handle = tokio::spawn(async move {
                 provider
                     .chat_stream(&attempt_messages, &attempt_opts, stream_tx)
@@ -624,64 +806,39 @@ pub async fn run_loop(
             loop {
                 let event = tokio::select! {
                     event = stream_rx.recv() => event,
-                    changed = cancel_rx.changed(), if cancel_open => {
-                        if changed.is_err() {
-                            // Sender gone: no cancellation can arrive any
-                            // more. Stop polling it instead of spinning.
-                            cancel_open = false;
-                            continue;
-                        }
-                        if *cancel_rx.borrow() {
-                            reap_stream_task(stream_handle, true);
-                            let _ = events_tx.send(Ok(AgentEvent::Cancelled {
-                                content: "(cancelled)".into(),
-                                tokens_input: total_input,
-                                tokens_output: total_output,
-                                history,
-                            }));
-                            return;
-                        }
-                        continue;
+                    _ = wait_for_cancel(&mut self.cancel_rx, &mut self.cancel_open) => {
+                        reap_stream_task(stream_handle, true);
+                        return Err(Terminal::Cancelled);
                     }
                 };
                 let Some(event) = event else {
                     reap_stream_task(stream_handle, false);
-                    if *cancel_rx.borrow() {
-                        let _ = events_tx.send(Ok(AgentEvent::Cancelled {
-                            content: "(cancelled)".into(),
-                            tokens_input: total_input,
-                            tokens_output: total_output,
-                            history,
-                        }));
-                        return;
+                    if self.cancel_requested() {
+                        return Err(Terminal::Cancelled);
                     }
                     tracing::warn!(
                         step,
                         streamed_chars = text_buf.len(),
                         "agent stream closed without a completion result"
                     );
-                    let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
-                        content: text_buf,
-                        tokens_input: total_input,
-                        tokens_output: total_output,
-                        history,
-                    }));
-                    return;
+                    return Err(Terminal::NeedsContinuation(text_buf));
                 };
                 match event {
                     Ok(StreamEvent::Chunk(text)) => {
                         emitted_stream_data = true;
                         text_buf.push_str(&text);
-                        let _ = events_tx.send(Ok(AgentEvent::TextDelta(text)));
+                        self.emit(AgentEvent::TextDelta(text));
                     }
                     Ok(StreamEvent::ReasoningChunk(text)) => {
                         emitted_stream_data = true;
-                        let _ = events_tx
-                            .send(Ok(AgentEvent::ReasoningDelta(text)));
+                        self.emit(AgentEvent::ReasoningDelta(text));
                     }
                     Ok(StreamEvent::Done(result)) => {
                         reap_stream_task(stream_handle, true);
-                        break 'stream_attempt result;
+                        return Ok(StepResponse {
+                            result,
+                            streamed_text: text_buf,
+                        });
                     }
                     Err(error)
                         if !emitted_stream_data
@@ -698,40 +855,43 @@ pub async fn run_loop(
                             retry_delay_ms = delay.as_millis(),
                             "retrying transient agent stream failure before output"
                         );
-                        let sleep = tokio::time::sleep(delay);
-                        tokio::pin!(sleep);
-                        loop {
-                            tokio::select! {
-                                _ = &mut sleep => break,
-                                changed = cancel_rx.changed(), if cancel_open => {
-                                    if changed.is_err() {
-                                        cancel_open = false;
-                                    } else if *cancel_rx.borrow() {
-                                        let _ = events_tx.send(Ok(AgentEvent::Cancelled {
-                                            content: "(cancelled)".into(),
-                                            tokens_input: total_input,
-                                            tokens_output: total_output,
-                                            history,
-                                        }));
-                                        return;
-                                    }
-                                }
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = wait_for_cancel(&mut self.cancel_rx, &mut self.cancel_open) => {
+                                return Err(Terminal::Cancelled);
                             }
                         }
                         continue 'stream_attempt;
                     }
                     Err(error) => {
                         reap_stream_task(stream_handle, true);
-                        let _ = events_tx.send(Err(error));
-                        return;
+                        return Err(Terminal::Failed(error));
                     }
                 }
             }
-        };
+        }
+    }
+
+    /// Record the assistant turn and run its tool calls. Returns the
+    /// terminal state if the run ends with this step.
+    async fn handle_response(
+        &mut self,
+        step: usize,
+        final_text_only_step: bool,
+        options: &ChatOptions,
+        response: StepResponse,
+    ) -> Option<Terminal> {
+        let StepResponse {
+            result,
+            streamed_text,
+        } = response;
+        let model_id = &options.model_id;
+        let max_tokens = options.max_tokens;
 
         // Accumulate token usage
-        total_input += result.usage.prompt_tokens;
-        total_output += result.usage.completion_tokens;
+        self.total_input += result.usage.prompt_tokens;
+        self.total_output += result.usage.completion_tokens;
+        let (total_input, total_output) = (self.total_input, self.total_output);
         tracing::debug!(
             step,
             model_id = %model_id,
@@ -751,8 +911,9 @@ pub async fn run_loop(
         // model may still intend to continue on the next turn.
         if result.tool_calls.is_empty() {
             let turn_finished = assistant_turn_is_finished(&result);
-            let content = assistant_result_text(&result, &text_buf);
-            history.push(ChatMessage::assistant_text(content.clone()));
+            let content = assistant_result_text(&result, &streamed_text);
+            self.history
+                .push(ChatMessage::assistant_text(content.clone()));
             if turn_finished {
                 if result.finish_reason.as_deref() == Some("length") {
                     tracing::warn!(
@@ -773,13 +934,7 @@ pub async fn run_loop(
                         "agent completed"
                     );
                 }
-                let _ = events_tx.send(Ok(AgentEvent::Done {
-                    content,
-                    tokens_input: total_input,
-                    tokens_output: total_output,
-                    history,
-                }));
-                return;
+                return Some(Terminal::Done(content));
             }
             if final_text_only_step {
                 tracing::warn!(
@@ -789,24 +944,19 @@ pub async fn run_loop(
                     total_output,
                     "agent reached its final text-only step without a terminal finish reason"
                 );
-                let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
-                    content,
-                    tokens_input: total_input,
-                    tokens_output: total_output,
-                    history,
-                }));
-                return;
+                return Some(Terminal::NeedsContinuation(content));
             }
-            let _ = events_tx.send(Ok(AgentEvent::TurnDone {
+            self.emit(AgentEvent::TurnDone {
                 text: content,
                 tool_calls: Vec::new(),
-            }));
-            continue;
+            });
+            return None;
         }
 
         if final_text_only_step {
-            let content = assistant_result_text(&result, &text_buf);
-            history.push(ChatMessage::assistant_text(content.clone()));
+            let content = assistant_result_text(&result, &streamed_text);
+            self.history
+                .push(ChatMessage::assistant_text(content.clone()));
             tracing::warn!(
                 step,
                 tool_calls = result.tool_calls.len(),
@@ -814,20 +964,12 @@ pub async fn run_loop(
                 total_output,
                 "agent requested tools during its final text-only step"
             );
-            let _ = events_tx.send(Ok(AgentEvent::NeedsContinuation {
-                content: if content.is_empty() {
-                    "(max steps reached)".into()
-                } else {
-                    content
-                },
-                tokens_input: total_input,
-                tokens_output: total_output,
-                history,
+            return Some(Terminal::NeedsContinuation(if content.is_empty() {
+                "(max steps reached)".into()
+            } else {
+                content
             }));
-            return;
         }
-
-        // ── Phase 2: Execute tool calls ─────────────────────────
 
         // There are tool calls — add the assistant message to history (with reasoning content)
         tracing::debug!("→ {} tool call(s) from LLM", result.tool_calls.len());
@@ -838,424 +980,334 @@ pub async fn run_loop(
                 safe_truncate(&tc.function.arguments, 120)
             );
         }
-        let turn_text = assistant_result_text(&result, &text_buf);
+        let turn_text = assistant_result_text(&result, &streamed_text);
+        let ChatResult {
+            content,
+            tool_calls,
+            reasoning_content,
+            ..
+        } = result;
         let mut msg = ChatMessage::assistant_tool_calls_with_content(
-            result.tool_calls.clone(),
+            tool_calls.clone(),
             (!turn_text.is_empty()).then_some(turn_text.clone()),
         );
-        msg.reasoning_content = result.reasoning_content;
-        history.push(msg);
+        msg.reasoning_content = reasoning_content;
+        self.history.push(msg);
 
-        // Execute each tool
-        let mut displays = Vec::new();
-        let mut finish_task_answer = None;
-        let mut pending_role_switch = None;
-        let mut tool_batch_failed = false;
-        for tc in &result.tool_calls {
-            if *cancel_rx.borrow() {
-                let _ = events_tx.send(Ok(AgentEvent::Cancelled {
-                    content: "(cancelled)".into(),
-                    tokens_input: total_input,
-                    tokens_output: total_output,
-                    history,
-                }));
-                return;
-            }
-
-            if tc.function.name == "finish_task" {
-                let final_answer = serde_json::from_str::<serde_json::Value>(
-                    &tc.function.arguments,
-                )
-                .ok()
-                .and_then(|args| {
-                    args.get("final_answer")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .or_else(|| result.content.clone())
-                .unwrap_or_else(|| "(task finished)".to_string());
-                finish_task_answer.get_or_insert(final_answer);
-                let result_text = "Task completion acknowledged.";
-                history.push(ChatMessage::tool_result(&tc.id, result_text));
-                displays.push(ToolCallDisplay {
-                    id: tc.id.clone(),
-                    name: "finish_task".into(),
-                    status: ToolStatus::Success,
-                    changes: Vec::new(),
-                });
-                continue;
-            }
-
-            // ── Handle switch_role (role-mode loop-owned tool) ──────
-            if tc.function.name == "switch_role" {
-                let _ = events_tx.send(Ok(AgentEvent::ToolStarted {
-                    id: tc.id.clone(),
-                    name: "switch_role".into(),
-                }));
-
-                let args: serde_json::Value =
-                    match serde_json::from_str(&tc.function.arguments) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tool_batch_failed = true;
-                            let err =
-                                format!("Invalid switch_role arguments: {e}");
-                            let _ =
-                                events_tx.send(Ok(AgentEvent::ToolFailed {
-                                    id: tc.id.clone(),
-                                    error: err.clone(),
-                                }));
-                            history
-                                .push(ChatMessage::tool_result(&tc.id, &err));
-                            displays.push(ToolCallDisplay {
-                                id: tc.id.clone(),
-                                name: "switch_role".into(),
-                                status: ToolStatus::Failed(err),
-                                changes: Vec::new(),
-                            });
-                            continue;
-                        }
-                    };
-                let target_role =
-                    args.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                let task =
-                    args.get("task").and_then(|v| v.as_str()).unwrap_or("");
-
-                match role_config.as_ref().and_then(|rc| {
-                    rc.find_role(target_role).map(|idx| (rc, idx))
-                }) {
-                    Some((_rc, idx)) => {
-                        // Valid role — switch and inject task
-                        let task_msg = if task.is_empty() {
-                            format!("Switched to role: {}", target_role)
-                        } else {
-                            task.to_string()
-                        };
-                        let result_text =
-                            format!("Switched to role: {}", target_role);
-                        // Push tool result first — providers expect tool
-                        // results to immediately follow the assistant tool_call.
-                        history.push(ChatMessage::tool_result(
-                            &tc.id,
-                            &result_text,
-                        ));
-                        let _ = events_tx.send(Ok(AgentEvent::ToolCompleted {
-                            id: tc.id.clone(),
-                            name: "switch_role".into(),
-                            result: result_text,
-                            changes: Vec::new(),
-                            rollback_entries: Vec::new(),
-                        }));
-                        displays.push(ToolCallDisplay {
-                            id: tc.id.clone(),
-                            name: "switch_role".into(),
-                            status: ToolStatus::Success,
-                            changes: Vec::new(),
-                        });
-                        // Apply this after every result from the current
-                        // assistant tool-call message has been recorded.
-                        // If several switches are emitted, the last valid one
-                        // wins because it is the last requested transition.
-                        pending_role_switch = Some((idx, task_msg));
-                    }
-                    None => {
-                        tool_batch_failed = true;
-                        let available = role_config
-                            .as_ref()
-                            .map(|rc| {
-                                rc.roles
-                                    .iter()
-                                    .map(|r| r.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            })
-                            .unwrap_or_else(|| "none".into());
-                        let err = format!(
-                            "Unknown role: '{}'. Available: {}",
-                            target_role, available
-                        );
-                        let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
-                            id: tc.id.clone(),
-                            error: err.clone(),
-                        }));
-                        history.push(ChatMessage::tool_result(&tc.id, &err));
-                        displays.push(ToolCallDisplay {
-                            id: tc.id.clone(),
-                            name: "switch_role".into(),
-                            status: ToolStatus::Failed(err),
-                            changes: Vec::new(),
-                        });
-                    }
-                }
-                continue;
-            }
-
-            // Emit skill selected event when use_skill is called
-            if tc.function.name == "use_skill" {
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                    &tc.function.arguments,
-                ) {
-                    if let Some(skill) =
-                        args.get("skill_name").and_then(|v| v.as_str())
-                    {
-                        let _ = events_tx.send(Ok(AgentEvent::SkillSelected {
-                            name: skill.to_string(),
-                        }));
-                        // Also send as reasoning so the TUI shows grey thinking text
-                        let _ = events_tx.send(Ok(AgentEvent::ReasoningDelta(
-                            format!("[Skill selected: {}]", skill),
-                        )));
-                    }
-                }
-            }
-
-            let _ = events_tx.send(Ok(AgentEvent::ToolStarted {
-                id: tc.id.clone(),
-                name: tc.function.name.clone(),
-            }));
-
-            // Find the tool
-            let tool = match tools
-                .iter()
-                .find(|t| t.def().function.name == tc.function.name)
-            {
-                Some(t) => t,
-                None => {
-                    tool_batch_failed = true;
-                    let err = format!("Unknown tool: {}", tc.function.name);
-                    let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
-                        id: tc.id.clone(),
-                        error: err.clone(),
-                    }));
-                    history.push(ChatMessage::tool_result(
-                        &tc.id,
-                        format!("Error: {}", err),
-                    ));
-                    displays.push(ToolCallDisplay {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        status: ToolStatus::Failed(err),
-                        changes: Vec::new(),
-                    });
-                    continue;
-                }
-            };
-
-            // Parse arguments
-            let args: serde_json::Value =
-                match serde_json::from_str(&tc.function.arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tool_batch_failed = true;
-                        let err = format!("Failed to parse arguments: {}", e);
-                        let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
-                            id: tc.id.clone(),
-                            error: err.clone(),
-                        }));
-                        history.push(ChatMessage::tool_result(
-                            &tc.id,
-                            format!("Error: {}", err),
-                        ));
-                        displays.push(ToolCallDisplay {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            status: ToolStatus::Failed(err),
-                            changes: Vec::new(),
-                        });
-                        continue;
-                    }
-                };
-
-            // Check permission for this tool
-            let perm = permissions
-                .get(&tc.function.name)
-                .copied()
-                .unwrap_or(crate::config::Permission::Ask);
-            match perm {
-                crate::config::Permission::Allow => {} // proceed to execute
-                crate::config::Permission::Deny => {
-                    tool_batch_failed = true;
-                    let err = format!(
-                        "Permission denied: '{}' is not allowed for this agent",
-                        tc.function.name
-                    );
-                    let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
-                        id: tc.id.clone(),
-                        error: err.clone(),
-                    }));
-                    history.push(ChatMessage::tool_result(
-                        &tc.id,
-                        format!("Error: {}", err),
-                    ));
-                    displays.push(ToolCallDisplay {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        status: ToolStatus::Failed(err),
-                        changes: Vec::new(),
-                    });
-                    continue;
-                }
-                crate::config::Permission::Ask => {
-                    // Request user permission
-                    let (perm_id, mut response_rx) =
-                        permission_broker.register(&tc.id);
-                    let _ = events_tx.send(Ok(AgentEvent::PermissionRequest {
-                        id: perm_id.clone(),
-                        tool_name: tc.function.name.clone(),
-                        args: args.clone(),
-                    }));
-                    // Wait for permission response. A dropped responder
-                    // (broker entry replaced or cleared) counts as a denial.
-                    let allowed = loop {
-                        tokio::select! {
-                            resp = &mut response_rx => break resp.unwrap_or(false),
-                            changed = cancel_rx.changed(), if cancel_open => {
-                                if changed.is_err() {
-                                    cancel_open = false;
-                                } else if *cancel_rx.borrow() {
-                                    permission_broker.forget(&perm_id);
-                                    let _ = events_tx.send(Ok(AgentEvent::Cancelled { content: "(cancelled)".into(), tokens_input: total_input, tokens_output: total_output, history }));
-                                    return;
-                                }
-                            }
-                        }
-                    };
-                    let _ =
-                        events_tx.send(Ok(AgentEvent::PermissionResolved {
-                            id: perm_id,
-                        }));
-                    if !allowed {
-                        tool_batch_failed = true;
-                        let err = format!(
-                            "Permission denied by user for tool '{}'",
-                            tc.function.name
-                        );
-                        let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
-                            id: tc.id.clone(),
-                            error: err.clone(),
-                        }));
-                        history.push(ChatMessage::tool_result(
-                            &tc.id,
-                            format!("Error: {}", err),
-                        ));
-                        displays.push(ToolCallDisplay {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            status: ToolStatus::Failed(err),
-                            changes: Vec::new(),
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            // Execute. A panicking tool must not take down the whole run, so
-            // the panic is caught and reported to the model as a tool error.
-            let tool_name = tc.function.name.clone();
-            let execution = std::panic::AssertUnwindSafe(tool.execute(args))
-                .catch_unwind()
-                .map(move |outcome| {
-                    outcome.unwrap_or_else(|panic| {
-                        Err(anyhow::anyhow!(
-                            "tool '{tool_name}' panicked: {}",
-                            panic_message(panic.as_ref())
-                        ))
-                    })
-                });
-            tokio::pin!(execution);
-            let execution = loop {
-                tokio::select! {
-                    output = &mut execution => break Some(output),
-                    changed = cancel_rx.changed(), if cancel_open => {
-                        match changed {
-                            Ok(()) if *cancel_rx.borrow() => break None,
-                            Ok(()) => continue,
-                            Err(_) => cancel_open = false,
-                        }
-                    }
-                }
-            };
-            let Some(execution) = execution else {
-                let _ = events_tx.send(Ok(AgentEvent::Cancelled {
-                    content: "(cancelled)".into(),
-                    tokens_input: total_input,
-                    tokens_output: total_output,
-                    history,
-                }));
-                return;
-            };
-            match execution {
-                Ok(output) => {
-                    let _ = events_tx.send(Ok(AgentEvent::ToolCompleted {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        result: output.output.clone(),
-                        changes: output.changes.clone(),
-                        rollback_entries: output.rollback_entries.clone(),
-                    }));
-                    history
-                        .push(ChatMessage::tool_result(&tc.id, &output.output));
-                    displays.push(ToolCallDisplay {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        status: ToolStatus::Success,
-                        changes: output.changes,
-                    });
-                }
-                Err(e) => {
-                    tool_batch_failed = true;
-                    let err = format!("{:#}", e);
-                    let _ = events_tx.send(Ok(AgentEvent::ToolFailed {
-                        id: tc.id.clone(),
-                        error: err.clone(),
-                    }));
-                    history.push(ChatMessage::tool_result(
-                        &tc.id,
-                        format!("Error: {}", err),
-                    ));
-                    displays.push(ToolCallDisplay {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        status: ToolStatus::Failed(err),
-                        changes: Vec::new(),
-                    });
-                }
-            }
-        }
+        let batch = match self.execute_tool_batch(&tool_calls, &content).await {
+            Ok(batch) => batch,
+            Err(terminal) => return Some(terminal),
+        };
 
         if let Some(final_answer) =
-            finish_task_answer.filter(|_| !tool_batch_failed)
+            batch.finish_answer.filter(|_| !batch.failed)
         {
-            history.push(ChatMessage::assistant_text(final_answer.clone()));
+            self.history
+                .push(ChatMessage::assistant_text(final_answer.clone()));
             tracing::info!(
                 step,
                 total_input,
                 total_output,
                 "agent completed via finish_task"
             );
-            let _ = events_tx.send(Ok(AgentEvent::Done {
-                content: final_answer,
-                tokens_input: total_input,
-                tokens_output: total_output,
-                history,
-            }));
-            return;
+            return Some(Terminal::Done(final_answer));
         }
 
-        if let Some((role_idx, task_msg)) = pending_role_switch {
-            current_role_idx = role_idx;
-            history.push(ChatMessage::role_task(task_msg));
+        if let Some((role_idx, task_msg)) = batch.role_switch {
+            self.current_role_idx = role_idx;
+            self.history.push(ChatMessage::role_task(task_msg));
         }
 
-        // ── Phase 3: Signal turn completion ────────────────────
-
-        // Signal turn complete with tool displays
-        let _ = events_tx.send(Ok(AgentEvent::TurnDone {
+        // History now contains tool results — the loop continues.
+        self.emit(AgentEvent::TurnDone {
             text: turn_text,
-            tool_calls: displays,
-        }));
+            tool_calls: batch.displays,
+        });
+        None
+    }
 
-        // History now contains tool results — loop continues
+    /// Run every tool call of one assistant message, in order.
+    async fn execute_tool_batch(
+        &mut self,
+        tool_calls: &[ToolCall],
+        content: &Option<String>,
+    ) -> std::result::Result<ToolBatch, Terminal> {
+        let mut batch = ToolBatch::default();
+        for tc in tool_calls {
+            if self.cancel_requested() {
+                return Err(Terminal::Cancelled);
+            }
+            let outcome = match tc.function.name.as_str() {
+                "finish_task" => self.finish_task_call(tc, content),
+                "switch_role" => self.switch_role_call(tc),
+                _ => self.regular_tool_call(tc).await?,
+            };
+            batch.failed |= outcome.failed;
+            if let Some(answer) = outcome.finish_answer {
+                batch.finish_answer.get_or_insert(answer);
+            }
+            if let Some(switch) = outcome.role_switch {
+                // Applied after every result from this assistant message is
+                // recorded; if several switches are emitted, the last valid
+                // one wins because it is the last requested transition.
+                batch.role_switch = Some(switch);
+            }
+            batch.displays.push(outcome.display);
+        }
+        Ok(batch)
+    }
+
+    /// Report a failed tool call to the client and to the model.
+    fn record_tool_failure(
+        &mut self,
+        tc: &ToolCall,
+        error: String,
+        history_text: String,
+    ) -> ToolOutcome {
+        self.emit(AgentEvent::ToolFailed {
+            id: tc.id.clone(),
+            error: error.clone(),
+        });
+        self.history
+            .push(ChatMessage::tool_result(&tc.id, history_text));
+        ToolOutcome {
+            display: ToolCallDisplay {
+                id: tc.id.clone(),
+                name: tc.function.name.clone(),
+                status: ToolStatus::Failed(error),
+                changes: Vec::new(),
+            },
+            failed: true,
+            finish_answer: None,
+            role_switch: None,
+        }
+    }
+
+    /// `finish_task` is an internal completion marker handled by the loop.
+    fn finish_task_call(
+        &mut self,
+        tc: &ToolCall,
+        content: &Option<String>,
+    ) -> ToolOutcome {
+        let final_answer =
+            serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                .ok()
+                .and_then(|args| {
+                    args.get("final_answer")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| content.clone())
+                .unwrap_or_else(|| "(task finished)".to_string());
+        self.history.push(ChatMessage::tool_result(
+            &tc.id,
+            "Task completion acknowledged.",
+        ));
+        ToolOutcome {
+            finish_answer: Some(final_answer),
+            ..ToolOutcome::succeeded(tc, "finish_task", Vec::new())
+        }
+    }
+
+    /// `switch_role` is a loop-owned tool in role mode.
+    fn switch_role_call(&mut self, tc: &ToolCall) -> ToolOutcome {
+        self.emit(AgentEvent::ToolStarted {
+            id: tc.id.clone(),
+            name: "switch_role".into(),
+        });
+
+        let args: serde_json::Value =
+            match serde_json::from_str(&tc.function.arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = format!("Invalid switch_role arguments: {e}");
+                    return self.record_tool_failure(tc, err.clone(), err);
+                }
+            };
+        let target_role =
+            args.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+
+        let role_config = self.cfg.role_config.as_ref();
+        let Some(idx) = role_config.and_then(|rc| rc.find_role(target_role))
+        else {
+            let available = role_config
+                .map(|rc| {
+                    rc.roles
+                        .iter()
+                        .map(|r| r.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "none".into());
+            let err = format!(
+                "Unknown role: '{}'. Available: {}",
+                target_role, available
+            );
+            return self.record_tool_failure(tc, err.clone(), err);
+        };
+
+        // Valid role — switch and inject task
+        let task_msg = if task.is_empty() {
+            format!("Switched to role: {}", target_role)
+        } else {
+            task.to_string()
+        };
+        let result_text = format!("Switched to role: {}", target_role);
+        // Push tool result first — providers expect tool results to
+        // immediately follow the assistant tool_call.
+        self.history
+            .push(ChatMessage::tool_result(&tc.id, &result_text));
+        self.emit(AgentEvent::ToolCompleted {
+            id: tc.id.clone(),
+            name: "switch_role".into(),
+            result: result_text,
+            changes: Vec::new(),
+            rollback_entries: Vec::new(),
+        });
+        ToolOutcome {
+            role_switch: Some((idx, task_msg)),
+            ..ToolOutcome::succeeded(tc, "switch_role", Vec::new())
+        }
+    }
+
+    /// A registry tool: look up, parse arguments, check permission, execute.
+    async fn regular_tool_call(
+        &mut self,
+        tc: &ToolCall,
+    ) -> std::result::Result<ToolOutcome, Terminal> {
+        let name = tc.function.name.as_str();
+
+        // Emit skill selected event when use_skill is called
+        if name == "use_skill" {
+            if let Some(skill) = serde_json::from_str::<serde_json::Value>(
+                &tc.function.arguments,
+            )
+            .ok()
+            .as_ref()
+            .and_then(|args| args.get("skill_name"))
+            .and_then(|v| v.as_str())
+            {
+                self.emit(AgentEvent::SkillSelected {
+                    name: skill.to_string(),
+                });
+                // Also send as reasoning so the TUI shows grey thinking text
+                self.emit(AgentEvent::ReasoningDelta(format!(
+                    "[Skill selected: {}]",
+                    skill
+                )));
+            }
+        }
+
+        self.emit(AgentEvent::ToolStarted {
+            id: tc.id.clone(),
+            name: name.to_string(),
+        });
+
+        if !self.cfg.tools.contains(name) {
+            let err = format!("Unknown tool: {}", name);
+            return Ok(self.record_tool_failure(
+                tc,
+                err.clone(),
+                format!("Error: {}", err),
+            ));
+        }
+
+        let args: serde_json::Value =
+            match serde_json::from_str(&tc.function.arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = format!("Failed to parse arguments: {}", e);
+                    return Ok(self.record_tool_failure(
+                        tc,
+                        err.clone(),
+                        format!("Error: {}", err),
+                    ));
+                }
+            };
+
+        if let Some(err) = self.check_permission(tc, &args).await? {
+            return Ok(self.record_tool_failure(
+                tc,
+                err.clone(),
+                format!("Error: {}", err),
+            ));
+        }
+
+        let tools = Arc::clone(&self.cfg.tools);
+        let execution = tokio::select! {
+            output = tools.execute(name, args) => output,
+            _ = wait_for_cancel(&mut self.cancel_rx, &mut self.cancel_open) => {
+                return Err(Terminal::Cancelled);
+            }
+        };
+        match execution {
+            Ok(output) => {
+                self.emit(AgentEvent::ToolCompleted {
+                    id: tc.id.clone(),
+                    name: name.to_string(),
+                    result: output.output.clone(),
+                    changes: output.changes.clone(),
+                    rollback_entries: output.rollback_entries.clone(),
+                });
+                self.history
+                    .push(ChatMessage::tool_result(&tc.id, &output.output));
+                Ok(ToolOutcome::succeeded(tc, name, output.changes))
+            }
+            Err(e) => {
+                let err = format!("{:#}", e);
+                Ok(self.record_tool_failure(
+                    tc,
+                    err.clone(),
+                    format!("Error: {}", err),
+                ))
+            }
+        }
+    }
+
+    /// Apply the tool's permission, asking the user when needed. Returns the
+    /// denial message if the call may not run.
+    async fn check_permission(
+        &mut self,
+        tc: &ToolCall,
+        args: &serde_json::Value,
+    ) -> std::result::Result<Option<String>, Terminal> {
+        let name = &tc.function.name;
+        let perm = self
+            .cfg
+            .permissions
+            .get(name)
+            .copied()
+            .unwrap_or(Permission::Ask);
+        match perm {
+            Permission::Allow => Ok(None),
+            Permission::Deny => Ok(Some(format!(
+                "Permission denied: '{}' is not allowed for this agent",
+                name
+            ))),
+            Permission::Ask => {
+                let (perm_id, response_rx) =
+                    self.permission_broker.register(&tc.id);
+                self.emit(AgentEvent::PermissionRequest {
+                    id: perm_id.clone(),
+                    tool_name: name.clone(),
+                    args: args.clone(),
+                });
+                // A dropped responder (broker entry replaced or cleared)
+                // counts as a denial.
+                let allowed = tokio::select! {
+                    response = response_rx => response.unwrap_or(false),
+                    _ = wait_for_cancel(&mut self.cancel_rx, &mut self.cancel_open) => {
+                        self.permission_broker.forget(&perm_id);
+                        return Err(Terminal::Cancelled);
+                    }
+                };
+                self.emit(AgentEvent::PermissionResolved { id: perm_id });
+                Ok((!allowed).then(|| {
+                    format!("Permission denied by user for tool '{}'", name)
+                }))
+            }
+        }
     }
 }
 
@@ -1524,8 +1576,10 @@ mod tests {
 
     #[test]
     fn test_advertised_tool_defs_excludes_denied_tools() {
-        let tools: Vec<Box<dyn Tool>> =
-            vec![Box::new(NamedTool("read")), Box::new(NamedTool("bash"))];
+        let tools = ToolRegistry::new(vec![
+            Box::new(NamedTool("read")),
+            Box::new(NamedTool("bash")),
+        ]);
         let permissions = std::collections::HashMap::from([
             ("read".to_string(), crate::config::Permission::Allow),
             ("bash".to_string(), crate::config::Permission::Deny),
@@ -1572,11 +1626,11 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
             seen_tools: Arc::clone(&seen_tools),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![
             Box::new(NamedTool("read")),
             Box::new(NamedTool("bash")),
             Box::new(NamedTool("finish_task")),
-        ]);
+        ]));
         let permissions = std::collections::HashMap::from([
             ("read".to_string(), crate::config::Permission::Allow),
             ("bash".to_string(), crate::config::Permission::Deny),
@@ -1587,19 +1641,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 2,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hello".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            2,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -1626,6 +1684,157 @@ mod tests {
     struct ScriptedProvider {
         calls: Arc<Mutex<usize>>,
         responses: Arc<Mutex<std::collections::VecDeque<ChatResult>>>,
+    }
+
+    /// Always fails with a non-retryable provider error.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl LlmProvider for FailingProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+        ) -> Result<ChatResult> {
+            unreachable!("run_loop uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+            sender: tokio::sync::mpsc::UnboundedSender<Result<StreamEvent>>,
+        ) {
+            let _ = sender.send(Err(anyhow::anyhow!(
+                "provider API error (401): invalid api key"
+            )));
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct SlowTool;
+
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: "slow".into(),
+                    description: "slow test tool".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(ToolExecutionResult {
+                output: "slow done".into(),
+                changes: Vec::new(),
+                rollback_entries: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropping_cancel_sender_mid_tool_lets_run_finish() {
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(SlowTool)]));
+        let permissions = std::collections::HashMap::from([(
+            "slow".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_loop(
+            RunConfig {
+                provider: single_tool_call_then_stop("slow"),
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: PermissionBroker::default(),
+            },
+            "hi".into(),
+            Vec::new(),
+        ));
+        loop {
+            if matches!(
+                events_rx.recv().await.unwrap(),
+                Ok(AgentEvent::ToolStarted { .. })
+            ) {
+                break;
+            }
+        }
+        // No cancellation can arrive any more; the run must neither treat
+        // this as a cancel nor spin, and must complete normally.
+        drop(cancel_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), loop_task)
+            .await
+            .expect("run must finish")
+            .unwrap();
+        let mut saw_completed = false;
+        let mut last = None;
+        while let Ok(event) = events_rx.try_recv() {
+            let event = event.unwrap();
+            if matches!(&event, AgentEvent::ToolCompleted { result, .. } if result == "slow done")
+            {
+                saw_completed = true;
+            }
+            last = Some(event);
+        }
+        assert!(saw_completed);
+        assert!(matches!(last, Some(AgentEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_ends_with_failed_on_non_retryable_error() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        run_loop(
+            RunConfig {
+                provider: Arc::new(FailingProvider),
+                tools: Arc::new(ToolRegistry::new(Vec::new())),
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions: std::collections::HashMap::new(),
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: PermissionBroker::default(),
+            },
+            "hi".into(),
+            Vec::new(),
+        )
+        .await;
+        let mut last = None;
+        while let Ok(event) = events_rx.try_recv() {
+            last = Some(event.unwrap());
+        }
+        match last {
+            Some(AgentEvent::Failed { error }) => {
+                assert!(format!("{error:#}").contains("invalid api key"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     struct RetryOnceProvider {
@@ -1847,8 +2056,8 @@ mod tests {
                 ],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
         let permissions = std::collections::HashMap::from([(
             "read".to_string(),
             crate::config::Permission::Allow,
@@ -1858,19 +2067,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 2,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            2,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -1913,8 +2126,8 @@ mod tests {
                 }],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
         let permissions = std::collections::HashMap::from([(
             "read".to_string(),
             crate::config::Permission::Allow,
@@ -1924,19 +2137,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -1972,19 +2189,23 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
             run_loop(
-                provider,
-                Arc::new(Vec::new()),
-                Vec::new(),
+                RunConfig {
+                    provider,
+                    tools: Arc::new(ToolRegistry::new(Vec::new())),
+                    system_layers: Vec::new(),
+                    options: ChatOptions::default(),
+                    permissions: std::collections::HashMap::new(),
+                    max_steps: 2,
+                    working_directory: "/tmp".into(),
+                    role_config: None,
+                },
+                RunChannels {
+                    events_tx,
+                    cancel_rx,
+                    permission_broker: perm_broker,
+                },
                 "hi".into(),
                 Vec::new(),
-                ChatOptions::default(),
-                events_tx,
-                cancel_rx,
-                perm_broker,
-                std::collections::HashMap::new(),
-                2,
-                "/tmp".into(),
-                None,
             ),
         )
         .await
@@ -2050,10 +2271,10 @@ mod tests {
                 ],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![
             Box::new(NamedTool("read")),
             Box::new(NamedTool("finish_task")),
-        ]);
+        ]));
         let permissions = std::collections::HashMap::from([
             ("read".to_string(), crate::config::Permission::Allow),
             ("finish_task".to_string(), crate::config::Permission::Allow),
@@ -2063,19 +2284,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -2134,8 +2359,8 @@ mod tests {
                 ],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
         let permissions = std::collections::HashMap::from([(
             "read".to_string(),
             crate::config::Permission::Allow,
@@ -2145,19 +2370,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -2223,8 +2452,8 @@ mod tests {
                 ],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
         let permissions = std::collections::HashMap::from([(
             "read".to_string(),
             crate::config::Permission::Allow,
@@ -2234,19 +2463,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 1,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            1,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -2278,8 +2511,8 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(LoopingToolProvider {
             calls: Arc::clone(&calls),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
         let permissions = std::collections::HashMap::from([(
             "read".to_string(),
             crate::config::Permission::Allow,
@@ -2290,19 +2523,23 @@ mod tests {
 
         let max_steps = 3usize;
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "go".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            max_steps,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -2353,10 +2590,10 @@ mod tests {
                 }],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![
             Box::new(NamedTool("read")),
             Box::new(NamedTool("finish_task")),
-        ]);
+        ]));
         let permissions = std::collections::HashMap::from([
             ("read".to_string(), crate::config::Permission::Allow),
             ("finish_task".to_string(), crate::config::Permission::Allow),
@@ -2366,19 +2603,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -2440,10 +2681,10 @@ mod tests {
                 ],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![
             Box::new(NamedTool("read")),
             Box::new(NamedTool("finish_task")),
-        ]);
+        ]));
         let permissions = std::collections::HashMap::from([
             ("read".to_string(), crate::config::Permission::Deny),
             ("finish_task".to_string(), crate::config::Permission::Allow),
@@ -2453,19 +2694,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         )
         .await;
 
@@ -2539,8 +2784,8 @@ mod tests {
                 },
             ],
         };
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("read"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
         let permissions = std::collections::HashMap::from([(
             "read".to_string(),
             crate::config::Permission::Allow,
@@ -2550,19 +2795,23 @@ mod tests {
         let perm_broker = PermissionBroker::default();
 
         run_loop(
-            provider_for_loop,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider: provider_for_loop,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: Some(role_config),
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            Some(role_config),
         )
         .await;
 
@@ -2609,8 +2858,8 @@ mod tests {
                 }],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(BlockingTool)]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(BlockingTool)]));
         let permissions = std::collections::HashMap::from([(
             "block".to_string(),
             crate::config::Permission::Allow,
@@ -2619,19 +2868,23 @@ mod tests {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let perm_broker = PermissionBroker::default();
         let loop_task = tokio::spawn(run_loop(
-            provider,
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider,
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: perm_broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            perm_broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         ));
 
         loop {
@@ -2688,8 +2941,8 @@ mod tests {
                 ],
             ))),
         });
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(PanickingTool)]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(PanickingTool)]));
         let permissions = std::collections::HashMap::from([(
             "boom".to_string(),
             crate::config::Permission::Allow,
@@ -2700,19 +2953,23 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             run_loop(
-                provider,
-                tools,
-                Vec::new(),
+                RunConfig {
+                    provider,
+                    tools,
+                    system_layers: Vec::new(),
+                    options: ChatOptions::default(),
+                    permissions,
+                    max_steps: 10,
+                    working_directory: "/tmp".into(),
+                    role_config: None,
+                },
+                RunChannels {
+                    events_tx,
+                    cancel_rx,
+                    permission_broker: perm_broker,
+                },
                 "hi".into(),
                 Vec::new(),
-                ChatOptions::default(),
-                events_tx,
-                cancel_rx,
-                perm_broker,
-                permissions,
-                10,
-                "/tmp".into(),
-                None,
             ),
         )
         .await
@@ -2812,8 +3069,8 @@ mod tests {
         answer_via: PermissionBroker,
         allowed: bool,
     ) -> Vec<AgentEvent> {
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("guarded"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("guarded"))]));
         let permissions = std::collections::HashMap::from([(
             "guarded".to_string(),
             crate::config::Permission::Ask,
@@ -2821,19 +3078,23 @@ mod tests {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let loop_task = tokio::spawn(run_loop(
-            single_tool_call_then_stop("guarded"),
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider: single_tool_call_then_stop("guarded"),
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: broker,
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            broker,
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         ));
         let mut events = Vec::new();
         while let Some(event) = tokio::time::timeout(
@@ -2903,8 +3164,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_during_permission_wait_forgets_request() {
         let broker = PermissionBroker::default();
-        let tools: Arc<Vec<Box<dyn Tool>>> =
-            Arc::new(vec![Box::new(NamedTool("guarded"))]);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("guarded"))]));
         let permissions = std::collections::HashMap::from([(
             "guarded".to_string(),
             crate::config::Permission::Ask,
@@ -2912,19 +3173,23 @@ mod tests {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let loop_task = tokio::spawn(run_loop(
-            single_tool_call_then_stop("guarded"),
-            tools,
-            Vec::new(),
+            RunConfig {
+                provider: single_tool_call_then_stop("guarded"),
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: broker.clone(),
+            },
             "hi".into(),
             Vec::new(),
-            ChatOptions::default(),
-            events_tx,
-            cancel_rx,
-            broker.clone(),
-            permissions,
-            10,
-            "/tmp".into(),
-            None,
         ));
         let perm_id = loop {
             if let Ok(AgentEvent::PermissionRequest { id, .. }) =

@@ -1309,18 +1309,18 @@ fn build_augmented_tools(
     agent_tx: &mpsc::UnboundedSender<Result<agent::AgentEvent>>,
     permission_broker: &agent::PermissionBroker,
     remembered_allow_tools: HashSet<String>,
-) -> Arc<Vec<Box<dyn llm::Tool>>> {
+) -> Arc<llm::ToolRegistry> {
     let mut augmented: Vec<Box<dyn llm::Tool>> =
         llm::builtin_tools(workspace.to_path_buf());
     augmented.push(Box::new(tools::UseSkillTool));
     augmented.push(Box::new(tools::FinishTaskTool));
 
     // Subagent tool set: builtins + use_skill (no subagent tool to prevent recursion).
-    let subagent_tools: Arc<Vec<Box<dyn llm::Tool>>> = {
+    let subagent_tools: Arc<llm::ToolRegistry> = {
         let mut v = llm::builtin_tools(workspace.to_path_buf());
         v.push(Box::new(tools::UseSkillTool));
         v.push(Box::new(tools::FinishTaskTool));
-        Arc::new(v)
+        Arc::new(llm::ToolRegistry::new(v))
     };
 
     augmented.push(Box::new(tools::SubagentTool::new(
@@ -1341,7 +1341,7 @@ fn build_augmented_tools(
             remembered_allow_tools,
         }),
     )));
-    Arc::new(augmented)
+    Arc::new(llm::ToolRegistry::new(augmented))
 }
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -1565,19 +1565,23 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let run_handle = tokio::spawn(
         async move {
             agent::run_loop(
-                prov_spawn,
-                augmented_tools_spawn,
-                ctx.system_layers,
+                agent::RunConfig {
+                    provider: prov_spawn,
+                    tools: augmented_tools_spawn,
+                    system_layers: ctx.system_layers,
+                    options: opts,
+                    permissions: perms,
+                    max_steps,
+                    working_directory: workspace_display,
+                    role_config: ctx.role_loop_config,
+                },
+                agent::RunChannels {
+                    events_tx: agent_tx,
+                    cancel_rx,
+                    permission_broker,
+                },
                 user_msg,
                 history,
-                opts,
-                agent_tx,
-                cancel_rx,
-                permission_broker,
-                perms,
-                max_steps,
-                workspace_display,
-                ctx.role_loop_config,
             )
             .await;
         }
@@ -1751,13 +1755,7 @@ async fn forward_agent_event(
             }
             false
         }
-        Ok(event) => {
-            if let Some(event) = agent_event_to_server_event(event) {
-                record_run_event(state, run_id, event).await;
-            }
-            false
-        }
-        Err(e) => {
+        Ok(agent::AgentEvent::Failed { error: e }) | Err(e) => {
             tracing::error!(
                 run_id = %run_id,
                 error_kind = "agent_stream_error",
@@ -1772,6 +1770,12 @@ async fn forward_agent_event(
             )
             .await;
             true
+        }
+        Ok(event) => {
+            if let Some(event) = agent_event_to_server_event(event) {
+                record_run_event(state, run_id, event).await;
+            }
+            false
         }
     }
 }
@@ -2145,6 +2149,11 @@ fn agent_event_to_server_event(
     use agent::AgentEvent;
     let event = match event {
         AgentEvent::PermissionResolved { .. } => return None,
+        AgentEvent::Failed { error, .. } => {
+            marshaling_protocol::ServerEvent::Error {
+                message: format!("{error:#}"),
+            }
+        }
         AgentEvent::TextDelta(text) => {
             marshaling_protocol::ServerEvent::TextDelta { data: text }
         }
@@ -3069,6 +3078,30 @@ read = "allow"
             assert!(is_terminal_event(&replay[0]));
             assert!(pending.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_forwarder_records_failed_run_as_terminal_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+        let terminal = forward_agent_event(
+            &state,
+            "run_1",
+            &test_save_ctx(dir.path()),
+            Ok(agent::AgentEvent::Failed {
+                error: anyhow::anyhow!("provider API error (401)"),
+            }),
+        )
+        .await;
+        assert!(terminal);
+        let runs = state.runs.lock().await;
+        assert!(runs["run_1"].finished);
+        assert!(matches!(
+            runs["run_1"].events.last(),
+            Some(marshaling_protocol::ServerEvent::Error { message })
+                if message.contains("401")
+        ));
     }
 
     #[tokio::test]

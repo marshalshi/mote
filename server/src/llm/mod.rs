@@ -215,6 +215,8 @@ pub enum StreamEvent {
 /// A single executable tool (read, write, bash, etc.).
 #[async_trait]
 pub trait Tool: Send + Sync {
+    /// The tool's definition. Must not change over the tool's lifetime:
+    /// [`ToolRegistry`] computes it once and caches it.
     fn def(&self) -> ToolDef;
     async fn execute(
         &self,
@@ -249,6 +251,61 @@ pub struct RollbackEntry {
 }
 
 // ── Tool registry ─────────────────────────────────────────
+
+/// An agent's tool set with definitions computed once and name lookup.
+///
+/// Also the single place tools are executed, so cross-cutting behavior
+/// (panic isolation today; output limits and timeouts later) applies to every
+/// tool uniformly.
+pub struct ToolRegistry {
+    tools: Vec<Box<dyn Tool>>,
+    /// `defs[i]` is `tools[i].def()`, in registration order.
+    defs: Vec<ToolDef>,
+    /// Tool name → index; the first tool registered under a name wins.
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl ToolRegistry {
+    pub fn new(tools: Vec<Box<dyn Tool>>) -> Self {
+        let defs: Vec<ToolDef> = tools.iter().map(|tool| tool.def()).collect();
+        let mut index = std::collections::HashMap::new();
+        for (i, def) in defs.iter().enumerate() {
+            index.entry(def.function.name.clone()).or_insert(i);
+        }
+        Self { tools, defs, index }
+    }
+
+    /// Definitions of all tools, in registration order.
+    pub fn defs(&self) -> &[ToolDef] {
+        &self.defs
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    /// Run tool `name`. A panicking tool must not take down the whole run,
+    /// so a panic is caught and returned as an error.
+    pub async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<ToolExecutionResult> {
+        use futures::FutureExt;
+        let Some(&i) = self.index.get(name) else {
+            anyhow::bail!("Unknown tool: {name}");
+        };
+        std::panic::AssertUnwindSafe(self.tools[i].execute(args))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "tool '{name}' panicked: {}",
+                    crate::agent::panic_message(panic.as_ref())
+                ))
+            })
+    }
+}
 
 /// Create the default built-in tool set.
 pub fn builtin_tools(workspace_root: std::path::PathBuf) -> Vec<Box<dyn Tool>> {
@@ -439,5 +496,83 @@ mod tests {
         let u = Usage::default();
         assert_eq!(u.prompt_tokens, 0);
         assert_eq!(u.completion_tokens, 0);
+    }
+
+    struct EchoTool {
+        name: &'static str,
+        output: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            if self.output == "panic" {
+                panic!("echo exploded");
+            }
+            Ok(ToolExecutionResult {
+                output: self.output.into(),
+                changes: Vec::new(),
+                rollback_entries: Vec::new(),
+            })
+        }
+    }
+
+    fn echo(name: &'static str, output: &'static str) -> Box<dyn Tool> {
+        Box::new(EchoTool { name, output })
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_lookup_order_and_duplicates() {
+        let registry = ToolRegistry::new(vec![
+            echo("read", "first"),
+            echo("bash", "b"),
+            echo("read", "second"),
+        ]);
+        let names: Vec<&str> = registry
+            .defs()
+            .iter()
+            .map(|d| d.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["read", "bash", "read"]);
+        assert!(registry.contains("bash"));
+        assert!(!registry.contains("write"));
+        // The first tool registered under a name wins.
+        let out = registry
+            .execute("read", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out.output, "first");
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_execute_errors_for_unknown_and_panicking_tools()
+    {
+        let registry = ToolRegistry::new(vec![echo("boom", "panic")]);
+        let unknown = registry
+            .execute("nope", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(format!("{unknown}").contains("Unknown tool: nope"));
+        let panicked = registry
+            .execute("boom", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        let message = format!("{panicked}");
+        assert!(message.contains("tool 'boom' panicked"), "{message}");
+        assert!(message.contains("echo exploded"), "{message}");
     }
 }

@@ -241,6 +241,10 @@ pub struct ServerConfig {
     /// Agent name used when no agent is specified (default: "build").
     #[serde(default = "default_agent_name")]
     pub default_agent: String,
+    /// Cancel a run whose permission prompt stays unanswered with no client
+    /// attached for this long (default: 600 seconds).
+    #[serde(default = "default_detached_permission_timeout_secs")]
+    pub detached_permission_timeout_secs: u64,
 }
 
 fn default_server_port() -> u16 {
@@ -252,6 +256,9 @@ fn default_max_steps() -> usize {
 fn default_agent_name() -> String {
     marshaling_protocol::DEFAULT_AGENT_NAME.into()
 }
+fn default_detached_permission_timeout_secs() -> u64 {
+    600
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -259,6 +266,8 @@ impl Default for ServerConfig {
             port: default_server_port(),
             max_steps: default_max_steps(),
             default_agent: default_agent_name(),
+            detached_permission_timeout_secs:
+                default_detached_permission_timeout_secs(),
         }
     }
 }

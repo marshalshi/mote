@@ -390,6 +390,8 @@ async fn single_message(
         repo_agents_md: workspace_ctx.repo_agents_md.clone(),
         runtime_session_key: Some(workspace_ctx.runtime_session_key.clone()),
         run_id: None,
+        replay_from: None,
+        client_instance_id: None,
         compaction: None,
     };
     let mut stream = client
@@ -398,6 +400,7 @@ async fn single_message(
         .context("Failed to start chat stream")?;
 
     let mut content = String::new();
+    let mut finished = false;
     while let Some(event) = stream.rx.recv().await {
         match event {
             marshaling_protocol::ServerEvent::TextDelta { data } => {
@@ -407,6 +410,7 @@ async fn single_message(
             marshaling_protocol::ServerEvent::Done { .. }
             | marshaling_protocol::ServerEvent::Cancelled { .. }
             | marshaling_protocol::ServerEvent::NeedsContinuation { .. } => {
+                finished = true;
                 break;
             }
             marshaling_protocol::ServerEvent::Error { message } => {
@@ -415,6 +419,11 @@ async fn single_message(
             }
             _ => {} // ignore tool events, reasoning, etc.
         }
+    }
+    if !finished {
+        let message = "Chat websocket closed before completion";
+        eprintln!("\nError: {message}");
+        return Err(anyhow::anyhow!(message));
     }
     // Ensure final newline
     if !content.ends_with('\n') {

@@ -217,7 +217,7 @@ impl Tool for ReadTool {
         let lines: Vec<&str> = content.lines().collect();
         let start = offset.saturating_sub(1).min(lines.len());
         let end = limit
-            .map(|l| start + l)
+            .map(|l| start.saturating_add(l))
             .unwrap_or(lines.len())
             .min(lines.len());
         Ok(result_no_changes(lines[start..end].join("\n")))
@@ -1085,6 +1085,12 @@ pub struct AgentSubagentRunner {
     pub parent_events_tx: tokio::sync::mpsc::UnboundedSender<
         anyhow::Result<crate::agent::AgentEvent>,
     >,
+    /// The parent run's permission broker. Subagent prompts are forwarded to
+    /// the parent's client and answered through it.
+    pub permission_broker: crate::agent::PermissionBroker,
+    /// Tools the user chose "allow always" for in this session, applied to
+    /// the subagent the same way they are applied to the parent.
+    pub remembered_allow_tools: std::collections::HashSet<String>,
 }
 
 #[async_trait]
@@ -1129,8 +1135,9 @@ impl SubagentRunner for AgentSubagentRunner {
         )
         .await?;
 
-        // Build permission map using the shared helper.
-        // Subagent remaps "ask" → "allow" (no TUI for subagent permission prompts).
+        // Build permission map using the shared helper. "ask" stays "ask":
+        // the prompt is forwarded to the parent's client (see the event
+        // collector below), so subagents never bypass user approval.
         let tool_names: Vec<String> = self
             .tools
             .iter()
@@ -1138,10 +1145,11 @@ impl SubagentRunner for AgentSubagentRunner {
             .collect();
         let mut perms =
             crate::build_permission_map(&self.config, agent_cfg, &tool_names);
-        // Remap Ask → Allow for subagents (no interactive TUI)
-        for perm in perms.values_mut() {
-            if *perm == crate::config::Permission::Ask {
-                *perm = crate::config::Permission::Allow;
+        for tool in &self.remembered_allow_tools {
+            if let Some(perm) = perms.get_mut(tool) {
+                if *perm == crate::config::Permission::Ask {
+                    *perm = crate::config::Permission::Allow;
+                }
             }
         }
 
@@ -1166,11 +1174,11 @@ impl SubagentRunner for AgentSubagentRunner {
             let _ = parent_cancel.changed().await;
             let _ = sub_cancel_tx.send(true);
         });
-        // _perm_tx is intentionally dropped immediately: subagent permissions are
-        // remapped to "allow" or "deny" only (never "ask"), so the permission
-        // channel is never used. If this changes, store _perm_tx and wire it to a
-        // permission forwarding mechanism.
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Generate a unique subagent session ID
+        let sub_id =
+            format!("sub_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"));
+        let permission_broker =
+            self.permission_broker.scoped(&format!("{sub_id}:"));
 
         let user_msg = task.to_string();
         let history: Vec<crate::llm::ChatMessage> = Vec::new();
@@ -1190,7 +1198,7 @@ impl SubagentRunner for AgentSubagentRunner {
                 opts,
                 agent_tx,
                 sub_cancel_rx,
-                perm_rx,
+                permission_broker,
                 perms,
                 crate::agent::DEFAULT_MAX_STEPS,
                 workspace_display,
@@ -1199,9 +1207,6 @@ impl SubagentRunner for AgentSubagentRunner {
             .await;
         });
 
-        // Generate a unique subagent session ID
-        let sub_id =
-            format!("sub_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"));
         let sub_name = agent_name.to_string();
 
         // Signal that a subagent started
@@ -1213,107 +1218,151 @@ impl SubagentRunner for AgentSubagentRunner {
         ));
 
         // Collect the result while forwarding events to the parent.
-        // Subagent has a 5-minute timeout to prevent blocking the parent indefinitely.
+        // Subagent has a 5-minute budget to prevent blocking the parent
+        // indefinitely. Time spent waiting for the user to answer a forwarded
+        // permission prompt does not count against it: the subagent is idle
+        // then, and the parent run's own detached-permission watchdog covers
+        // a user who never answers.
         let mut content = String::new();
         let mut tool_log = String::new();
         let subagent_timeout = std::time::Duration::from_secs(300);
+        let mut deadline = tokio::time::Instant::now() + subagent_timeout;
+        let mut awaiting_permission_since: Option<tokio::time::Instant> = None;
+        let mut timed_out = false;
 
-        let collect_result = tokio::time::timeout(subagent_timeout, async {
-            while let Some(event) = agent_rx.recv().await {
-                match event {
-                    Ok(crate::agent::AgentEvent::Done {
-                        content: c, ..
-                    })
-                    | Ok(crate::agent::AgentEvent::Cancelled {
-                        content: c,
-                        ..
-                    })
-                    | Ok(crate::agent::AgentEvent::NeedsContinuation {
-                        content: c,
-                        ..
-                    }) => {
-                        content = c;
-                        break;
+        loop {
+            let next = match awaiting_permission_since {
+                Some(_) => agent_rx.recv().await,
+                None => {
+                    match tokio::time::timeout_at(deadline, agent_rx.recv())
+                        .await
+                    {
+                        Ok(next) => next,
+                        Err(_) => {
+                            timed_out = true;
+                            break;
+                        }
                     }
-                    Ok(crate::agent::AgentEvent::TextDelta(text)) => {
-                        content.push_str(&text);
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentTextDelta {
-                                id: sub_id.clone(),
-                                data: text,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ReasoningDelta(text)) => {
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentReasoningDelta {
-                                id: sub_id.clone(),
-                                data: text,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ToolStarted {
-                        id: tool_call_id,
-                        name,
-                    }) => {
-                        tool_log.push_str(&format!("\n  [Tool: {}]", name));
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentToolStarted {
-                                id: sub_id.clone(),
-                                sub_id: tool_call_id,
-                                tool_name: name,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ToolCompleted {
-                        id: tool_call_id,
-                        result,
-                        changes,
-                        ..
-                    }) => {
-                        let summary = if result.len() > 100 {
-                            format!(
-                                "{}...",
-                                crate::agent::safe_truncate(&result, 97)
-                            )
-                        } else {
-                            result.clone()
-                        };
-                        tool_log.push_str(&format!(" → {}", summary));
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentToolCompleted {
-                                id: sub_id.clone(),
-                                sub_id: tool_call_id,
-                                result,
-                                changes,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ToolFailed {
-                        id: tool_call_id,
-                        error,
-                    }) => {
-                        tool_log.push_str(&format!(" → FAILED: {}", error));
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentToolFailed {
-                                id: sub_id.clone(),
-                                sub_id: tool_call_id,
-                                error,
-                            },
-                        ));
-                    }
-                    Err(e) => {
-                        content = format!("[Sub-agent error: {:#}]", e);
-                        break;
-                    }
-                    _ => {}
                 }
+            };
+            let Some(event) = next else {
+                break;
+            };
+            // The first event after a prompt is normally `PermissionResolved`
+            // (or `Cancelled`); give the waiting time back to the budget.
+            if let Some(since) = awaiting_permission_since.take() {
+                deadline += since.elapsed();
             }
-        })
-        .await;
+            match event {
+                Ok(crate::agent::AgentEvent::Done { content: c, .. })
+                | Ok(crate::agent::AgentEvent::Cancelled {
+                    content: c, ..
+                })
+                | Ok(crate::agent::AgentEvent::NeedsContinuation {
+                    content: c,
+                    ..
+                }) => {
+                    content = c;
+                    break;
+                }
+                Ok(crate::agent::AgentEvent::TextDelta(text)) => {
+                    content.push_str(&text);
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentTextDelta {
+                            id: sub_id.clone(),
+                            data: text,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ReasoningDelta(text)) => {
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentReasoningDelta {
+                            id: sub_id.clone(),
+                            data: text,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ToolStarted {
+                    id: tool_call_id,
+                    name,
+                }) => {
+                    tool_log.push_str(&format!("\n  [Tool: {}]", name));
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentToolStarted {
+                            id: sub_id.clone(),
+                            sub_id: tool_call_id,
+                            tool_name: name,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ToolCompleted {
+                    id: tool_call_id,
+                    result,
+                    changes,
+                    ..
+                }) => {
+                    let summary = if result.len() > 100 {
+                        format!(
+                            "{}...",
+                            crate::agent::safe_truncate(&result, 97)
+                        )
+                    } else {
+                        result.clone()
+                    };
+                    tool_log.push_str(&format!(" → {}", summary));
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentToolCompleted {
+                            id: sub_id.clone(),
+                            sub_id: tool_call_id,
+                            result,
+                            changes,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ToolFailed {
+                    id: tool_call_id,
+                    error,
+                }) => {
+                    tool_log.push_str(&format!(" → FAILED: {}", error));
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentToolFailed {
+                            id: sub_id.clone(),
+                            sub_id: tool_call_id,
+                            error,
+                        },
+                    ));
+                }
+                // Forward prompts to the parent's client unchanged; the
+                // answer comes back through the shared permission broker.
+                Ok(
+                    event @ crate::agent::AgentEvent::PermissionRequest {
+                        ..
+                    },
+                ) => {
+                    let _ = self.parent_events_tx.send(Ok(event));
+                    awaiting_permission_since =
+                        Some(tokio::time::Instant::now());
+                }
+                // The user answered: only the waiting time was refunded above,
+                // not the approved tool's run time that follows. Forwarded so
+                // the parent run drops the prompt from its pending set.
+                Ok(
+                    event @ crate::agent::AgentEvent::PermissionResolved {
+                        ..
+                    },
+                ) => {
+                    let _ = self.parent_events_tx.send(Ok(event));
+                }
+                Err(e) => {
+                    content = format!("[Sub-agent error: {:#}]", e);
+                    break;
+                }
+                _ => {}
+            }
+        }
 
         // Handle timeout — cancel the subagent if it didn't finish in time
-        if collect_result.is_err() {
+        if timed_out {
             tracing::warn!(
                 "Sub-agent '{}' timed out after {}s",
                 agent_name,
@@ -1383,6 +1432,23 @@ mod tests {
         let args = serde_json::json!({"file_path": "lines.txt", "offset": 2, "limit": 3});
         let result = tool.execute(args).await.unwrap();
         assert_eq!(result.output, "b\nc\nd");
+    }
+
+    #[tokio::test]
+    async fn test_read_with_huge_limit_and_offset_past_eof() {
+        let (_tmp, ws) = tmp_workspace();
+        std::fs::write(ws.join("f.txt"), "a\nb\nc").unwrap();
+        let tool = ReadTool::new(ws);
+        let r = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "offset": 2, "limit": u64::MAX}))
+            .await
+            .unwrap();
+        assert_eq!(r.output, "b\nc");
+        let r = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "offset": 99, "limit": u64::MAX}))
+            .await
+            .unwrap();
+        assert_eq!(r.output, "");
     }
 
     #[tokio::test]

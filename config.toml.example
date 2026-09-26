@@ -46,6 +46,7 @@ default_max_tokens = 65536
 [server]
 port = 9847                    # port to listen on (default: 9847)
 default_agent = "build"        # agent used when no agent is specified
+# detached_permission_timeout_secs = 600  # cancel a run whose permission prompt stays unanswered with no client attached
 
 # --- UI accent colors ---
 [ui]

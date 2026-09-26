@@ -78,29 +78,165 @@ enum RunStatus {
 
 struct ActiveRun {
     runtime_session_key: String,
+    /// Client instance that started this run; at most one unfinished run is
+    /// allowed per instance.
+    client_instance_id: Option<String>,
     events: Vec<marshaling_protocol::ServerEvent>,
     tx: broadcast::Sender<marshaling_protocol::ServerEvent>,
     cancel_tx: watch::Sender<bool>,
-    permission_tx: mpsc::UnboundedSender<(String, bool)>,
-    pending_permission_tools: HashMap<String, String>,
+    permission_broker: agent::PermissionBroker,
+    /// Permission requests that have not been answered yet, by id. Re-sent
+    /// to every newly attached socket as `PermissionPending`.
+    pending_permission_tools: HashMap<String, PendingPermission>,
+    /// Set once a terminal event has been recorded.
+    finished: bool,
+    /// Bumped on every socket attach; lets a detached-permission watchdog
+    /// detect that a client came back in the meantime.
+    attach_generation: u64,
+    /// Attach generation a detached-permission watchdog is already armed
+    /// for, so repeated triggers do not spawn duplicate watchdogs.
+    watchdog_armed_for: Option<u64>,
+}
+
+struct PendingPermission {
+    tool_name: String,
+    args: serde_json::Value,
 }
 
 impl ActiveRun {
     fn new(
         runtime_session_key: String,
+        client_instance_id: Option<String>,
         cancel_tx: watch::Sender<bool>,
-        permission_tx: mpsc::UnboundedSender<(String, bool)>,
+        permission_broker: agent::PermissionBroker,
     ) -> Self {
         let (tx, _) = broadcast::channel(512);
         Self {
             runtime_session_key,
+            client_instance_id,
             events: Vec::new(),
             tx,
             cancel_tx,
-            permission_tx,
+            permission_broker,
             pending_permission_tools: HashMap::new(),
+            finished: false,
+            attach_generation: 0,
+            watchdog_armed_for: None,
         }
     }
+
+    /// No client is attached while the run waits on a permission prompt, so
+    /// nobody can answer it.
+    fn is_detached_awaiting_permission(&self) -> bool {
+        !self.finished
+            && self.tx.receiver_count() == 0
+            && !self.pending_permission_tools.is_empty()
+    }
+
+    /// Register a new subscriber. Returns its live receiver, the log events
+    /// to replay from `replay_from`, and a `PermissionPending` notice for
+    /// every unanswered prompt. Must run under the `runs` lock so the
+    /// snapshot and the subscription line up exactly.
+    fn attach(
+        &mut self,
+        replay_from: usize,
+    ) -> (
+        broadcast::Receiver<marshaling_protocol::ServerEvent>,
+        Vec<marshaling_protocol::ServerEvent>,
+        Vec<marshaling_protocol::ServerEvent>,
+    ) {
+        self.attach_generation += 1;
+        // A finished run gets nothing new on the live stream, so always
+        // replay at least its terminal event (the last one) or the socket
+        // would wait forever.
+        let start = if self.finished {
+            replay_from.min(self.events.len().saturating_sub(1))
+        } else {
+            replay_from
+        };
+        let pending = self
+            .pending_permission_tools
+            .iter()
+            .map(|(id, pending)| {
+                marshaling_protocol::ServerEvent::PermissionPending {
+                    id: id.clone(),
+                    tool_name: pending.tool_name.clone(),
+                    args: pending.args.clone(),
+                }
+            })
+            .collect();
+        (
+            self.tx.subscribe(),
+            self.events.get(start..).unwrap_or_default().to_vec(),
+            pending,
+        )
+    }
+
+    /// If a watchdog is needed and not yet armed for the current attach
+    /// generation, mark it armed and return that generation.
+    fn arm_detached_permission_watchdog(&mut self) -> Option<u64> {
+        let generation = self.attach_generation;
+        if !self.is_detached_awaiting_permission()
+            || self.watchdog_armed_for == Some(generation)
+        {
+            return None;
+        }
+        self.watchdog_armed_for = Some(generation);
+        Some(generation)
+    }
+}
+
+/// Insert `run` unless `client_instance_id` already owns an unfinished run.
+/// Check and insert happen under one lock so two concurrent requests from the
+/// same client cannot both start a run. Returns the busy run id on conflict.
+fn claim_run_slot(
+    runs: &mut HashMap<String, ActiveRun>,
+    run_id: &str,
+    run: ActiveRun,
+) -> std::result::Result<(), String> {
+    if let Some(instance) = run.client_instance_id.as_deref() {
+        if let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
+            !r.finished && r.client_instance_id.as_deref() == Some(instance)
+        }) {
+            return Err(busy_id.clone());
+        }
+    }
+    runs.insert(run_id.to_string(), run);
+    Ok(())
+}
+
+/// Cancel a run that stays detached while waiting on a permission prompt for
+/// longer than the configured timeout; otherwise it would wait forever.
+fn spawn_detached_permission_watchdog(
+    state: &Arc<AppState>,
+    run_id: &str,
+    generation: u64,
+) {
+    let timeout = std::time::Duration::from_secs(
+        state.config.server.detached_permission_timeout_secs,
+    );
+    let state = Arc::clone(state);
+    let run_id = run_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let mut runs = state.runs.lock().await;
+        let Some(run) = runs.get_mut(&run_id) else {
+            return;
+        };
+        if run.watchdog_armed_for == Some(generation) {
+            run.watchdog_armed_for = None;
+        }
+        if run.attach_generation == generation
+            && run.is_detached_awaiting_permission()
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                timeout_secs = timeout.as_secs(),
+                "cancelling run: permission prompt unanswered while detached"
+            );
+            let _ = run.cancel_tx.send(true);
+        }
+    });
 }
 
 // ── HTTP routes ─────────────────────────────────────────
@@ -470,6 +606,8 @@ fn resolve_compact_request_context(
         repo_agents_md: request.repo_agents_md.clone(),
         runtime_session_key: request.runtime_session_key.clone(),
         run_id: None,
+        replay_from: None,
+        client_instance_id: None,
         compaction: None,
     };
     resolve_request_context(&chat_request)
@@ -687,6 +825,10 @@ async fn record_run_event(
     run_id: &str,
     event: marshaling_protocol::ServerEvent,
 ) {
+    debug_assert!(
+        event.is_run_log_event(),
+        "connection-scoped event recorded into run log: {event:?}"
+    );
     let terminal = is_terminal_event(&event);
     if let Some(status) = terminal_status(&event) {
         tracing::info!(run_id, ?status, "agent run reached terminal state");
@@ -699,16 +841,29 @@ async fn record_run_event(
     if let marshaling_protocol::ServerEvent::PermissionRequest {
         id,
         tool_name,
-        ..
+        args,
     } = &event
     {
-        run.pending_permission_tools
-            .insert(id.clone(), tool_name.clone());
+        run.pending_permission_tools.insert(
+            id.clone(),
+            PendingPermission {
+                tool_name: tool_name.clone(),
+                args: args.clone(),
+            },
+        );
+    }
+    if terminal {
+        run.finished = true;
+        run.pending_permission_tools.clear();
     }
 
     run.events.push(event.clone());
     let _ = run.tx.send(event);
+    let watchdog_generation = run.arm_detached_permission_watchdog();
     drop(runs);
+    if let Some(generation) = watchdog_generation {
+        spawn_detached_permission_watchdog(state, run_id, generation);
+    }
 
     if terminal {
         let expired = {
@@ -1152,6 +1307,8 @@ fn build_augmented_tools(
     merged_agents: &HashMap<String, config::AgentConfig>,
     cancel_rx: &tokio::sync::watch::Receiver<bool>,
     agent_tx: &mpsc::UnboundedSender<Result<agent::AgentEvent>>,
+    permission_broker: &agent::PermissionBroker,
+    remembered_allow_tools: HashSet<String>,
 ) -> Arc<Vec<Box<dyn llm::Tool>>> {
     let mut augmented: Vec<Box<dyn llm::Tool>> =
         llm::builtin_tools(workspace.to_path_buf());
@@ -1180,6 +1337,8 @@ fn build_augmented_tools(
             depth: 0,
             max_depth: 3,
             parent_events_tx: agent_tx.clone(),
+            permission_broker: permission_broker.clone(),
+            remembered_allow_tools,
         }),
     )));
     Arc::new(augmented)
@@ -1214,6 +1373,19 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         request.agent,
         request.message.len()
     );
+
+    // Attaching to an existing run needs none of the agent setup below (and
+    // must not fail because of it, e.g. after a /model change mid-run).
+    if let Some(run_id) = request.run_id.clone() {
+        attach_socket_to_run(
+            socket,
+            state,
+            run_id,
+            request.replay_from.unwrap_or(0),
+        )
+        .await;
+        return;
+    }
 
     let req_ctx = match resolve_request_context(&request) {
         Ok(v) => v,
@@ -1286,9 +1458,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             .map(|s| s.remember_allow_tools.clone())
             .unwrap_or_default()
     };
-    for tool in remembered_allows {
-        if perms.get(&tool) == Some(&config::Permission::Ask) {
-            perms.insert(tool, config::Permission::Allow);
+    for tool in &remembered_allows {
+        if perms.get(tool) == Some(&config::Permission::Ask) {
+            perms.insert(tool.clone(), config::Permission::Allow);
         }
     }
 
@@ -1296,19 +1468,45 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // The run is owned by AppState, not by this websocket. Disconnecting this
     // websocket only detaches the subscriber; explicit ClientEvent::Cancel is
     // required to stop the agent.
-    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+    let (agent_tx, agent_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (permission_tx, permission_rx) =
-        mpsc::unbounded_channel::<(String, bool)>();
-    let run_id = request.run_id.clone().unwrap_or_else(new_run_id);
+    let permission_broker = agent::PermissionBroker::default();
+    let run_id = new_run_id();
 
-    if request.run_id.is_some() {
-        let exists = state.runs.lock().await.contains_key(&run_id);
-        if !exists {
-            send_error(&mut socket, format!("Unknown run_id: {run_id}")).await;
+    let client_instance_id = match request.client_instance_id.clone() {
+        Some(id) if !validate_runtime_session_key(&id) => {
+            send_error(&mut socket, "Invalid client_instance_id").await;
             return;
         }
-        attach_socket_to_run(socket, state, run_id).await;
+        other => other,
+    };
+    let claimed = {
+        let mut runs = state.runs.lock().await;
+        claim_run_slot(
+            &mut runs,
+            &run_id,
+            ActiveRun::new(
+                req_ctx.runtime_session_key.clone(),
+                client_instance_id,
+                cancel_tx.clone(),
+                permission_broker.clone(),
+            ),
+        )
+    };
+    if let Err(busy_run_id) = claimed {
+        tracing::info!(
+            busy_run_id = %busy_run_id,
+            "client already has an active run; attaching instead of starting"
+        );
+        let busy = marshaling_protocol::ServerEvent::SessionBusy {
+            run_id: busy_run_id.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&busy) {
+            if socket.send(Message::Text(json.into())).await.is_err() {
+                return;
+            }
+        }
+        attach_socket_to_run(socket, state, busy_run_id, 0).await;
         return;
     }
 
@@ -1321,6 +1519,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         &state.merged_agents,
         &cancel_rx,
         &agent_tx,
+        &permission_broker,
+        remembered_allows,
     );
 
     // Reconstruct conversation history from the client's display messages
@@ -1352,17 +1552,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let workspace_display = req_ctx.workspace_display.clone();
     let compaction_for_save = request.compaction.clone();
 
-    {
-        let mut runs = state.runs.lock().await;
-        runs.insert(
-            run_id.clone(),
-            ActiveRun::new(
-                req_ctx.runtime_session_key.clone(),
-                cancel_tx.clone(),
-                permission_tx.clone(),
-            ),
-        );
-    }
     record_run_event(
         &state,
         &run_id,
@@ -1373,7 +1562,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     .await;
 
     let agent_span = tracing::info_span!("agent_run", run_id = %run_id);
-    tokio::spawn(
+    let run_handle = tokio::spawn(
         async move {
             agent::run_loop(
                 prov_spawn,
@@ -1384,7 +1573,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 opts,
                 agent_tx,
                 cancel_rx,
-                permission_rx,
+                permission_broker,
                 perms,
                 max_steps,
                 workspace_display,
@@ -1395,169 +1584,290 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         .instrument(agent_span),
     );
 
-    let state_for_events = Arc::clone(&state);
-    let run_id_for_events = run_id.clone();
-    let runtime_session_key = req_ctx.runtime_session_key.clone();
-    let history_dir = state.config.history.dir.clone();
-    tokio::spawn(async move {
-        while let Some(agent_event) = agent_rx.recv().await {
-            match agent_event {
-                Ok(agent::AgentEvent::Done {
+    let save_ctx = RunSaveContext {
+        model_id: eff_model_id_save,
+        provider: eff_provider,
+        agent_name,
+        selected_session_id,
+        history_dir: state.config.history.dir.clone(),
+        runtime_session_key: req_ctx.runtime_session_key.clone(),
+        compaction: compaction_for_save,
+    };
+    tokio::spawn(supervise_forwarder(
+        Arc::clone(&state),
+        run_id.clone(),
+        tokio::spawn(forward_agent_events(
+            Arc::clone(&state),
+            run_id.clone(),
+            agent_rx,
+            run_handle,
+            save_ctx,
+        )),
+    ));
+
+    attach_socket_to_run(socket, state, run_id, 0).await;
+}
+
+/// Everything needed to persist a run's history when it reaches a terminal
+/// state.
+struct RunSaveContext {
+    model_id: String,
+    provider: String,
+    agent_name: String,
+    selected_session_id: Option<String>,
+    history_dir: PathBuf,
+    runtime_session_key: String,
+    compaction: Option<marshaling_protocol::CompactionState>,
+}
+
+impl RunSaveContext {
+    fn save(
+        &self,
+        history: Vec<llm::ChatMessage>,
+        tokens_input: u64,
+        tokens_output: u64,
+    ) {
+        // In role mode, model_id and provider hold the orchestrator
+        // (roles[0]) identity — this is intentional canonical metadata for
+        // session lists.
+        save_run_session(
+            history,
+            self.model_id.clone(),
+            self.provider.clone(),
+            self.agent_name.clone(),
+            tokens_input,
+            tokens_output,
+            self.selected_session_id.clone(),
+            self.history_dir.clone(),
+            self.runtime_session_key.clone(),
+            self.compaction.clone(),
+        );
+    }
+}
+
+/// Handle one event from the agent loop. Returns true when the event was
+/// terminal and forwarding should stop.
+async fn forward_agent_event(
+    state: &Arc<AppState>,
+    run_id: &str,
+    save_ctx: &RunSaveContext,
+    agent_event: Result<agent::AgentEvent>,
+) -> bool {
+    match agent_event {
+        Ok(agent::AgentEvent::Done {
+            content,
+            tokens_input,
+            tokens_output,
+            history,
+        }) => {
+            save_ctx.save(history, tokens_input, tokens_output);
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::Done {
                     content,
                     tokens_input,
                     tokens_output,
-                    history,
-                }) => {
-                    // In role mode, eff_model_id_save and eff_provider hold the orchestrator
-                    // (roles[0]) identity — this is intentional canonical metadata for session lists.
-                    save_run_session(
-                        history,
-                        eff_model_id_save.clone(),
-                        eff_provider.clone(),
-                        agent_name.clone(),
-                        tokens_input,
-                        tokens_output,
-                        selected_session_id.clone(),
-                        history_dir.clone(),
-                        runtime_session_key.clone(),
-                        compaction_for_save.clone(),
-                    );
-                    record_run_event(
-                        &state_for_events,
-                        &run_id_for_events,
-                        marshaling_protocol::ServerEvent::Done {
-                            content,
-                            tokens_input,
-                            tokens_output,
-                        },
-                    )
-                    .await;
-                    break;
-                }
-                Ok(agent::AgentEvent::Cancelled {
+                },
+            )
+            .await;
+            true
+        }
+        Ok(agent::AgentEvent::Cancelled {
+            content,
+            tokens_input,
+            tokens_output,
+            history,
+        }) => {
+            save_ctx.save(history, tokens_input, tokens_output);
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::Cancelled {
                     content,
                     tokens_input,
                     tokens_output,
-                    history,
-                }) => {
-                    // In role mode, eff_model_id_save and eff_provider hold the orchestrator
-                    // (roles[0]) identity — this is intentional canonical metadata for session lists.
-                    save_run_session(
-                        history,
-                        eff_model_id_save.clone(),
-                        eff_provider.clone(),
-                        agent_name.clone(),
-                        tokens_input,
-                        tokens_output,
-                        selected_session_id.clone(),
-                        history_dir.clone(),
-                        runtime_session_key.clone(),
-                        compaction_for_save.clone(),
-                    );
-                    record_run_event(
-                        &state_for_events,
-                        &run_id_for_events,
-                        marshaling_protocol::ServerEvent::Cancelled {
-                            content,
-                            tokens_input,
-                            tokens_output,
-                        },
-                    )
-                    .await;
-                    break;
-                }
-                Ok(agent::AgentEvent::NeedsContinuation {
+                },
+            )
+            .await;
+            true
+        }
+        Ok(agent::AgentEvent::NeedsContinuation {
+            content,
+            tokens_input,
+            tokens_output,
+            history,
+        }) => {
+            save_ctx.save(history, tokens_input, tokens_output);
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::NeedsContinuation {
                     content,
                     tokens_input,
                     tokens_output,
-                    history,
-                }) => {
-                    save_run_session(
-                        history,
-                        eff_model_id_save.clone(),
-                        eff_provider.clone(),
-                        agent_name.clone(),
-                        tokens_input,
-                        tokens_output,
-                        selected_session_id.clone(),
-                        history_dir.clone(),
-                        runtime_session_key.clone(),
-                        compaction_for_save.clone(),
-                    );
-                    record_run_event(
-                        &state_for_events,
-                        &run_id_for_events,
-                        marshaling_protocol::ServerEvent::NeedsContinuation {
-                            content,
-                            tokens_input,
-                            tokens_output,
-                        },
-                    )
-                    .await;
-                    break;
-                }
-                Ok(agent::AgentEvent::ToolCompleted {
+                },
+            )
+            .await;
+            true
+        }
+        Ok(agent::AgentEvent::ToolCompleted {
+            id,
+            name,
+            result,
+            changes,
+            rollback_entries,
+        }) => {
+            if !rollback_entries.is_empty() {
+                let mut sessions = state.runtime_states.lock().await;
+                let session_state = sessions
+                    .entry(save_ctx.runtime_session_key.clone())
+                    .or_default();
+                session_state.rollback_journal.push(RollbackChangeSet {
+                    id: id.clone(),
+                    tool_name: name,
+                    entries: rollback_entries,
+                    display_changes: changes.clone(),
+                });
+            }
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::ToolCompleted {
                     id,
-                    name,
                     result,
                     changes,
-                    rollback_entries,
-                }) => {
-                    if !rollback_entries.is_empty() {
-                        let mut sessions =
-                            state_for_events.runtime_states.lock().await;
-                        let session_state = sessions
-                            .entry(runtime_session_key.clone())
-                            .or_default();
-                        session_state.rollback_journal.push(
-                            RollbackChangeSet {
-                                id: id.clone(),
-                                tool_name: name,
-                                entries: rollback_entries,
-                                display_changes: changes.clone(),
-                            },
-                        );
+                },
+            )
+            .await;
+            false
+        }
+        Ok(agent::AgentEvent::PermissionResolved { id }) => {
+            // Covers answers that never reach `handle_client_event_for_run`
+            // (e.g. subagent prompts resolved some other way), so the pending
+            // set only holds prompts that are really still open.
+            if let Some(run) = state.runs.lock().await.get_mut(run_id) {
+                run.pending_permission_tools.remove(&id);
+            }
+            false
+        }
+        Ok(event) => {
+            if let Some(event) = agent_event_to_server_event(event) {
+                record_run_event(state, run_id, event).await;
+            }
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                run_id = %run_id,
+                error_kind = "agent_stream_error",
+                "agent run failed"
+            );
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::Error {
+                    message: format!("{:#}", e),
+                },
+            )
+            .await;
+            true
+        }
+    }
+}
+
+/// Forward agent-loop events into the run's event log until a terminal event.
+///
+/// The run task is supervised as well: if it panics or returns without a
+/// terminal event, an `Error` is recorded so subscribers never wait forever.
+/// Watching the task handle (not only channel closure) matters because other
+/// senders of `agent_rx` (e.g. the subagent tool) may outlive the loop.
+async fn forward_agent_events(
+    state: Arc<AppState>,
+    run_id: String,
+    mut agent_rx: mpsc::UnboundedReceiver<Result<agent::AgentEvent>>,
+    mut run_handle: tokio::task::JoinHandle<()>,
+    save_ctx: RunSaveContext,
+) {
+    let join_result = loop {
+        tokio::select! {
+            agent_event = agent_rx.recv() => {
+                match agent_event {
+                    Some(event) => {
+                        if forward_agent_event(&state, &run_id, &save_ctx, event).await {
+                            return;
+                        }
                     }
-                    record_run_event(
-                        &state_for_events,
-                        &run_id_for_events,
-                        marshaling_protocol::ServerEvent::ToolCompleted {
-                            id,
-                            result,
-                            changes,
-                        },
-                    )
-                    .await;
-                }
-                Ok(event) => {
-                    record_run_event(
-                        &state_for_events,
-                        &run_id_for_events,
-                        agent_event_to_server_event(event),
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        run_id = %run_id_for_events,
-                        error_kind = "agent_stream_error",
-                        "agent run failed"
-                    );
-                    record_run_event(
-                        &state_for_events,
-                        &run_id_for_events,
-                        marshaling_protocol::ServerEvent::Error {
-                            message: format!("{:#}", e),
-                        },
-                    )
-                    .await;
-                    break;
+                    None => break (&mut run_handle).await,
                 }
             }
+            joined = &mut run_handle => break joined,
         }
-    });
+    };
 
-    attach_socket_to_run(socket, state, run_id).await;
+    // The loop task has finished. Events it sent before returning are still
+    // buffered in the channel, so drain them before deciding it ended badly.
+    while let Ok(event) = agent_rx.try_recv() {
+        if forward_agent_event(&state, &run_id, &save_ctx, event).await {
+            return;
+        }
+    }
+
+    let message = match join_result {
+        Ok(()) => "agent run ended without a final result".to_string(),
+        Err(e) if e.is_panic() => format!(
+            "agent run panicked: {}",
+            agent::panic_message(e.into_panic().as_ref())
+        ),
+        Err(e) => format!("agent run ended unexpectedly: {e}"),
+    };
+    tracing::error!(run_id = %run_id, "{message}");
+    record_run_event(
+        &state,
+        &run_id,
+        marshaling_protocol::ServerEvent::Error { message },
+    )
+    .await;
+}
+
+/// If the forwarder task itself dies (e.g. a panic while saving), nothing
+/// would ever mark the run finished: its client instance would be told
+/// "busy" forever and the loop would run on with nobody draining its events.
+/// Stop the loop and record a terminal error instead.
+async fn supervise_forwarder(
+    state: Arc<AppState>,
+    run_id: String,
+    forwarder: tokio::task::JoinHandle<()>,
+) {
+    let Err(e) = forwarder.await else {
+        return;
+    };
+    let message = if e.is_panic() {
+        format!(
+            "agent run event forwarder panicked: {}",
+            agent::panic_message(e.into_panic().as_ref())
+        )
+    } else {
+        format!("agent run event forwarder ended unexpectedly: {e}")
+    };
+    let unfinished = {
+        let runs = state.runs.lock().await;
+        runs.get(&run_id)
+            .filter(|run| !run.finished)
+            .map(|run| {
+                let _ = run.cancel_tx.send(true);
+            })
+            .is_some()
+    };
+    if unfinished {
+        tracing::error!(run_id = %run_id, "{message}");
+        record_run_event(
+            &state,
+            &run_id,
+            marshaling_protocol::ServerEvent::Error { message },
+        )
+        .await;
+    }
 }
 
 fn save_run_session(
@@ -1616,24 +1926,67 @@ fn save_run_session(
     });
 }
 
+/// Attach a websocket to a run: replay its log from `replay_from`, then stream
+/// live events until a terminal event or disconnect.
+///
+/// Subscribing and snapshotting the log happen under one lock, so the replay
+/// and the live stream neither overlap nor leave a gap.
 async fn attach_socket_to_run(
     mut socket: WebSocket,
     state: Arc<AppState>,
     run_id: String,
+    replay_from: usize,
 ) {
-    let (mut rx, replay, runtime_session_key) = {
-        let runs = state.runs.lock().await;
-        let Some(run) = runs.get(&run_id) else {
+    let (rx, replay, pending, runtime_session_key) = {
+        let mut runs = state.runs.lock().await;
+        let Some(run) = runs.get_mut(&run_id) else {
+            drop(runs);
             send_error(&mut socket, format!("Unknown run_id: {run_id}")).await;
             return;
         };
-        (
-            run.tx.subscribe(),
-            run.events.clone(),
-            run.runtime_session_key.clone(),
-        )
+        let (rx, replay, pending) = run.attach(replay_from);
+        (rx, replay, pending, run.runtime_session_key.clone())
     };
 
+    stream_run_to_socket(
+        &mut socket,
+        &state,
+        &run_id,
+        &runtime_session_key,
+        rx,
+        replay,
+        pending,
+    )
+    .await;
+
+    // The subscription is dropped by now; if nobody else is attached while
+    // the run waits on a prompt, arm the watchdog.
+    let watchdog_generation = {
+        let mut runs = state.runs.lock().await;
+        runs.get_mut(&run_id)
+            .and_then(ActiveRun::arm_detached_permission_watchdog)
+    };
+    if let Some(generation) = watchdog_generation {
+        spawn_detached_permission_watchdog(&state, &run_id, generation);
+    }
+
+    let detached = marshaling_protocol::ServerEvent::RunDetached { run_id };
+    if let Ok(json) = serde_json::to_string(&detached) {
+        let _ = socket.send(Message::Text(json.into())).await;
+    }
+}
+
+/// Send the replay, re-announce unanswered prompts, then forward live events
+/// and client messages until a terminal event, lag, or disconnect.
+async fn stream_run_to_socket(
+    socket: &mut WebSocket,
+    state: &Arc<AppState>,
+    run_id: &str,
+    runtime_session_key: &str,
+    mut rx: broadcast::Receiver<marshaling_protocol::ServerEvent>,
+    replay: Vec<marshaling_protocol::ServerEvent>,
+    pending: Vec<marshaling_protocol::ServerEvent>,
+) {
     for event in replay {
         let terminal = is_terminal_event(&event);
         let json = match serde_json::to_string(&event) {
@@ -1652,11 +2005,13 @@ async fn attach_socket_to_run(
     }
 
     let attached = marshaling_protocol::ServerEvent::RunAttached {
-        run_id: run_id.clone(),
+        run_id: run_id.to_string(),
     };
-    if let Ok(json) = serde_json::to_string(&attached) {
-        if socket.send(Message::Text(json.into())).await.is_err() {
-            return;
+    for event in pending.into_iter().chain(std::iter::once(attached)) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            if socket.send(Message::Text(json.into())).await.is_err() {
+                return;
+            }
         }
     }
 
@@ -1674,28 +2029,31 @@ async fn attach_socket_to_run(
                             }
                         };
                         if socket.send(Message::Text(json.into())).await.is_err() {
-                            break;
+                            return;
                         }
                         if terminal {
-                            break;
+                            return;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!("Websocket subscriber lagged by {skipped} run events");
-                        continue;
+                        // Skipping events would silently corrupt the client's
+                        // view. Close instead: the client reattaches with its
+                        // event count and gets an exact replay.
+                        tracing::warn!("Websocket subscriber lagged by {skipped} run events; closing so it can resume");
+                        return;
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
             ws_msg = socket.recv() => {
                 match ws_msg {
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => return,
                     Some(Ok(Message::Text(text))) => {
                         handle_client_event_for_run(
-                            &state,
-                            &run_id,
-                            &runtime_session_key,
-                            &mut socket,
+                            state,
+                            run_id,
+                            runtime_session_key,
+                            socket,
                             &text,
                         )
                         .await;
@@ -1704,11 +2062,6 @@ async fn attach_socket_to_run(
                 }
             }
         }
-    }
-
-    let detached = marshaling_protocol::ServerEvent::RunDetached { run_id };
-    if let Ok(json) = serde_json::to_string(&detached) {
-        let _ = socket.send(Message::Text(json.into())).await;
     }
 }
 
@@ -1731,14 +2084,16 @@ async fn handle_client_event_for_run(
             allowed,
             remember,
         } => {
-            let (permission_tx, remembered_tool) = {
-                let runs = state.runs.lock().await;
-                let Some(run) = runs.get(run_id) else {
+            let (permission_broker, remembered_tool) = {
+                let mut runs = state.runs.lock().await;
+                let Some(run) = runs.get_mut(run_id) else {
                     return;
                 };
                 (
-                    run.permission_tx.clone(),
-                    run.pending_permission_tools.get(&id).cloned(),
+                    run.permission_broker.clone(),
+                    run.pending_permission_tools
+                        .remove(&id)
+                        .map(|pending| pending.tool_name),
                 )
             };
             if remember && allowed {
@@ -1750,7 +2105,9 @@ async fn handle_client_event_for_run(
                     sess.remember_allow_tools.insert(tool_name);
                 }
             }
-            let _ = permission_tx.send((id, allowed));
+            if !permission_broker.resolve(&id, allowed) {
+                debug!("Permission response for {id} had no waiting request");
+            }
         }
         marshaling_protocol::ClientEvent::Cancel => {
             debug!("Client requested cancellation for run {run_id}");
@@ -1780,11 +2137,14 @@ async fn handle_client_event_for_run(
     }
 }
 
+/// Map an agent event to its client-facing form. Returns `None` for internal
+/// bookkeeping events that clients never see.
 fn agent_event_to_server_event(
     event: agent::AgentEvent,
-) -> marshaling_protocol::ServerEvent {
+) -> Option<marshaling_protocol::ServerEvent> {
     use agent::AgentEvent;
-    match event {
+    let event = match event {
+        AgentEvent::PermissionResolved { .. } => return None,
         AgentEvent::TextDelta(text) => {
             marshaling_protocol::ServerEvent::TextDelta { data: text }
         }
@@ -1897,7 +2257,8 @@ fn agent_event_to_server_event(
             tokens_input,
             tokens_output,
         },
-    }
+    };
+    Some(event)
 }
 
 fn hash64(content: &str) -> u64 {
@@ -2487,6 +2848,400 @@ read = "allow"
         apply_selected_session_id(&mut sess, None);
         assert_eq!(sess.id, "sess-picked");
         assert_ne!(sess.id, original);
+    }
+
+    fn empty_test_state(dir: &std::path::Path) -> Arc<AppState> {
+        Arc::new(AppState {
+            config: test_config(dir.join("history")),
+            auth: RwLock::new(auth::Auth::default()),
+            merged_agents: HashMap::new(),
+            runtime_states: tokio::sync::Mutex::new(HashMap::new()),
+            runs: tokio::sync::Mutex::new(HashMap::new()),
+            completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+        })
+    }
+
+    fn test_save_ctx(dir: &std::path::Path) -> RunSaveContext {
+        RunSaveContext {
+            model_id: "m".into(),
+            provider: "p".into(),
+            agent_name: "build".into(),
+            selected_session_id: None,
+            history_dir: dir.join("history"),
+            runtime_session_key: "sess".into(),
+            compaction: None,
+        }
+    }
+
+    fn test_run(
+        client_instance_id: Option<&str>,
+    ) -> (ActiveRun, watch::Receiver<bool>) {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        (
+            ActiveRun::new(
+                "sess".into(),
+                client_instance_id.map(str::to_string),
+                cancel_tx,
+                agent::PermissionBroker::default(),
+            ),
+            cancel_rx,
+        )
+    }
+
+    async fn insert_test_run(
+        state: &Arc<AppState>,
+        run_id: &str,
+    ) -> watch::Receiver<bool> {
+        let (run, cancel_rx) = test_run(None);
+        state.runs.lock().await.insert(run_id.to_string(), run);
+        cancel_rx
+    }
+
+    #[test]
+    fn test_claim_run_slot_rejects_second_run_for_same_client_instance() {
+        let mut runs = HashMap::new();
+        assert!(
+            claim_run_slot(&mut runs, "run_1", test_run(Some("tui-a")).0)
+                .is_ok()
+        );
+        assert_eq!(
+            claim_run_slot(&mut runs, "run_2", test_run(Some("tui-a")).0),
+            Err("run_1".to_string())
+        );
+        assert!(!runs.contains_key("run_2"));
+        // Other instances and requests without an instance id are unaffected.
+        assert!(
+            claim_run_slot(&mut runs, "run_3", test_run(Some("tui-b")).0)
+                .is_ok()
+        );
+        assert!(claim_run_slot(&mut runs, "run_4", test_run(None).0).is_ok());
+        assert!(claim_run_slot(&mut runs, "run_5", test_run(None).0).is_ok());
+    }
+
+    #[test]
+    fn test_claim_run_slot_allows_new_run_after_previous_finished() {
+        let mut runs = HashMap::new();
+        claim_run_slot(&mut runs, "run_1", test_run(Some("tui-a")).0).unwrap();
+        runs.get_mut("run_1").unwrap().finished = true;
+        assert!(
+            claim_run_slot(&mut runs, "run_2", test_run(Some("tui-a")).0)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_run_event_marks_finished_and_clears_pending_permissions()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+        // Keep a subscriber so no detached watchdog is armed.
+        let _sub = state.runs.lock().await["run_1"].tx.subscribe();
+        record_run_event(
+            &state,
+            "run_1",
+            marshaling_protocol::ServerEvent::PermissionRequest {
+                id: "perm_1".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert_eq!(
+            state.runs.lock().await["run_1"]
+                .pending_permission_tools
+                .len(),
+            1
+        );
+        record_run_event(
+            &state,
+            "run_1",
+            marshaling_protocol::ServerEvent::Cancelled {
+                content: String::new(),
+                tokens_input: 0,
+                tokens_output: 0,
+            },
+        )
+        .await;
+        let runs = state.runs.lock().await;
+        assert!(runs["run_1"].finished);
+        assert!(runs["run_1"].pending_permission_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_detached_permission_request_cancels_run_after_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("history"));
+        config.server.detached_permission_timeout_secs = 0;
+        let state = Arc::new(AppState {
+            config,
+            auth: RwLock::new(auth::Auth::default()),
+            merged_agents: HashMap::new(),
+            runtime_states: tokio::sync::Mutex::new(HashMap::new()),
+            runs: tokio::sync::Mutex::new(HashMap::new()),
+            completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+        });
+        let mut cancel_rx = insert_test_run(&state, "run_1").await;
+        record_run_event(
+            &state,
+            "run_1",
+            marshaling_protocol::ServerEvent::PermissionRequest {
+                id: "perm_1".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({}),
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cancel_rx.changed(),
+        )
+        .await
+        .expect("watchdog should cancel the detached run")
+        .unwrap();
+        assert!(*cancel_rx.borrow());
+    }
+
+    fn permission_request(id: &str) -> marshaling_protocol::ServerEvent {
+        marshaling_protocol::ServerEvent::PermissionRequest {
+            id: id.into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attach_replays_from_offset_and_reannounces_pending_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+        let _sub = state.runs.lock().await["run_1"].tx.subscribe();
+        for event in [
+            marshaling_protocol::ServerEvent::RunStarted {
+                run_id: "run_1".into(),
+            },
+            marshaling_protocol::ServerEvent::TextDelta { data: "a".into() },
+            permission_request("perm_0_c"),
+        ] {
+            record_run_event(&state, "run_1", event).await;
+        }
+
+        let mut runs = state.runs.lock().await;
+        let run = runs.get_mut("run_1").unwrap();
+        let (_rx, replay, pending) = run.attach(3);
+        assert!(replay.is_empty(), "client already has all 3 events");
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            marshaling_protocol::ServerEvent::PermissionPending { id, tool_name, args }
+                if id == "perm_0_c" && tool_name == "bash" && args["command"] == "ls"
+        ));
+        let (_rx, replay, _) = run.attach(1);
+        assert_eq!(replay.len(), 2);
+        assert!(!pending[0].is_run_log_event());
+        assert_eq!(run.attach_generation, 2);
+    }
+
+    #[tokio::test]
+    async fn test_attach_to_finished_run_always_replays_terminal_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+        record_run_event(
+            &state,
+            "run_1",
+            marshaling_protocol::ServerEvent::TextDelta { data: "a".into() },
+        )
+        .await;
+        record_run_event(
+            &state,
+            "run_1",
+            marshaling_protocol::ServerEvent::Error {
+                message: "boom".into(),
+            },
+        )
+        .await;
+        let mut runs = state.runs.lock().await;
+        let run = runs.get_mut("run_1").unwrap();
+        for replay_from in [2, 5] {
+            let (_rx, replay, pending) = run.attach(replay_from);
+            assert_eq!(replay.len(), 1);
+            assert!(is_terminal_event(&replay[0]));
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_permission_resolved_clears_pending_and_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+        let _sub = state.runs.lock().await["run_1"].tx.subscribe();
+        record_run_event(&state, "run_1", permission_request("perm_0_c")).await;
+        let save_ctx = test_save_ctx(dir.path());
+        let terminal = forward_agent_event(
+            &state,
+            "run_1",
+            &save_ctx,
+            Ok(agent::AgentEvent::PermissionResolved {
+                id: "perm_0_c".into(),
+            }),
+        )
+        .await;
+        assert!(!terminal);
+        let runs = state.runs.lock().await;
+        assert!(runs["run_1"].pending_permission_tools.is_empty());
+        assert_eq!(runs["run_1"].events.len(), 1, "internal event not logged");
+    }
+
+    #[test]
+    fn test_detached_watchdog_is_armed_once_per_generation() {
+        let (mut run, _cancel_rx) = test_run(None);
+        run.pending_permission_tools.insert(
+            "perm_0_c".into(),
+            PendingPermission {
+                tool_name: "bash".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        assert_eq!(run.arm_detached_permission_watchdog(), Some(0));
+        assert_eq!(run.arm_detached_permission_watchdog(), None);
+        run.attach_generation = 1;
+        assert_eq!(run.arm_detached_permission_watchdog(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_forwarder_panic_cancels_run_and_records_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let mut cancel_rx = insert_test_run(&state, "run_1").await;
+        let forwarder = tokio::spawn(async {
+            panic!("save exploded");
+        });
+        supervise_forwarder(Arc::clone(&state), "run_1".into(), forwarder)
+            .await;
+        assert!(cancel_rx.has_changed().unwrap());
+        assert!(*cancel_rx.borrow_and_update());
+        let runs = state.runs.lock().await;
+        assert!(runs["run_1"].finished);
+        assert!(matches!(
+            runs["run_1"].events.last(),
+            Some(marshaling_protocol::ServerEvent::Error { message })
+                if message.contains("save exploded")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_detached_watchdog_skips_run_that_was_reattached() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("history"));
+        config.server.detached_permission_timeout_secs = 0;
+        let state = Arc::new(AppState {
+            config,
+            auth: RwLock::new(auth::Auth::default()),
+            merged_agents: HashMap::new(),
+            runtime_states: tokio::sync::Mutex::new(HashMap::new()),
+            runs: tokio::sync::Mutex::new(HashMap::new()),
+            completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+        });
+        let cancel_rx = insert_test_run(&state, "run_1").await;
+        {
+            let mut runs = state.runs.lock().await;
+            let run = runs.get_mut("run_1").unwrap();
+            run.pending_permission_tools.insert(
+                "perm_1".into(),
+                PendingPermission {
+                    tool_name: "bash".into(),
+                    args: serde_json::json!({}),
+                },
+            );
+            // A client attached after the watchdog for generation 0 was armed.
+            run.attach_generation = 1;
+        }
+        spawn_detached_permission_watchdog(&state, "run_1", 0);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!*cancel_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn test_forwarder_records_error_when_run_task_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+
+        // Keep an extra sender alive (like the subagent tool's clone) so the
+        // channel never closes; the forwarder must notice via the handle.
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
+        let _extra_sender = agent_tx.clone();
+        let run_handle = tokio::spawn(async move {
+            let _ =
+                agent_tx.send(Ok(agent::AgentEvent::TextDelta("hi".into())));
+            panic!("loop exploded");
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            forward_agent_events(
+                Arc::clone(&state),
+                "run_1".into(),
+                agent_rx,
+                run_handle,
+                test_save_ctx(dir.path()),
+            ),
+        )
+        .await
+        .expect("forwarder must stop once the run task dies");
+
+        let runs = state.runs.lock().await;
+        let events = &runs["run_1"].events;
+        assert!(matches!(
+            events.first(),
+            Some(marshaling_protocol::ServerEvent::TextDelta { .. })
+        ));
+        match events.last() {
+            Some(marshaling_protocol::ServerEvent::Error { message }) => {
+                assert!(message.contains("loop exploded"), "{message}");
+            }
+            other => panic!("expected terminal Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forwarder_drains_terminal_event_sent_before_task_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
+        let _extra_sender = agent_tx.clone();
+        let run_handle = tokio::spawn(async move {
+            let _ = agent_tx.send(Ok(agent::AgentEvent::Cancelled {
+                content: "(cancelled)".into(),
+                tokens_input: 0,
+                tokens_output: 0,
+                history: Vec::new(),
+            }));
+        });
+        // Let the task finish before the forwarder polls, so the handle can
+        // win the race against the buffered terminal event.
+        tokio::task::yield_now().await;
+
+        forward_agent_events(
+            Arc::clone(&state),
+            "run_1".into(),
+            agent_rx,
+            run_handle,
+            test_save_ctx(dir.path()),
+        )
+        .await;
+
+        let runs = state.runs.lock().await;
+        let events = &runs["run_1"].events;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            marshaling_protocol::ServerEvent::Cancelled { .. }
+        ));
     }
 
     #[tokio::test]

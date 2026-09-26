@@ -21,6 +21,33 @@ use crate::client::{AudioTranscriptionStream, ChatStream, MoteClient};
 
 enum BackgroundEvent {
     CompactFinished(anyhow::Result<marshaling_protocol::CompactResponse>),
+    /// Result of one attempt to reattach to an in-flight run.
+    Reattached {
+        run_id: String,
+        /// Reattach cycle this attempt belongs to; results from an earlier,
+        /// abandoned cycle carry a stale `replay_from` and are dropped.
+        generation: u64,
+        result: anyhow::Result<ChatStream>,
+    },
+}
+
+/// Delay before each reattach attempt after the run's websocket drops. The
+/// server keeps the run alive, so these only need to cover short outages.
+const REATTACH_DELAYS_MS: [u64; 6] = [0, 500, 1_000, 2_000, 4_000, 8_000];
+/// Upper bound for one reattach attempt, so a server that accepts TCP but
+/// never finishes the handshake cannot stall reconnection.
+const REATTACH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REATTACH_STATUS: &str =
+    "reconnecting to run… (Ctrl+C twice to stop waiting)";
+
+fn is_terminal_server_event(event: &marshaling_protocol::ServerEvent) -> bool {
+    matches!(
+        event,
+        marshaling_protocol::ServerEvent::Done { .. }
+            | marshaling_protocol::ServerEvent::Cancelled { .. }
+            | marshaling_protocol::ServerEvent::NeedsContinuation { .. }
+            | marshaling_protocol::ServerEvent::Error { .. }
+    )
 }
 
 /// Run the TUI event loop. Returns when the user quits.
@@ -48,6 +75,10 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
     // Agent / WS chat channels
     let mut chat_stream: Option<ChatStream> = None;
+    // Index of the next reattach attempt while the run's websocket is down.
+    let mut reattach_attempt: Option<usize> = None;
+    // Bumped each time a reattach cycle starts.
+    let mut reattach_generation: u64 = 0;
     let mut audio_stream: Option<AudioTranscriptionStream> = None;
     let mut audio_capture: Option<AudioCapture> = None;
     let (background_tx, mut background_rx) =
@@ -94,35 +125,44 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                 }
                 server_event = stream.rx.recv() => {
                     match server_event {
-                        Some(event) => handle_server_event(&mut app, event, &mut chat_stream),
+                        Some(event) => {
+                            if app.discarding_run {
+                                if event.is_run_log_event() && is_terminal_server_event(&event) {
+                                    app.finish_discarded_run();
+                                    chat_stream = None;
+                                }
+                            } else if app.accept_run_log_event(&event) {
+                                handle_server_event(&mut app, event, &mut chat_stream);
+                            }
+                        }
                         None => {
-                            if let Some(run_id) = app.active_run_id.clone() {
-                                match client.chat_stream(build_attach_request(&app, run_id)).await {
-                                    Ok(new_stream) => {
-                                        *stream = new_stream;
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        app.server_health = ServerHealth::Disconnected(format!(
-                                            "stream reconnect failed: {e}"
-                                        ));
-                                    }
+                            // The websocket dropped before a terminal event.
+                            // The server keeps the run alive, so reattach in
+                            // the background instead of failing the turn.
+                            chat_stream = None;
+                            match app.active_run_id.clone() {
+                                Some(run_id) => {
+                                    app.server_health = ServerHealth::Disconnected(
+                                        REATTACH_STATUS.into(),
+                                    );
+                                    reattach_attempt = Some(0);
+                                    reattach_generation += 1;
+                                    schedule_reattach(
+                                        client,
+                                        &app,
+                                        run_id,
+                                        0,
+                                        reattach_generation,
+                                        &background_tx,
+                                    );
+                                }
+                                None => {
+                                    app.connection_lost(
+                                        "Chat websocket closed before the run started",
+                                    );
                                 }
                             }
-                            app.pending_permission = None;
-                            // Flush any buffered content before going idle
-                            if !app.stream_buffer.is_empty() {
-                                let text = std::mem::take(&mut app.stream_buffer);
-                                app.messages.push(self::state::DisplayMessage {
-                                    role: crate::llm::Role::Assistant,
-                                    content: text,
-                                    thinking: None,
-                                    source: self::state::MessageSource::Conversation,
-                                });
-                                app.touch_response_render();
-                            }
-                            chat_stream = None;
-                            app.state = AppState::Idle;
+                            app.touch_response_render();
                         }
                     }
                 }
@@ -145,7 +185,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                 }, if audio_stream.is_some() => {
                     handle_audio_event(&mut app, audio_event, &mut audio_stream, &mut audio_capture);
                 }
-                _ = health_interval.tick() => {
+                _ = health_interval.tick(), if reattach_attempt.is_none() => {
                     let healthy = client.health().await;
                     app.server_health = if healthy {
                         ServerHealth::Connected
@@ -158,8 +198,25 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     }
                 }
                 background = background_rx.recv() => {
-                    if let Some(event) = background {
-                        handle_background_event(&mut app, event);
+                    match background {
+                        Some(BackgroundEvent::Reattached { run_id, generation, result }) => {
+                            // Results from an earlier, abandoned reattach
+                            // cycle carry a stale replay offset.
+                            if generation == reattach_generation {
+                                handle_reattach_result(
+                                    client,
+                                    &mut app,
+                                    run_id,
+                                    generation,
+                                    result,
+                                    &mut chat_stream,
+                                    &mut reattach_attempt,
+                                    &background_tx,
+                                );
+                            }
+                        }
+                        Some(event) => handle_background_event(&mut app, event),
+                        None => {}
                     }
                 }
             }
@@ -387,10 +444,24 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
             app.touch_response_render();
         }
 
-        // Send pending permission response if any
-        if let Some((id, allowed, remember)) =
-            app.pending_permission_response.take()
+        // Ctrl+C pressed again while a cancel is stuck waiting for the
+        // connection: stop reconnecting and give control back to the user.
+        if std::mem::take(&mut app.stop_reattach_requested)
+            && reattach_attempt.take().is_some()
         {
+            app.connection_lost(
+                "Stopped reconnecting. The run may still be active on the server.",
+            );
+        }
+
+        // Send pending permission response if any. While reattaching, keep it
+        // queued so it is delivered once the run's websocket is back.
+        if let Some((id, allowed, remember)) = app
+            .pending_permission_response
+            .take_if(|_| reattach_attempt.is_none() || chat_stream.is_some())
+        {
+            app.answered_permissions
+                .insert(id.clone(), (allowed, remember));
             if let Some(ref mut stream) = chat_stream {
                 let resp =
                     marshaling_protocol::ClientEvent::PermissionResponse {
@@ -405,8 +476,11 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
             }
         }
 
-        // Send cancel signal if user pressed Escape/CancelAgent during streaming
-        if app.pending_cancel {
+        // Send cancel signal if user pressed Escape/CancelAgent during streaming.
+        // While reattaching, keep it pending until the websocket is back.
+        if app.pending_cancel
+            && (reattach_attempt.is_none() || chat_stream.is_some())
+        {
             app.pending_cancel = false;
             if let Some(ref mut stream) = chat_stream {
                 let cancel_event = marshaling_protocol::ClientEvent::Cancel;
@@ -456,6 +530,7 @@ async fn start_chat(
     };
 
     app.pending_auto_compact_send = false;
+    app.prepare_new_run();
     app.start_agent();
 
     let request = build_chat_request(app, user_msg.clone());
@@ -523,6 +598,101 @@ fn start_compaction(
     });
 }
 
+/// Try to reattach to `run_id` after the delay for `attempt`, reporting the
+/// outcome as a `BackgroundEvent::Reattached`. Runs in the background so the
+/// UI stays responsive during the outage.
+fn schedule_reattach(
+    client: &MoteClient,
+    app: &App,
+    run_id: String,
+    attempt: usize,
+    generation: u64,
+    background_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
+) {
+    let delay = Duration::from_millis(
+        REATTACH_DELAYS_MS
+            .get(attempt)
+            .copied()
+            .unwrap_or(REATTACH_DELAYS_MS[REATTACH_DELAYS_MS.len() - 1]),
+    );
+    let request = build_attach_request(app, run_id.clone());
+    let client = client.clone();
+    let tx = background_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let result = tokio::time::timeout(
+            REATTACH_CONNECT_TIMEOUT,
+            client.chat_stream(request),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("reattach timed out")));
+        let _ = tx.send(BackgroundEvent::Reattached {
+            run_id,
+            generation,
+            result,
+        });
+    });
+}
+
+fn handle_reattach_result(
+    client: &MoteClient,
+    app: &mut App,
+    run_id: String,
+    generation: u64,
+    result: anyhow::Result<ChatStream>,
+    chat_stream: &mut Option<ChatStream>,
+    reattach_attempt: &mut Option<usize>,
+    background_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
+) {
+    // Ignore stale results: the user may have started over (e.g. /new) or
+    // the run may already be settled while this attempt was in flight.
+    let Some(attempt) = *reattach_attempt else {
+        return;
+    };
+    match app.active_run_id.as_deref() {
+        // The run was abandoned (e.g. /new) or a stream already exists:
+        // there is nothing left to reattach to.
+        _ if chat_stream.is_some() => {
+            *reattach_attempt = None;
+            return;
+        }
+        None => {
+            *reattach_attempt = None;
+            return;
+        }
+        // A late result for some other run; the current run's own attempt
+        // is still in flight.
+        Some(current) if current != run_id => return,
+        Some(_) => {}
+    }
+    match result {
+        Ok(stream) => {
+            *reattach_attempt = None;
+            app.server_health = ServerHealth::Connected;
+            *chat_stream = Some(stream);
+        }
+        Err(e) if attempt + 1 < REATTACH_DELAYS_MS.len() => {
+            tracing::warn!(attempt, "reattach to run {run_id} failed: {e:#}");
+            *reattach_attempt = Some(attempt + 1);
+            schedule_reattach(
+                client,
+                app,
+                run_id,
+                attempt + 1,
+                generation,
+                background_tx,
+            );
+        }
+        Err(e) => {
+            *reattach_attempt = None;
+            app.server_health = ServerHealth::Disconnected(format!("{e:#}"));
+            app.connection_lost(&format!(
+                "Lost connection to the running agent ({e:#}). It may still be running on the server."
+            ));
+        }
+    }
+}
+
 fn handle_background_event(app: &mut App, event: BackgroundEvent) {
     match event {
         BackgroundEvent::CompactFinished(result) => {
@@ -546,6 +716,9 @@ fn handle_background_event(app: &mut App, event: BackgroundEvent) {
                     app.touch_response_render();
                 }
             }
+        }
+        BackgroundEvent::Reattached { .. } => {
+            // Routed to `handle_reattach_result` by the event loop.
         }
     }
 }
@@ -574,6 +747,8 @@ fn build_chat_request(
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
         run_id: None,
+        replay_from: None,
+        client_instance_id: Some(app.client_instance_id.clone()),
         compaction: app.compaction_state.clone(),
     }
 }
@@ -595,6 +770,8 @@ fn build_attach_request(
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
         run_id: Some(run_id),
+        replay_from: Some(app.run_event_count),
+        client_instance_id: Some(app.client_instance_id.clone()),
         compaction: app.compaction_state.clone(),
     }
 }
@@ -607,11 +784,18 @@ fn handle_server_event(
 ) {
     use marshaling_protocol::ServerEvent;
     match event {
-        ServerEvent::RunStarted { run_id }
-        | ServerEvent::RunAttached { run_id } => {
+        ServerEvent::RunStarted { run_id } => {
+            app.lost_run = None;
+            app.active_run_id = Some(run_id);
+        }
+        ServerEvent::RunAttached { run_id } => {
             app.active_run_id = Some(run_id);
         }
         ServerEvent::RunDetached { .. } => {}
+        ServerEvent::SessionBusy { run_id } => {
+            app.handle_session_busy(run_id);
+            app.touch_response_render();
+        }
         ServerEvent::TextDelta { data } => {
             app.agent_text_delta(&data);
             app.loading_progress = Some(0.5);
@@ -643,18 +827,14 @@ fn handle_server_event(
             tool_name,
             args,
         } => {
-            // If user previously chose "Allow Always" for this tool, auto-allow
-            if app.auto_allowed_tools.contains(&tool_name) {
-                app.pending_permission_response = Some((id, true, true));
-            } else {
-                app.pending_permission = Some(self::state::PendingPermission {
-                    id,
-                    tool_name,
-                    args: args.to_string(),
-                    confirming_always: false,
-                });
-                app.touch_response_render();
-            }
+            app.show_permission_request(id, tool_name, &args);
+        }
+        ServerEvent::PermissionPending {
+            id,
+            tool_name,
+            args,
+        } => {
+            app.show_pending_permission(id, tool_name, &args);
         }
         ServerEvent::SkillsLoaded { .. } => {
             // Skills loaded silently — no user-facing message.
@@ -829,6 +1009,7 @@ fn handle_server_event(
             app.touch_response_render();
         }
         ServerEvent::Error { message } => {
+            app.active_run_id = None;
             app.pending_permission = None;
             app.clear_esc_cancel_arm();
             app.clear_pending_command_overrides();
@@ -1231,7 +1412,12 @@ fn handle_action(
     // During agent running, Ctrl+C cancels immediately and Esc requires a double-tap
     match action {
         Some(Action::Quit) if app.state == AppState::AgentRunning => {
-            // Ctrl+C cancels immediately while running.
+            // Ctrl+C cancels immediately while running. A cancel that is
+            // still pending could not be delivered (reconnecting), so a
+            // second press asks to stop waiting instead.
+            if app.pending_cancel {
+                app.stop_reattach_requested = true;
+            }
             app.pending_cancel = true;
             app.clear_esc_cancel_arm();
             return;
@@ -2188,5 +2374,356 @@ mod tests {
             ],
         );
         assert_eq!(action, Some(PermissionMouseAction::AllowAlways));
+    }
+
+    fn reattach_test_app() -> App {
+        let cfg = test_ui_config();
+        App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        )
+    }
+
+    fn text_delta(data: &str) -> marshaling_protocol::ServerEvent {
+        marshaling_protocol::ServerEvent::TextDelta { data: data.into() }
+    }
+
+    #[test]
+    fn test_accept_run_log_event_counts_only_run_log_events() {
+        use marshaling_protocol::ServerEvent;
+        let mut app = reattach_test_app();
+        assert!(app.accept_run_log_event(&ServerEvent::RunStarted {
+            run_id: "run_1".into()
+        }));
+        assert!(app.accept_run_log_event(&text_delta("a")));
+        assert!(app.accept_run_log_event(&ServerEvent::RunAttached {
+            run_id: "run_1".into()
+        }));
+        assert!(app.accept_run_log_event(&ServerEvent::RollbackResult {
+            success: true,
+            message: String::new(),
+            changes: Vec::new(),
+        }));
+        assert_eq!(app.run_event_count, 2);
+
+        // A new run restarts the count.
+        assert!(app.accept_run_log_event(&ServerEvent::RunStarted {
+            run_id: "run_2".into()
+        }));
+        assert_eq!(app.run_event_count, 1);
+    }
+
+    #[test]
+    fn test_accept_run_log_event_skips_already_applied_replay() {
+        use marshaling_protocol::ServerEvent;
+        let mut app = reattach_test_app();
+        app.skip_run_log_events = 2;
+        assert!(!app.accept_run_log_event(&ServerEvent::RunStarted {
+            run_id: "run_1".into()
+        }));
+        assert!(!app.accept_run_log_event(&text_delta("a")));
+        assert!(app.accept_run_log_event(&text_delta("b")));
+        assert_eq!(app.run_event_count, 3);
+        assert_eq!(app.skip_run_log_events, 0);
+    }
+
+    #[test]
+    fn test_build_attach_request_resumes_from_event_count() {
+        let mut app = reattach_test_app();
+        app.run_event_count = 7;
+        let req = build_attach_request(&app, "run_1".into());
+        assert_eq!(req.run_id.as_deref(), Some("run_1"));
+        assert_eq!(req.replay_from, Some(7));
+        assert_eq!(
+            req.client_instance_id.as_deref(),
+            Some(app.client_instance_id.as_str())
+        );
+        let chat = build_chat_request(&app, "hi".into());
+        assert_eq!(chat.replay_from, None);
+        assert_eq!(chat.client_instance_id, req.client_instance_id);
+    }
+
+    #[test]
+    fn test_session_busy_restores_message_and_attaches() {
+        let mut app = reattach_test_app();
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "second message".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+        app.start_agent();
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::SessionBusy {
+                run_id: "run_other".into(),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.input, "second message");
+        assert_eq!(app.input_cursor, app.input.len());
+        assert!(app.pending_user_message_content().is_none());
+        assert_eq!(app.active_run_id.as_deref(), Some("run_other"));
+        assert_eq!(app.skip_run_log_events, 0);
+        assert_eq!(app.state, AppState::AgentRunning);
+        // Not the run we lost: it belongs to a conversation we left, so it is
+        // cancelled and its events are swallowed instead of displayed.
+        assert!(app.discarding_run);
+        assert!(app.pending_cancel);
+    }
+
+    #[test]
+    fn test_session_busy_for_lost_run_skips_known_events() {
+        let mut app = reattach_test_app();
+        app.lost_run = Some(("run_1".into(), 5));
+        app.handle_session_busy("run_1".into());
+        assert_eq!(app.skip_run_log_events, 5);
+        assert_eq!(app.run_event_count, 0);
+        assert_eq!(app.active_run_id.as_deref(), Some("run_1"));
+        assert!(app.lost_run.is_none());
+        assert!(!app.discarding_run);
+        assert!(!app.pending_cancel);
+    }
+
+    #[test]
+    fn test_connection_lost_keeps_run_position_and_goes_idle() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.active_run_id = Some("run_1".into());
+        app.run_event_count = 4;
+        app.pending_cancel = true;
+        app.agent_text_delta("partial");
+        app.connection_lost("gone");
+        assert_eq!(app.state, AppState::Idle);
+        // Moved aside so a new request can never reattach to it by accident.
+        assert_eq!(app.active_run_id, None);
+        assert_eq!(app.lost_run, Some(("run_1".to_string(), 4)));
+        assert!(!app.pending_cancel);
+        assert!(app.messages.iter().any(|m| m.content == "partial"));
+        assert!(app.messages.iter().any(|m| m.content.contains("gone")));
+    }
+
+    #[tokio::test]
+    async fn test_reattach_result_ignores_stale_and_gives_up_after_last_attempt()
+     {
+        let client = MoteClient::new("http://127.0.0.1:1");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.active_run_id = Some("run_1".into());
+        let mut chat_stream = None;
+
+        // Not reattaching any more: result is ignored.
+        let mut attempt = None;
+        handle_reattach_result(
+            &client,
+            &mut app,
+            "run_1".into(),
+            1,
+            Err(anyhow::anyhow!("refused")),
+            &mut chat_stream,
+            &mut attempt,
+            &tx,
+        );
+        assert_eq!(app.state, AppState::AgentRunning);
+
+        // Late result for a different run: the current run's attempt stays.
+        let mut attempt = Some(0);
+        handle_reattach_result(
+            &client,
+            &mut app,
+            "run_old".into(),
+            1,
+            Err(anyhow::anyhow!("refused")),
+            &mut chat_stream,
+            &mut attempt,
+            &tx,
+        );
+        assert_eq!(attempt, Some(0));
+        assert_eq!(app.state, AppState::AgentRunning);
+
+        // Final attempt fails: give up and go idle.
+        let mut attempt = Some(REATTACH_DELAYS_MS.len() - 1);
+        handle_reattach_result(
+            &client,
+            &mut app,
+            "run_1".into(),
+            1,
+            Err(anyhow::anyhow!("refused")),
+            &mut chat_stream,
+            &mut attempt,
+            &tx,
+        );
+        assert_eq!(attempt, None);
+        assert_eq!(app.state, AppState::Idle);
+        assert!(chat_stream.is_none());
+    }
+
+    #[test]
+    fn test_permission_pending_is_shown_once_and_not_after_answering() {
+        let mut app = reattach_test_app();
+        let args = serde_json::json!({"command": "ls"});
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::PermissionPending {
+                id: "perm_0_c".into(),
+                tool_name: "bash".into(),
+                args: args.clone(),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(
+            app.pending_permission.as_ref().map(|p| p.id.as_str()),
+            Some("perm_0_c")
+        );
+
+        // Already answered locally (response queued while reconnecting).
+        app.pending_permission = None;
+        app.pending_permission_response =
+            Some(("perm_0_c".into(), true, false));
+        app.show_pending_permission("perm_0_c".into(), "bash".into(), &args);
+        assert!(app.pending_permission.is_none());
+
+        // Answer lost with the old socket: shown again.
+        app.pending_permission_response = None;
+        app.show_pending_permission("perm_0_c".into(), "bash".into(), &args);
+        assert!(app.pending_permission.is_some());
+    }
+
+    #[test]
+    fn test_discarded_run_finishes_on_terminal_event() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.handle_session_busy("run_old".into());
+        assert!(app.discarding_run);
+        app.finish_discarded_run();
+        assert!(!app.discarding_run);
+        assert_eq!(app.state, AppState::Idle);
+        assert_eq!(app.active_run_id, None);
+        assert!(!app.pending_cancel);
+        assert!(is_terminal_server_event(
+            &marshaling_protocol::ServerEvent::Cancelled {
+                content: String::new(),
+                tokens_input: 0,
+                tokens_output: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_prepare_new_run_and_error_clear_active_run() {
+        let mut app = reattach_test_app();
+        app.active_run_id = Some("run_1".into());
+        app.run_event_count = 3;
+        app.skip_run_log_events = 2;
+        app.lost_run = Some(("run_0".into(), 9));
+        app.prepare_new_run();
+        assert_eq!(app.active_run_id, None);
+        assert_eq!(app.run_event_count, 0);
+        assert_eq!(app.skip_run_log_events, 0);
+        // Kept for a possible SessionBusy answer to the new request.
+        assert!(app.lost_run.is_some());
+
+        app.active_run_id = Some("run_1".into());
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::Error {
+                message: "boom".into(),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.active_run_id, None);
+
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::RunStarted {
+                run_id: "run_2".into(),
+            },
+            &mut chat_stream,
+        );
+        assert!(app.lost_run.is_none());
+    }
+
+    #[test]
+    fn test_second_ctrl_c_with_undelivered_cancel_requests_stop_reattach() {
+        let mut app = reattach_test_app();
+        let keys = Keybindings::from_config(None);
+        let mut chat_stream = None;
+        app.start_agent();
+        let ctrl_c = || {
+            Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        handle_key_event(&mut app, &keys, ctrl_c(), &mut chat_stream);
+        assert!(app.pending_cancel);
+        assert!(!app.stop_reattach_requested);
+        handle_key_event(&mut app, &keys, ctrl_c(), &mut chat_stream);
+        assert!(app.stop_reattach_requested);
+        assert_eq!(app.state, AppState::AgentRunning);
+    }
+
+    #[test]
+    fn test_permission_pending_for_answered_id_resends_the_answer() {
+        let mut app = reattach_test_app();
+        let args = serde_json::json!({});
+        app.answered_permissions
+            .insert("perm_0_c".into(), (false, false));
+        app.show_pending_permission("perm_0_c".into(), "bash".into(), &args);
+        // No ghost popup; the earlier answer is queued to be sent again in
+        // case the first one was lost with the old socket.
+        assert!(app.pending_permission.is_none());
+        assert_eq!(
+            app.pending_permission_response,
+            Some(("perm_0_c".to_string(), false, false))
+        );
+        // A new run forgets the old answers.
+        app.prepare_new_run();
+        assert!(app.answered_permissions.is_empty());
+    }
+
+    #[test]
+    fn test_connection_lost_while_discarding_does_not_remember_run() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.handle_session_busy("run_old".into());
+        assert!(app.discarding_run);
+        app.connection_lost("gone");
+        assert!(app.lost_run.is_none());
+        assert!(!app.discarding_run);
+    }
+
+    #[test]
+    fn test_connection_lost_without_active_run_keeps_older_lost_run() {
+        let mut app = reattach_test_app();
+        app.lost_run = Some(("run_1".into(), 4));
+        app.active_run_id = None;
+        app.connection_lost("closed before start");
+        assert_eq!(app.lost_run, Some(("run_1".to_string(), 4)));
+    }
+
+    #[test]
+    fn test_finish_discarded_run_mentions_queued_messages() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.handle_session_busy("run_old".into());
+        app.queue_input("later");
+        app.pending_permission_response =
+            Some(("perm_0_x".into(), true, false));
+        app.finish_discarded_run();
+        assert!(app.pending_permission_response.is_none());
+        assert_eq!(app.input_queue.len(), 1);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("1 queued message"))
+        );
     }
 }

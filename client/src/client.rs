@@ -258,8 +258,13 @@ impl MoteClient {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Spawn a task to read events from the WebSocket and forward to the channel
+        //
+        // Transport loss before a terminal event is deliberately not turned
+        // into an error: dropping `tx` closes the channel, which the TUI
+        // treats as "detached" and reattaches to the still-running server
+        // run. Callers that cannot reattach must treat a closed channel
+        // without a terminal event as a failure.
         tokio::spawn(async move {
-            let mut saw_terminal = false;
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(msg) => match msg {
@@ -277,7 +282,6 @@ impl MoteClient {
                                         break;
                                     }
                                     if is_terminal {
-                                        saw_terminal = true;
                                         break;
                                     }
                                 }
@@ -289,47 +293,18 @@ impl MoteClient {
                                     let _ = tx.send(ServerEvent::Error {
                                         message: format!("Protocol error: {e}"),
                                     });
-                                    saw_terminal = true;
                                     break;
                                 }
                             }
                         }
-                        Message::Close(frame) => {
-                            if !saw_terminal {
-                                let reason = frame
-                                    .map(|f| {
-                                        format!(
-                                            "code={} reason={}",
-                                            f.code, f.reason
-                                        )
-                                    })
-                                    .unwrap_or_else(|| "no close frame".into());
-                                let _ = tx.send(ServerEvent::Error {
-                                message: format!("Chat websocket closed before completion ({reason})"),
-                            });
-                                saw_terminal = true;
-                            }
-                            break;
-                        }
+                        Message::Close(_) => break,
                         _ => {}
                     },
                     Err(e) => {
-                        if !saw_terminal {
-                            let _ = tx.send(ServerEvent::Error {
-                                message: format!(
-                                    "Chat websocket read error: {e}"
-                                ),
-                            });
-                            saw_terminal = true;
-                        }
+                        tracing::warn!("Chat websocket read error: {e}");
                         break;
                     }
                 }
-            }
-            if !saw_terminal {
-                let _ = tx.send(ServerEvent::Error {
-                    message: "Chat websocket ended before completion".into(),
-                });
             }
         });
 

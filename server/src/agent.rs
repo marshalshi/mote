@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use futures::FutureExt;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::llm::*;
@@ -141,6 +142,90 @@ fn is_retryable_stream_error(error: &anyhow::Error) -> bool {
     .any(|pattern| message.contains(pattern))
 }
 
+/// Routes user permission responses to whichever agent loop is waiting.
+///
+/// A parent run and its subagents share one broker: while a subagent waits on
+/// a prompt, the parent loop is blocked inside the `subagent` tool and could
+/// not forward a response itself. Each waiter registers a one-shot channel
+/// under a unique permission id; the websocket handler resolves it by id.
+#[derive(Clone, Default)]
+pub struct PermissionBroker {
+    pending: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::oneshot::Sender<bool>,
+            >,
+        >,
+    >,
+    /// Prepended to permission ids so subagent ids cannot collide with the
+    /// parent's (providers may reuse tool-call ids such as `call_0`).
+    id_prefix: String,
+    /// Shared sequence number making every permission id unique within the
+    /// run, so a late answer to an old prompt can never match a new one.
+    next_seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl PermissionBroker {
+    /// A broker sharing this one's pending map, with ids prefixed by `prefix`.
+    pub fn scoped(&self, prefix: &str) -> Self {
+        Self {
+            pending: Arc::clone(&self.pending),
+            id_prefix: format!("{}{prefix}", self.id_prefix),
+            next_seq: Arc::clone(&self.next_seq),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>,
+    > {
+        // The map stays consistent even if a holder panicked, so recover
+        // from poisoning instead of propagating the panic.
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Register a wait for the tool call `tool_call_id`. Returns the
+    /// permission id to send to the client and the receiver for the answer.
+    pub fn register(
+        &self,
+        tool_call_id: &str,
+    ) -> (String, tokio::sync::oneshot::Receiver<bool>) {
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("{}perm_{seq}_{tool_call_id}", self.id_prefix);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.lock().insert(id.clone(), tx);
+        (id, rx)
+    }
+
+    /// Deliver the user's answer. Returns false if nobody is waiting on `id`.
+    pub fn resolve(&self, id: &str, allowed: bool) -> bool {
+        self.lock()
+            .remove(id)
+            .is_some_and(|tx| tx.send(allowed).is_ok())
+    }
+
+    /// Drop a wait that will never be answered (e.g. on cancellation).
+    pub fn forget(&self, id: &str) {
+        self.lock().remove(id);
+    }
+}
+
+/// Extract a readable message from a caught panic payload.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 fn stream_retry_delay(retry: usize) -> std::time::Duration {
     std::time::Duration::from_secs(1_u64 << retry.saturating_sub(1).min(4))
 }
@@ -245,6 +330,11 @@ pub enum AgentEvent {
         tool_name: String,
         args: serde_json::Value,
     },
+    /// The wait for permission `id` ended (answered, or the responder went
+    /// away). Internal bookkeeping only; never sent to clients. Emitted
+    /// before the approved tool runs, so observers can tell user wait time
+    /// apart from tool run time.
+    PermissionResolved { id: String },
     /// Skills that have been loaded for this session.
     SkillsLoaded { names: Vec<String> },
     /// A skill was selected via use_skill tool.
@@ -314,7 +404,7 @@ pub async fn run_loop(
     options: ChatOptions,
     events_tx: UnboundedSender<Result<AgentEvent>>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-    mut permission_rx: tokio::sync::mpsc::UnboundedReceiver<(String, bool)>,
+    permission_broker: PermissionBroker,
     // Pre-resolved permission map: tool_name → Permission
     permissions: std::collections::HashMap<String, crate::config::Permission>,
     // Configurable max steps (defaults to DEFAULT_MAX_STEPS if 0)
@@ -368,6 +458,9 @@ pub async fn run_loop(
 
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
+    // Becomes false once the cancel sender is dropped. `changed()` then
+    // resolves immediately forever, so every `select!` must stop polling it.
+    let mut cancel_open = true;
 
     let mut step = 0usize;
     loop {
@@ -531,8 +624,14 @@ pub async fn run_loop(
             loop {
                 let event = tokio::select! {
                     event = stream_rx.recv() => event,
-                    changed = cancel_rx.changed() => {
-                        if changed.is_ok() && *cancel_rx.borrow() {
+                    changed = cancel_rx.changed(), if cancel_open => {
+                        if changed.is_err() {
+                            // Sender gone: no cancellation can arrive any
+                            // more. Stop polling it instead of spinning.
+                            cancel_open = false;
+                            continue;
+                        }
+                        if *cancel_rx.borrow() {
                             reap_stream_task(stream_handle, true);
                             let _ = events_tx.send(Ok(AgentEvent::Cancelled {
                                 content: "(cancelled)".into(),
@@ -599,17 +698,23 @@ pub async fn run_loop(
                             retry_delay_ms = delay.as_millis(),
                             "retrying transient agent stream failure before output"
                         );
-                        tokio::select! {
-                            _ = tokio::time::sleep(delay) => {}
-                            changed = cancel_rx.changed() => {
-                                if changed.is_ok() && *cancel_rx.borrow() {
-                                    let _ = events_tx.send(Ok(AgentEvent::Cancelled {
-                                        content: "(cancelled)".into(),
-                                        tokens_input: total_input,
-                                        tokens_output: total_output,
-                                        history,
-                                    }));
-                                    return;
+                        let sleep = tokio::time::sleep(delay);
+                        tokio::pin!(sleep);
+                        loop {
+                            tokio::select! {
+                                _ = &mut sleep => break,
+                                changed = cancel_rx.changed(), if cancel_open => {
+                                    if changed.is_err() {
+                                        cancel_open = false;
+                                    } else if *cancel_rx.borrow() {
+                                        let _ = events_tx.send(Ok(AgentEvent::Cancelled {
+                                            content: "(cancelled)".into(),
+                                            tokens_input: total_input,
+                                            tokens_output: total_output,
+                                            history,
+                                        }));
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -992,30 +1097,33 @@ pub async fn run_loop(
                 }
                 crate::config::Permission::Ask => {
                     // Request user permission
-                    let perm_id = format!("perm_{}", tc.id);
+                    let (perm_id, mut response_rx) =
+                        permission_broker.register(&tc.id);
                     let _ = events_tx.send(Ok(AgentEvent::PermissionRequest {
                         id: perm_id.clone(),
                         tool_name: tc.function.name.clone(),
                         args: args.clone(),
                     }));
-                    // Wait for permission response
+                    // Wait for permission response. A dropped responder
+                    // (broker entry replaced or cleared) counts as a denial.
                     let allowed = loop {
                         tokio::select! {
-                            resp = permission_rx.recv() => {
-                                match resp {
-                                    Some((id, allowed)) if id == perm_id => break allowed,
-                                    Some(_) => continue,
-                                    None => break false,
-                                }
-                            }
-                            _ = cancel_rx.changed() => {
-                                if *cancel_rx.borrow() {
+                            resp = &mut response_rx => break resp.unwrap_or(false),
+                            changed = cancel_rx.changed(), if cancel_open => {
+                                if changed.is_err() {
+                                    cancel_open = false;
+                                } else if *cancel_rx.borrow() {
+                                    permission_broker.forget(&perm_id);
                                     let _ = events_tx.send(Ok(AgentEvent::Cancelled { content: "(cancelled)".into(), tokens_input: total_input, tokens_output: total_output, history }));
                                     return;
                                 }
                             }
                         }
                     };
+                    let _ =
+                        events_tx.send(Ok(AgentEvent::PermissionResolved {
+                            id: perm_id,
+                        }));
                     if !allowed {
                         tool_batch_failed = true;
                         let err = format!(
@@ -1041,10 +1149,20 @@ pub async fn run_loop(
                 }
             }
 
-            // Execute
-            let execution = tool.execute(args);
+            // Execute. A panicking tool must not take down the whole run, so
+            // the panic is caught and reported to the model as a tool error.
+            let tool_name = tc.function.name.clone();
+            let execution = std::panic::AssertUnwindSafe(tool.execute(args))
+                .catch_unwind()
+                .map(move |outcome| {
+                    outcome.unwrap_or_else(|panic| {
+                        Err(anyhow::anyhow!(
+                            "tool '{tool_name}' panicked: {}",
+                            panic_message(panic.as_ref())
+                        ))
+                    })
+                });
             tokio::pin!(execution);
-            let mut cancel_open = true;
             let execution = loop {
                 tokio::select! {
                     output = &mut execution => break Some(output),
@@ -1351,6 +1469,29 @@ mod tests {
         }
     }
 
+    struct PanickingTool;
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: "boom".into(),
+                    description: "panicking test tool".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            panic!("tool exploded");
+        }
+    }
+
     #[test]
     fn test_extract_last_user_message_finds_latest() {
         let history = vec![
@@ -1443,7 +1584,7 @@ mod tests {
         ]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -1454,7 +1595,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             2,
             "/tmp".into(),
@@ -1714,7 +1855,7 @@ mod tests {
         )]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -1725,7 +1866,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             2,
             "/tmp".into(),
@@ -1780,7 +1921,7 @@ mod tests {
         )]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -1791,7 +1932,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             10,
             "/tmp".into(),
@@ -1826,7 +1967,7 @@ mod tests {
         });
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -1839,7 +1980,7 @@ mod tests {
                 ChatOptions::default(),
                 events_tx,
                 cancel_rx,
-                perm_rx,
+                perm_broker,
                 std::collections::HashMap::new(),
                 2,
                 "/tmp".into(),
@@ -1919,7 +2060,7 @@ mod tests {
         ]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -1930,7 +2071,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             10,
             "/tmp".into(),
@@ -2001,7 +2142,7 @@ mod tests {
         )]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -2012,7 +2153,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             10,
             "/tmp".into(),
@@ -2090,7 +2231,7 @@ mod tests {
         )]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -2101,7 +2242,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             1,
             "/tmp".into(),
@@ -2145,7 +2286,7 @@ mod tests {
         )]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         let max_steps = 3usize;
         run_loop(
@@ -2157,7 +2298,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             max_steps,
             "/tmp".into(),
@@ -2222,7 +2363,7 @@ mod tests {
         ]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -2233,7 +2374,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             10,
             "/tmp".into(),
@@ -2309,7 +2450,7 @@ mod tests {
         ]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider,
@@ -2320,7 +2461,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             10,
             "/tmp".into(),
@@ -2406,7 +2547,7 @@ mod tests {
         )]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
 
         run_loop(
             provider_for_loop,
@@ -2417,7 +2558,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             10,
             "/tmp".into(),
@@ -2476,7 +2617,7 @@ mod tests {
         )]);
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let perm_broker = PermissionBroker::default();
         let loop_task = tokio::spawn(run_loop(
             provider,
             tools,
@@ -2486,7 +2627,7 @@ mod tests {
             ChatOptions::default(),
             events_tx,
             cancel_rx,
-            perm_rx,
+            perm_broker,
             permissions,
             10,
             "/tmp".into(),
@@ -2515,6 +2656,295 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_reports_tool_panic_as_tool_failure() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            calls: Arc::new(Mutex::new(0)),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [
+                    ChatResult {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call_boom".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "boom".into(),
+                                arguments: "{}".into(),
+                            },
+                        }],
+                        usage: Usage::default(),
+                        finish_reason: Some("tool_calls".into()),
+                        reasoning_content: None,
+                    },
+                    ChatResult {
+                        content: Some("recovered".into()),
+                        tool_calls: Vec::new(),
+                        usage: Usage::default(),
+                        finish_reason: Some("stop".into()),
+                        reasoning_content: None,
+                    },
+                ],
+            ))),
+        });
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(PanickingTool)]);
+        let permissions = std::collections::HashMap::from([(
+            "boom".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let perm_broker = PermissionBroker::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_loop(
+                provider,
+                tools,
+                Vec::new(),
+                "hi".into(),
+                Vec::new(),
+                ChatOptions::default(),
+                events_tx,
+                cancel_rx,
+                perm_broker,
+                permissions,
+                10,
+                "/tmp".into(),
+                None,
+            ),
+        )
+        .await
+        .expect("run_loop must finish after a tool panic");
+
+        let mut saw_failure = false;
+        let mut done_history = None;
+        while let Ok(event) = events_rx.try_recv() {
+            match event.unwrap() {
+                AgentEvent::ToolFailed { id, error } => {
+                    assert_eq!(id, "call_boom");
+                    assert!(error.contains("panicked"), "{error}");
+                    assert!(error.contains("tool exploded"), "{error}");
+                    saw_failure = true;
+                }
+                AgentEvent::Done { history, .. } => {
+                    done_history = Some(history)
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_failure);
+        let history = done_history.expect("loop should reach Done");
+        assert!(history.iter().any(|m| {
+            m.tool_call_id.as_deref() == Some("call_boom")
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("Error:"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_permission_broker_routes_by_id() {
+        let broker = PermissionBroker::default();
+        let (id, rx) = broker.register("call_1");
+        assert_eq!(id, "perm_0_call_1");
+        assert!(!broker.resolve("perm_other", true));
+        assert!(broker.resolve(&id, true));
+        assert!(rx.await.unwrap());
+        // Already answered: a duplicate response finds nobody waiting.
+        assert!(!broker.resolve(&id, false));
+
+        let (id, rx) = broker.register("call_2");
+        broker.forget(&id);
+        assert!(!broker.resolve(&id, true));
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_permission_broker_scoped_ids_share_pending_map() {
+        let parent = PermissionBroker::default();
+        let sub = parent.scoped("sub_1:");
+        let (parent_id, _parent_rx) = parent.register("call_0");
+        let (sub_id, sub_rx) = sub.register("call_0");
+        assert_eq!(sub_id, "sub_1:perm_1_call_0");
+        assert_ne!(parent_id, sub_id);
+        // The websocket handler only holds the parent broker.
+        assert!(parent.resolve(&sub_id, false));
+        assert!(!sub_rx.await.unwrap());
+    }
+
+    fn single_tool_call_then_stop(tool: &str) -> Arc<dyn LlmProvider> {
+        Arc::new(ScriptedProvider {
+            calls: Arc::new(Mutex::new(0)),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                [
+                    ChatResult {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call_0".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: tool.into(),
+                                arguments: "{}".into(),
+                            },
+                        }],
+                        usage: Usage::default(),
+                        finish_reason: Some("tool_calls".into()),
+                        reasoning_content: None,
+                    },
+                    ChatResult {
+                        content: Some("done".into()),
+                        tool_calls: Vec::new(),
+                        usage: Usage::default(),
+                        finish_reason: Some("stop".into()),
+                        reasoning_content: None,
+                    },
+                ],
+            ))),
+        })
+    }
+
+    /// Run a loop whose only tool needs approval; answer the prompt with
+    /// `allowed` through the (scoped) broker and return all events.
+    async fn run_with_permission_answer(
+        broker: PermissionBroker,
+        answer_via: PermissionBroker,
+        allowed: bool,
+    ) -> Vec<AgentEvent> {
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(NamedTool("guarded"))]);
+        let permissions = std::collections::HashMap::from([(
+            "guarded".to_string(),
+            crate::config::Permission::Ask,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_loop(
+            single_tool_call_then_stop("guarded"),
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            broker,
+            permissions,
+            10,
+            "/tmp".into(),
+            None,
+        ));
+        let mut events = Vec::new();
+        while let Some(event) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            events_rx.recv(),
+        )
+        .await
+        .expect("loop stalled")
+        {
+            let event = event.unwrap();
+            if let AgentEvent::PermissionRequest { id, .. } = &event {
+                assert!(answer_via.resolve(id, allowed));
+            }
+            events.push(event);
+        }
+        loop_task.await.unwrap();
+        events
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_waits_for_permission_and_executes_when_allowed() {
+        let broker = PermissionBroker::default();
+        let events =
+            run_with_permission_answer(broker.clone(), broker, true).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PermissionRequest { id, .. } if id == "perm_0_call_0"
+        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCompleted { id, .. } if id == "call_0")));
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+        // The wait ends before the tool runs, so observers can separate user
+        // wait time from tool run time.
+        let resolved = events.iter().position(|e| {
+            matches!(e, AgentEvent::PermissionResolved { id } if id == "perm_0_call_0")
+        });
+        let completed = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolCompleted { .. }));
+        assert!(resolved.unwrap() < completed.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_scoped_run_loop_permission_denied_through_parent_broker() {
+        // Mirrors a subagent: its loop uses a scoped broker while the answer
+        // arrives through the parent's broker.
+        let parent = PermissionBroker::default();
+        let events =
+            run_with_permission_answer(parent.scoped("sub_x:"), parent, false)
+                .await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PermissionRequest { id, .. } if id == "sub_x:perm_0_call_0"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolFailed { error, .. } if error.contains("Permission denied by user")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_during_permission_wait_forgets_request() {
+        let broker = PermissionBroker::default();
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(NamedTool("guarded"))]);
+        let permissions = std::collections::HashMap::from([(
+            "guarded".to_string(),
+            crate::config::Permission::Ask,
+        )]);
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_loop(
+            single_tool_call_then_stop("guarded"),
+            tools,
+            Vec::new(),
+            "hi".into(),
+            Vec::new(),
+            ChatOptions::default(),
+            events_tx,
+            cancel_rx,
+            broker.clone(),
+            permissions,
+            10,
+            "/tmp".into(),
+            None,
+        ));
+        let perm_id = loop {
+            if let Ok(AgentEvent::PermissionRequest { id, .. }) =
+                events_rx.recv().await.unwrap()
+            {
+                break id;
+            }
+        };
+        cancel_tx.send(true).unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            events_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(event, AgentEvent::Cancelled { .. }));
+        loop_task.await.unwrap();
+        assert!(!broker.resolve(&perm_id, true));
     }
 
     #[test]

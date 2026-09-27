@@ -16,7 +16,7 @@ pub struct PromptAssembler {
     config: Config,
     agent_instructions: Option<String>,
     disable_user_agents_md: bool,
-    disble_system_prompt: bool,
+    disable_system_prompt: bool,
     workspace_root: Option<PathBuf>,
     repo_agents_md: Option<String>,
 }
@@ -29,7 +29,7 @@ impl PromptAssembler {
             config,
             agent_instructions: None,
             disable_user_agents_md: false,
-            disble_system_prompt: false,
+            disable_system_prompt: false,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -44,13 +44,13 @@ impl PromptAssembler {
         let instructions = agent.and_then(|a| a.instructions.clone());
         let disable_user_agents_md =
             agent.is_some_and(|a| a.disable_user_agents_md);
-        let disble_system_prompt =
-            agent.is_some_and(|a| a.disble_system_prompt);
+        let disable_system_prompt =
+            agent.is_some_and(|a| a.disable_system_prompt);
         Self {
             config: cfg,
             agent_instructions: instructions,
             disable_user_agents_md,
-            disble_system_prompt,
+            disable_system_prompt,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -142,7 +142,7 @@ impl PromptAssembler {
         &self,
         _model_provider: &str,
     ) -> Result<Option<String>> {
-        if self.disble_system_prompt {
+        if self.disable_system_prompt {
             return Ok(None);
         }
         let prompt =
@@ -554,7 +554,7 @@ default = "/nonexistent/prompts/system/mote.md"
     }
 
     #[test]
-    fn test_agent_can_disble_system_prompt_layer() {
+    fn test_agent_can_disable_system_prompt_layer() {
         let dir = tempfile::tempdir().unwrap();
         let prompt_path = dir.path().join("mote.md");
         std::fs::write(&prompt_path, "SHARED SYSTEM PROMPT").unwrap();
@@ -573,7 +573,7 @@ default = "{}"
         );
         let config: Config = toml::from_str(&toml).unwrap();
         let agent = crate::config::AgentConfig {
-            disble_system_prompt: true,
+            disable_system_prompt: true,
             ..Default::default()
         };
 

@@ -371,10 +371,10 @@ pub struct AgentConfig {
     pub disable_user_agents_md: bool,
     /// If true, omit the shared system prompt layer for this agent.
     ///
-    /// The field name intentionally matches the current agent-definition
-    /// contract spelling. `disable_system_prompt` is accepted as an alias.
-    #[serde(default, alias = "disable_system_prompt")]
-    pub disble_system_prompt: bool,
+    /// The earlier misspelling `disble_system_prompt` is still accepted, so
+    /// existing agent files keep working.
+    #[serde(default, alias = "disble_system_prompt")]
+    pub disable_system_prompt: bool,
     /// Agent mode: "primary" (user-selectable, default), "subagent" (tool-only), "all" (both).
     #[serde(default = "default_agent_mode")]
     pub mode: String,
@@ -399,7 +399,7 @@ impl Default for AgentConfig {
             permissions: HashMap::new(),
             instructions: None,
             disable_user_agents_md: false,
-            disble_system_prompt: false,
+            disable_system_prompt: false,
             mode: default_agent_mode(),
             roles: None,
         }
@@ -1242,7 +1242,7 @@ base_url = "https://api.deepseek.com/v1"
                 permissions: HashMap::new(),
                 instructions: None,
                 disable_user_agents_md: false,
-                disble_system_prompt: false,
+                disable_system_prompt: false,
                 mode: "primary".into(),
                 roles: None,
             },
@@ -1708,31 +1708,31 @@ Just instructions.
     fn test_agent_prompt_disable_flags_default_false() {
         let cfg = parse_agent_markdown("# Build\n\nInstructions.").unwrap();
         assert!(!cfg.disable_user_agents_md);
-        assert!(!cfg.disble_system_prompt);
+        assert!(!cfg.disable_system_prompt);
     }
 
     #[test]
     fn test_parse_agent_prompt_disable_flags() {
         let markdown = r#"---
 disable_user_agents_md: true
-disble_system_prompt: true
----
-# Build
-"#;
-        let cfg = parse_agent_markdown(markdown).unwrap();
-        assert!(cfg.disable_user_agents_md);
-        assert!(cfg.disble_system_prompt);
-    }
-
-    #[test]
-    fn test_parse_agent_prompt_disable_system_prompt_alias() {
-        let markdown = r#"---
 disable_system_prompt: true
 ---
 # Build
 "#;
         let cfg = parse_agent_markdown(markdown).unwrap();
-        assert!(cfg.disble_system_prompt);
+        assert!(cfg.disable_user_agents_md);
+        assert!(cfg.disable_system_prompt);
+    }
+
+    #[test]
+    fn test_parse_agent_prompt_accepts_old_misspelled_key() {
+        let markdown = r#"---
+disble_system_prompt: true
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert!(cfg.disable_system_prompt);
     }
 
     #[test]

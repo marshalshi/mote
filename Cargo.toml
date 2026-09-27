@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
-default-members = ["client"]
+# default-members = ["client"]
 members = ["protocol", "server", "client"]

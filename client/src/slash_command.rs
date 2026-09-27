@@ -106,16 +106,13 @@ fn load_command_dir_recursive(
     }
 }
 
-fn load_markdown_command(
-    root: &Path,
-    path: &Path,
-) -> Result<CustomSlashCommand> {
+fn load_markdown_command(root: &Path, path: &Path) -> Result<CustomSlashCommand> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
     let content = normalize_line_endings(&content);
-    let relative = path.strip_prefix(root).with_context(|| {
-        format!("{} is not under {}", path.display(), root.display())
-    })?;
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
     let name = command_name_from_relative_path(relative)?;
     validate_command_name(&name)?;
 
@@ -148,10 +145,7 @@ fn command_name_from_relative_path(relative: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn command_from_config(
-    name: String,
-    config: PartialCommandConfig,
-) -> Result<CustomSlashCommand> {
+fn command_from_config(name: String, config: PartialCommandConfig) -> Result<CustomSlashCommand> {
     let template = config
         .template
         .map(|s| s.trim().to_string())
@@ -193,9 +187,7 @@ fn parse_frontmatter(raw: &str) -> Result<PartialCommandConfig> {
             continue;
         }
         let Some((key, value)) = line.split_once(':') else {
-            anyhow::bail!(
-                "Invalid frontmatter line `{line}`; expected `key: value`"
-            );
+            anyhow::bail!("Invalid frontmatter line `{line}`; expected `key: value`");
         };
         let value = unquote(value.trim()).to_string();
         match key.trim() {
@@ -223,9 +215,7 @@ fn unquote(value: &str) -> &str {
 
 fn validate_command_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        anyhow::bail!(
-            "Invalid command name `{name}`; command name cannot be empty"
-        );
+        anyhow::bail!("Invalid command name `{name}`; command name cannot be empty");
     }
     for segment in name.split('/') {
         validate_command_segment(segment)?;
@@ -239,9 +229,7 @@ fn validate_command_segment(segment: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        anyhow::bail!(
-            "Invalid command segment `{segment}`; use letters, numbers, '-' or '_'"
-        );
+        anyhow::bail!("Invalid command segment `{segment}`; use letters, numbers, '-' or '_'");
     }
     Ok(())
 }
@@ -251,20 +239,13 @@ pub async fn expand_custom_command(
     workspace_root: &Path,
 ) -> Result<String> {
     let args = parse_arguments(&invocation.arguments);
-    let with_args = expand_argument_placeholders(
-        &invocation.command.template,
-        &invocation.arguments,
-        &args,
-    );
+    let with_args =
+        expand_argument_placeholders(&invocation.command.template, &invocation.arguments, &args);
     let with_files = expand_file_references(&with_args, workspace_root).await?;
     expand_shell_output(&with_files, workspace_root).await
 }
 
-fn expand_argument_placeholders(
-    template: &str,
-    raw_arguments: &str,
-    args: &[String],
-) -> String {
+fn expand_argument_placeholders(template: &str, raw_arguments: &str, args: &[String]) -> String {
     let mut output = String::new();
     let mut chars = template.char_indices().peekable();
     while let Some((_, ch)) = chars.next() {
@@ -345,10 +326,7 @@ fn parse_arguments(raw: &str) -> Vec<String> {
     args
 }
 
-async fn expand_file_references(
-    template: &str,
-    workspace_root: &Path,
-) -> Result<String> {
+async fn expand_file_references(template: &str, workspace_root: &Path) -> Result<String> {
     let workspace_root = canonicalize_existing_dir(workspace_root)?;
     let mut output = String::new();
     let mut chars = template.char_indices().peekable();
@@ -394,8 +372,7 @@ fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf> {
 }
 
 fn is_file_reference_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric()
-        || matches!(ch, '_' | '-' | '.' | '/' | ':' | '+')
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '+')
 }
 
 async fn read_workspace_file_reference(
@@ -406,9 +383,9 @@ async fn read_workspace_file_reference(
     if !candidate.exists() || !candidate.is_file() {
         return Ok(None);
     }
-    let canonical = candidate.canonicalize().with_context(|| {
-        format!("Failed to resolve {}", candidate.display())
-    })?;
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve {}", candidate.display()))?;
     if !canonical.starts_with(workspace_root) {
         return Ok(None);
     }
@@ -418,10 +395,7 @@ async fn read_workspace_file_reference(
     Ok(Some(content))
 }
 
-async fn expand_shell_output(
-    template: &str,
-    workspace_root: &Path,
-) -> Result<String> {
+async fn expand_shell_output(template: &str, workspace_root: &Path) -> Result<String> {
     let mut output = String::new();
     let mut rest = template;
 
@@ -441,10 +415,7 @@ async fn expand_shell_output(
     Ok(output)
 }
 
-async fn run_shell_capture(
-    command: &str,
-    workspace_root: &Path,
-) -> Result<String> {
+async fn run_shell_capture(command: &str, workspace_root: &Path) -> Result<String> {
     let output = tokio::process::Command::new("/bin/bash")
         .arg("-lc")
         .arg(command)
@@ -581,16 +552,12 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let outside_file = outside.path().join("secret.txt");
         std::fs::write(&outside_file, "secret").unwrap();
-        std::os::unix::fs::symlink(
-            &outside_file,
-            workspace.path().join("secret-link.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(&outside_file, workspace.path().join("secret-link.txt"))
+            .unwrap();
 
-        let expanded =
-            expand_file_references("Read @secret-link.txt", workspace.path())
-                .await
-                .unwrap();
+        let expanded = expand_file_references("Read @secret-link.txt", workspace.path())
+            .await
+            .unwrap();
 
         assert_eq!(expanded, "Read @secret-link.txt");
     }

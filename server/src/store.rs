@@ -113,9 +113,7 @@ pub fn new_session_id() -> String {
 
 /// A user-authored message (not a tool result, role hand-off, or summary).
 fn is_user_text(message: &ChatMessage) -> bool {
-    message.role == Role::User
-        && message.tool_call_id.is_none()
-        && !message.internal_role_task
+    message.role == Role::User && message.tool_call_id.is_none() && !message.internal_role_task
 }
 
 impl Transcript {
@@ -169,16 +167,12 @@ impl Transcript {
     }
 }
 
-fn display_messages<'a>(
-    messages: impl Iterator<Item = &'a ChatMessage>,
-) -> Vec<(Role, String)> {
+fn display_messages<'a>(messages: impl Iterator<Item = &'a ChatMessage>) -> Vec<(Role, String)> {
     messages
         .filter_map(|m| {
             let content = m.content.as_deref().filter(|c| !c.is_empty())?;
             match m.role {
-                Role::User if is_user_text(m) => {
-                    Some((Role::User, content.to_string()))
-                }
+                Role::User if is_user_text(m) => Some((Role::User, content.to_string())),
                 Role::Assistant => Some((Role::Assistant, content.to_string())),
                 _ => None,
             }
@@ -191,22 +185,17 @@ fn display_messages<'a>(
 pub fn load(path: &Path) -> Result<Transcript> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let lines: Vec<&str> =
-        text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut records = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
         match serde_json::from_str::<Record>(line) {
             Ok(record) => records.push(record),
             Err(e) if i + 1 == lines.len() => {
-                tracing::warn!(
-                    "ignoring truncated last record in {}: {e}",
-                    path.display()
-                );
+                tracing::warn!("ignoring truncated last record in {}: {e}", path.display());
             }
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Corrupt record {} in {}", i + 1, path.display())
-                });
+                return Err(e)
+                    .with_context(|| format!("Corrupt record {} in {}", i + 1, path.display()));
             }
         }
     }
@@ -316,8 +305,7 @@ pub fn append(path: &Path, records: &[Record], create: bool) -> Result<()> {
     let len_before = file.metadata()?.len();
     if let Err(e) = file.write_all(buf.as_bytes()) {
         let _ = file.set_len(len_before);
-        return Err(e)
-            .with_context(|| format!("Failed to write {}", path.display()));
+        return Err(e).with_context(|| format!("Failed to write {}", path.display()));
     }
     Ok(())
 }
@@ -427,12 +415,7 @@ impl TranscriptWriter {
     }
 
     /// Start a new transcript for session `id`.
-    pub fn create(
-        path: PathBuf,
-        id: String,
-        model_provider: String,
-        model_id: String,
-    ) -> Self {
+    pub fn create(path: PathBuf, id: String, model_provider: String, model_id: String) -> Self {
         Self {
             path,
             pending_header: Some(Record::Session {
@@ -560,8 +543,7 @@ mod tests {
         let transcript = load(&path).unwrap();
         assert_eq!(transcript.id, "chat-1");
         assert_eq!(transcript.tokens_input, 10);
-        let seqs: Vec<u64> =
-            transcript.messages.iter().map(|m| m.seq).collect();
+        let seqs: Vec<u64> = transcript.messages.iter().map(|m| m.seq).collect();
         assert_eq!(seqs, [0, 1, 2, 3, 4]);
         let loaded: Vec<ChatMessage> = transcript.uncompacted_messages();
         assert_eq!(loaded[1].tool_calls.as_ref().unwrap()[0].id, "c1");
@@ -593,12 +575,8 @@ mod tests {
     fn compaction_hides_covered_messages_from_the_model() {
         let dir = tempfile::tempdir().unwrap();
         let path = transcript_path(dir.path(), "chat-1");
-        let mut writer = TranscriptWriter::create(
-            path.clone(),
-            "chat-1".into(),
-            "p".into(),
-            "m".into(),
-        );
+        let mut writer =
+            TranscriptWriter::create(path.clone(), "chat-1".into(), "p".into(), "m".into());
         writer.append_messages(&sample_run()).unwrap();
         writer
             .append_record(Record::Compaction {
@@ -624,12 +602,8 @@ mod tests {
     fn load_skips_truncated_last_line_but_rejects_corruption_elsewhere() {
         let dir = tempfile::tempdir().unwrap();
         let path = transcript_path(dir.path(), "chat-1");
-        let mut writer = TranscriptWriter::create(
-            path.clone(),
-            "chat-1".into(),
-            "p".into(),
-            "m".into(),
-        );
+        let mut writer =
+            TranscriptWriter::create(path.clone(), "chat-1".into(), "p".into(), "m".into());
         writer
             .append_messages(&[ChatMessage::user("hello")])
             .unwrap();
@@ -651,8 +625,7 @@ mod tests {
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = transcript_path(dir.path(), "chat-old");
-        append(&path, &legacy_records("chat-old", &meta, &messages), true)
-            .unwrap();
+        append(&path, &legacy_records("chat-old", &meta, &messages), true).unwrap();
         let transcript = load(&path).unwrap();
         assert_eq!(transcript.id, "chat-old");
         assert_eq!(transcript.tokens_input, 10);
@@ -670,12 +643,8 @@ mod tests {
     fn append_after_crash_drops_partial_line_and_stays_loadable() {
         let dir = tempfile::tempdir().unwrap();
         let path = transcript_path(dir.path(), "chat-1");
-        let mut writer = TranscriptWriter::create(
-            path.clone(),
-            "chat-1".into(),
-            "p".into(),
-            "m".into(),
-        );
+        let mut writer =
+            TranscriptWriter::create(path.clone(), "chat-1".into(), "p".into(), "m".into());
         writer
             .append_messages(&[ChatMessage::user("hello")])
             .unwrap();
@@ -693,8 +662,7 @@ mod tests {
             .append_messages(&[ChatMessage::user("again")])
             .unwrap();
         let transcript = load(&path).unwrap();
-        let seqs: Vec<u64> =
-            transcript.messages.iter().map(|m| m.seq).collect();
+        let seqs: Vec<u64> = transcript.messages.iter().map(|m| m.seq).collect();
         assert_eq!(seqs, [0, 1, 2]);
         assert_eq!(
             transcript.messages[1].message.content.as_deref(),
@@ -706,12 +674,8 @@ mod tests {
     fn appends_never_recreate_a_deleted_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let path = transcript_path(dir.path(), "chat-1");
-        let mut writer = TranscriptWriter::create(
-            path.clone(),
-            "chat-1".into(),
-            "p".into(),
-            "m".into(),
-        );
+        let mut writer =
+            TranscriptWriter::create(path.clone(), "chat-1".into(), "p".into(), "m".into());
         writer
             .append_messages(&[ChatMessage::user("hello")])
             .unwrap();
@@ -729,12 +693,8 @@ mod tests {
     fn failed_writes_are_retried_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = transcript_path(dir.path(), "chat-1");
-        let mut writer = TranscriptWriter::create(
-            path.clone(),
-            "chat-1".into(),
-            "p".into(),
-            "m".into(),
-        );
+        let mut writer =
+            TranscriptWriter::create(path.clone(), "chat-1".into(), "p".into(), "m".into());
         writer.append_messages(&[ChatMessage::user("one")]).unwrap();
         // Make the next write fail by moving the file away...
         let aside = dir.path().join("aside");
@@ -766,8 +726,7 @@ mod tests {
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = transcript_path(dir.path(), "chat-old");
-        append(&path, &legacy_records("chat-old", &meta, &messages), true)
-            .unwrap();
+        append(&path, &legacy_records("chat-old", &meta, &messages), true).unwrap();
         let transcript = load(&path).unwrap();
         let compaction = transcript.compaction.as_ref().unwrap();
         assert_eq!(compaction.upto_seq, 1);

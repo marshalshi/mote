@@ -101,8 +101,7 @@ async fn main() -> Result<()> {
         return run_server_only().await;
     }
 
-    let workspace_ctx =
-        workspace::resolve_workspace_context(cli.session_key.as_deref())?;
+    let workspace_ctx = workspace::resolve_workspace_context(cli.session_key.as_deref())?;
 
     // Logging setup: verbose/debug → file, otherwise → stderr
     let env_log = std::env::var("RUST_LOG").unwrap_or_default();
@@ -135,10 +134,7 @@ async fn main() -> Result<()> {
             .with_ansi(false)
             .init();
         Box::leak(Box::new(_guard));
-        tracing::info!(
-            "Verbose logging enabled, writing to {}",
-            log_path.display()
-        );
+        tracing::info!("Verbose logging enabled, writing to {}", log_path.display());
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -210,8 +206,7 @@ async fn main() -> Result<()> {
         workspace_ctx.repo_agents_md.clone(),
         workspace_ctx.runtime_session_key.clone(),
     );
-    let custom_commands =
-        slash_command::load_custom_commands(&workspace_ctx.root);
+    let custom_commands = slash_command::load_custom_commands(&workspace_ctx.root);
     app.set_custom_commands(custom_commands.commands);
     for warning in custom_commands.warnings {
         tracing::warn!("{warning}");
@@ -369,8 +364,7 @@ fn server_command() -> Result<Command> {
 }
 
 fn sibling_server_binary() -> Result<Option<std::path::PathBuf>> {
-    let current = std::env::current_exe()
-        .context("Failed to resolve current executable")?;
+    let current = std::env::current_exe().context("Failed to resolve current executable")?;
     let Some(dir) = current.parent() else {
         return Ok(None);
     };
@@ -383,9 +377,8 @@ fn sibling_server_binary() -> Result<Option<std::path::PathBuf>> {
 }
 
 fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
 struct SingleMessageOptions {
@@ -431,16 +424,8 @@ async fn single_message(
                 content.push_str(&data);
             }
             // Nobody can be asked interactively here: answer per `--yes`.
-            marshaling_protocol::ServerEvent::PermissionRequest {
-                id,
-                tool_name,
-                ..
-            }
-            | marshaling_protocol::ServerEvent::PermissionPending {
-                id,
-                tool_name,
-                ..
-            } => {
+            marshaling_protocol::ServerEvent::PermissionRequest { id, tool_name, .. }
+            | marshaling_protocol::ServerEvent::PermissionPending { id, tool_name, .. } => {
                 let allowed = options.approve_tools;
                 if !allowed {
                     eprintln!(
@@ -448,25 +433,20 @@ async fn single_message(
                     );
                 }
                 stream
-                    .send(
-                        marshaling_protocol::ClientEvent::PermissionResponse {
-                            id,
-                            allowed,
-                            remember: false,
-                        },
-                    )
+                    .send(marshaling_protocol::ClientEvent::PermissionResponse {
+                        id,
+                        allowed,
+                        remember: false,
+                    })
                     .await
                     .context("Failed to answer permission prompt")?;
             }
-            marshaling_protocol::ServerEvent::NeedsContinuation {
-                content,
-                ..
-            } if content == "(permission denied)" => {
+            marshaling_protocol::ServerEvent::NeedsContinuation { content, .. }
+                if content == "(permission denied)" =>
+            {
                 // A refused tool ended the run: not a success for scripts.
                 println!();
-                anyhow::bail!(
-                    "The run stopped because a tool was not approved"
-                );
+                anyhow::bail!("The run stopped because a tool was not approved");
             }
             marshaling_protocol::ServerEvent::Done { .. }
             | marshaling_protocol::ServerEvent::Cancelled { .. }
@@ -563,9 +543,7 @@ async fn login_api_key_provider(
     client
         .save_credential(provider.name, "api_key", &key)
         .await
-        .with_context(|| {
-            format!("Failed to save {} API key", provider.display_name)
-        })?;
+        .with_context(|| format!("Failed to save {} API key", provider.display_name))?;
 
     println!();
     println!(

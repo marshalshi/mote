@@ -18,8 +18,7 @@ pub async fn handle_transcription_socket(
         channels = config.channels,
         "audio transcription websocket connected"
     );
-    if let Err(e) = run_transcription_socket(&mut socket, config, api_key).await
-    {
+    if let Err(e) = run_transcription_socket(&mut socket, config, api_key).await {
         tracing::warn!("audio transcription socket failed: {e:#}");
         let _ = send_server_event(
             &mut socket,
@@ -38,8 +37,7 @@ async fn run_transcription_socket(
 ) -> Result<()> {
     let start = match socket.recv().await {
         Some(Ok(Message::Text(text))) => {
-            serde_json::from_str::<AudioClientEvent>(&text)
-                .context("Invalid audio start event")?
+            serde_json::from_str::<AudioClientEvent>(&text).context("Invalid audio start event")?
         }
         Some(Ok(Message::Close(_))) | None => return Ok(()),
         _ => anyhow::bail!("Expected audio start event"),
@@ -76,66 +74,56 @@ async fn run_transcription_socket(
             return Ok(());
         };
         match msg {
-            Ok(Message::Text(text)) => {
-                match serde_json::from_str::<AudioClientEvent>(&text) {
-                    Ok(AudioClientEvent::AudioChunk { data }) => {
-                        let decoded = base64::engine::general_purpose::STANDARD
-                            .decode(data.as_bytes())
-                            .context("Invalid base64 audio chunk")?;
-                        audio_chunk_count += 1;
-                        tracing::trace!(
-                            chunks = audio_chunk_count,
-                            bytes = decoded.len(),
-                            "buffering audio chunk"
-                        );
-                        pcm.extend_from_slice(&decoded);
-                    }
-                    Ok(AudioClientEvent::Stop) => {
-                        tracing::info!(
-                            chunks = audio_chunk_count,
-                            pcm_bytes = pcm.len(),
-                            "submitting audio transcription"
-                        );
-                        if pcm.is_empty() {
-                            send_server_event(socket, &AudioServerEvent::Error {
+            Ok(Message::Text(text)) => match serde_json::from_str::<AudioClientEvent>(&text) {
+                Ok(AudioClientEvent::AudioChunk { data }) => {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(data.as_bytes())
+                        .context("Invalid base64 audio chunk")?;
+                    audio_chunk_count += 1;
+                    tracing::trace!(
+                        chunks = audio_chunk_count,
+                        bytes = decoded.len(),
+                        "buffering audio chunk"
+                    );
+                    pcm.extend_from_slice(&decoded);
+                }
+                Ok(AudioClientEvent::Stop) => {
+                    tracing::info!(
+                        chunks = audio_chunk_count,
+                        pcm_bytes = pcm.len(),
+                        "submitting audio transcription"
+                    );
+                    if pcm.is_empty() {
+                        send_server_event(socket, &AudioServerEvent::Error {
                                 message: "No microphone audio was captured before stop. Check microphone permission/device and try again.".into(),
                             }).await?;
-                            return Ok(());
-                        }
-                        let transcript =
-                            transcribe_with_openai(&config, &api_key, pcm)
-                                .await?;
-                        send_server_event(
-                            socket,
-                            &AudioServerEvent::TranscriptFinal {
-                                text: transcript,
-                            },
-                        )
-                        .await?;
-                        send_server_event(socket, &AudioServerEvent::Stopped)
-                            .await?;
                         return Ok(());
                     }
-                    Ok(AudioClientEvent::Cancel) => {
-                        tracing::debug!(
-                            "audio transcription cancelled by client"
-                        );
-                        send_server_event(socket, &AudioServerEvent::Stopped)
-                            .await?;
-                        return Ok(());
-                    }
-                    Ok(AudioClientEvent::Start { .. }) => {}
-                    Err(e) => {
-                        send_server_event(
-                            socket,
-                            &AudioServerEvent::Error {
-                                message: format!("Invalid audio event: {e}"),
-                            },
-                        )
-                        .await?;
-                    }
+                    let transcript = transcribe_with_openai(&config, &api_key, pcm).await?;
+                    send_server_event(
+                        socket,
+                        &AudioServerEvent::TranscriptFinal { text: transcript },
+                    )
+                    .await?;
+                    send_server_event(socket, &AudioServerEvent::Stopped).await?;
+                    return Ok(());
                 }
-            }
+                Ok(AudioClientEvent::Cancel) => {
+                    tracing::debug!("audio transcription cancelled by client");
+                    send_server_event(socket, &AudioServerEvent::Stopped).await?;
+                    return Ok(());
+                }
+                Ok(AudioClientEvent::Start { .. }) => {}
+                Err(e) => {
+                    send_server_event(
+                        socket,
+                        &AudioServerEvent::Error {
+                            message: format!("Invalid audio event: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            },
             Ok(Message::Close(_)) => return Ok(()),
             Ok(_) => {}
             Err(e) => anyhow::bail!("Audio websocket error: {e}"),
@@ -174,9 +162,7 @@ async fn transcribe_with_openai(
         .multipart(form)
         .send()
         .await
-        .with_context(|| {
-            format!("Failed to call OpenAI transcription API at {url}")
-        })?;
+        .with_context(|| format!("Failed to call OpenAI transcription API at {url}"))?;
     let status = response.status();
     let body = response
         .text()
@@ -207,9 +193,8 @@ fn transcription_model(configured: &str) -> String {
 }
 
 fn parse_transcription_text(body: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(body).with_context(|| {
-        format!("Invalid OpenAI transcription JSON: {body}")
-    })?;
+    let value: Value = serde_json::from_str(body)
+        .with_context(|| format!("Invalid OpenAI transcription JSON: {body}"))?;
     value
         .get("text")
         .and_then(Value::as_str)
@@ -240,8 +225,7 @@ fn pcm16_wav(pcm: &[u8], sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
         .checked_mul(u32::from(channels))
         .and_then(|v| v.checked_mul(2))
         .context("Invalid WAV byte rate")?;
-    let block_align =
-        channels.checked_mul(2).context("Invalid WAV block align")?;
+    let block_align = channels.checked_mul(2).context("Invalid WAV block align")?;
 
     let mut wav = Vec::with_capacity(44 + pcm.len());
     wav.extend_from_slice(b"RIFF");
@@ -261,12 +245,8 @@ fn pcm16_wav(pcm: &[u8], sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
     Ok(wav)
 }
 
-async fn send_server_event(
-    socket: &mut WebSocket,
-    event: &AudioServerEvent,
-) -> Result<()> {
-    let json = serde_json::to_string(event)
-        .context("Failed to serialize audio server event")?;
+async fn send_server_event(socket: &mut WebSocket, event: &AudioServerEvent) -> Result<()> {
+    let json = serde_json::to_string(event).context("Failed to serialize audio server event")?;
     socket
         .send(Message::Text(json.into()))
         .await

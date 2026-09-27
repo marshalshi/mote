@@ -132,10 +132,7 @@ impl ChatMessage {
         }
     }
 
-    pub fn tool_result(
-        tool_call_id: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
             content: Some(content.into()),
@@ -225,10 +222,7 @@ pub trait Tool: Send + Sync {
     /// The tool's definition. Must not change over the tool's lifetime:
     /// [`ToolRegistry`] computes it once and caches it.
     fn def(&self) -> ToolDef;
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<ToolExecutionResult>;
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolExecutionResult>;
 }
 
 #[derive(Debug, Clone)]
@@ -301,16 +295,15 @@ impl ToolRegistry {
         let Some(&i) = self.index.get(name) else {
             anyhow::bail!("Unknown tool: {name}");
         };
-        let mut result =
-            std::panic::AssertUnwindSafe(self.tools[i].execute(args))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|panic| {
-                    Err(anyhow::anyhow!(
-                        "tool '{name}' panicked: {}",
-                        crate::agent::panic_message(panic.as_ref())
-                    ))
-                })?;
+        let mut result = std::panic::AssertUnwindSafe(self.tools[i].execute(args))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "tool '{name}' panicked: {}",
+                    crate::agent::panic_message(panic.as_ref())
+                ))
+            })?;
         result.output = limit_tool_output(result.output);
         Ok(result)
     }
@@ -331,19 +324,14 @@ const TOOL_OUTPUT_TAIL_LINES: usize = 1000;
 /// how to narrow the request.
 fn limit_tool_output(output: String) -> String {
     let total_lines = output.lines().count();
-    if output.len() <= MAX_TOOL_OUTPUT_BYTES
-        && total_lines <= MAX_TOOL_OUTPUT_LINES
-    {
+    if output.len() <= MAX_TOOL_OUTPUT_BYTES && total_lines <= MAX_TOOL_OUTPUT_LINES {
         return output;
     }
     let head_end = output
         .match_indices('\n')
         .nth(TOOL_OUTPUT_HEAD_LINES - 1)
         .map_or(output.len(), |(i, _)| i + 1);
-    let head = crate::agent::safe_truncate(
-        &output[..head_end],
-        TOOL_OUTPUT_HEAD_BYTES,
-    );
+    let head = crate::agent::safe_truncate(&output[..head_end], TOOL_OUTPUT_HEAD_BYTES);
     let rest = &output[head.len()..];
     let tail_start = rest
         .trim_end_matches('\n')
@@ -388,11 +376,7 @@ pub fn builtin_tools(workspace_root: std::path::PathBuf) -> Vec<Box<dyn Tool>> {
 #[async_trait]
 #[allow(dead_code)] // trait methods used via dynamic dispatch
 pub trait LlmProvider: Send + Sync {
-    async fn chat(
-        &self,
-        messages: &[ChatMessage],
-        options: &ChatOptions,
-    ) -> Result<ChatResult>;
+    async fn chat(&self, messages: &[ChatMessage], options: &ChatOptions) -> Result<ChatResult>;
 
     async fn chat_stream(
         &self,
@@ -412,8 +396,7 @@ pub mod ollama;
 pub use error::{ProviderError, ProviderErrorKind};
 
 /// Time allowed to establish a connection to a provider.
-const PROVIDER_CONNECT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+const PROVIDER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// HTTP client shared by all providers' constructors: fails fast when a
 /// provider is unreachable instead of hanging a run.
@@ -457,9 +440,7 @@ pub struct ProviderTimeouts {
 
 impl ProviderTimeouts {
     pub fn from_config(config: &crate::config::Config) -> Self {
-        let secs = |value: u64| {
-            (value > 0).then(|| std::time::Duration::from_secs(value))
-        };
+        let secs = |value: u64| (value > 0).then(|| std::time::Duration::from_secs(value));
         Self {
             first_response: secs(config.server.first_response_timeout_secs),
             stream_idle: secs(config.server.stream_idle_timeout_secs),
@@ -474,12 +455,8 @@ pub fn build_provider_for(
     provider_name: &str,
 ) -> Result<Box<dyn LlmProvider>> {
     match provider_name {
-        "deepseek" => {
-            Ok(Box::new(deepseek::DeepSeekProvider::new(config, auth)?))
-        }
-        "glm" => {
-            Ok(Box::new(deepseek::DeepSeekProvider::new_glm(config, auth)?))
-        }
+        "deepseek" => Ok(Box::new(deepseek::DeepSeekProvider::new(config, auth)?)),
+        "glm" => Ok(Box::new(deepseek::DeepSeekProvider::new_glm(config, auth)?)),
         "kimi" => Ok(Box::new(deepseek::DeepSeekProvider::new_kimi(
             config, auth,
         )?)),
@@ -638,10 +615,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             if self.output == "panic" {
                 panic!("echo exploded");
             }
@@ -668,11 +642,7 @@ mod tests {
 
     #[test]
     fn test_limit_tool_output_keeps_head_and_tail() {
-        let long = format!(
-            "{}{}",
-            "x".repeat(MAX_TOOL_OUTPUT_BYTES),
-            "z".repeat(1000)
-        );
+        let long = format!("{}{}", "x".repeat(MAX_TOOL_OUTPUT_BYTES), "z".repeat(1000));
         let out = limit_tool_output(long.clone());
         assert!(out.starts_with(&"x".repeat(TOOL_OUTPUT_HEAD_BYTES)));
         assert!(out.ends_with(&"z".repeat(1000)));
@@ -686,10 +656,7 @@ mod tests {
         assert!(out.starts_with("1\n2\n"));
         assert!(out.contains(&format!("\n{TOOL_OUTPUT_HEAD_LINES}\n[...")));
         assert!(out.ends_with(&format!("\n{}", MAX_TOOL_OUTPUT_LINES + 10)));
-        assert!(
-            out.lines().count()
-                <= TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 1
-        );
+        assert!(out.lines().count() <= TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 1);
 
         // Multi-byte characters are never split.
         let wide = "é".repeat(MAX_TOOL_OUTPUT_BYTES);
@@ -699,8 +666,7 @@ mod tests {
 
     #[test]
     fn test_limit_tool_output_never_drops_the_final_status_line() {
-        let noisy =
-            format!("{}\n[exit code: 101]", "compiling crate\n".repeat(10_000));
+        let noisy = format!("{}\n[exit code: 101]", "compiling crate\n".repeat(10_000));
         let out = limit_tool_output(noisy);
         assert!(
             out.ends_with("[exit code: 101]"),
@@ -733,8 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tool_registry_execute_errors_for_unknown_and_panicking_tools()
-    {
+    async fn test_tool_registry_execute_errors_for_unknown_and_panicking_tools() {
         let registry = ToolRegistry::new(vec![echo("boom", "panic")]);
         let unknown = registry
             .execute("nope", serde_json::json!({}))

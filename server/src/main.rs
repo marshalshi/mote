@@ -55,17 +55,13 @@ struct AppState {
     completed_run_ids: tokio::sync::Mutex<VecDeque<String>>,
     /// Per-transcript locks serializing writes (runs, compaction,
     /// legacy conversion) to the same session file.
-    session_locks:
-        tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    session_locks: tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     /// Session list entries by transcript path (see `session_infos`).
     session_info_cache: Arc<std::sync::Mutex<SessionInfoCache>>,
 }
 
 impl AppState {
-    async fn session_lock(
-        &self,
-        path: &std::path::Path,
-    ) -> Arc<tokio::sync::Mutex<()>> {
+    async fn session_lock(&self, path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.session_locks.lock().await;
         Arc::clone(locks.entry(path.to_path_buf()).or_default())
     }
@@ -164,15 +160,11 @@ async fn list_models_handler(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "model listing failed for provider {name}: {e:#}"
-                    );
+                    tracing::warn!("model listing failed for provider {name}: {e:#}");
                 }
             },
             Err(e) => {
-                tracing::warn!(
-                    "provider {name} unavailable for model listing: {e:#}"
-                );
+                tracing::warn!("provider {name} unavailable for model listing: {e:#}");
             }
         }
     }
@@ -199,10 +191,8 @@ async fn audio_transcribe_handler(
             }
         }
     };
-    ws.on_upgrade(move |socket| {
-        audio::handle_transcription_socket(socket, audio_config, api_key)
-    })
-    .into_response()
+    ws.on_upgrade(move |socket| audio::handle_transcription_socket(socket, audio_config, api_key))
+        .into_response()
 }
 
 // ── Generic credential save (DeepSeek, etc.) ────────────
@@ -228,19 +218,18 @@ async fn auth_save(
     };
 
     // Extract credential: prefer token, fall back to api_key
-    let (field_name, credential) =
-        if let Some(val) = body.get("token").and_then(|v| v.as_str()) {
-            ("token", val.to_string())
-        } else if let Some(val) = body.get("api_key").and_then(|v| v.as_str()) {
-            ("api_key", val.to_string())
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "Missing field: token or api_key"
-                })),
-            );
-        };
+    let (field_name, credential) = if let Some(val) = body.get("token").and_then(|v| v.as_str()) {
+        ("token", val.to_string())
+    } else if let Some(val) = body.get("api_key").and_then(|v| v.as_str()) {
+        ("api_key", val.to_string())
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Missing field: token or api_key"
+            })),
+        );
+    };
 
     // Save in blocking task (file I/O)
     let provider_owned = provider.to_string();
@@ -284,11 +273,9 @@ async fn auth_save(
 
 /// Helper: send an error event over WebSocket.
 async fn send_error(socket: &mut WebSocket, msg: impl Into<String>) {
-    let Ok(json) =
-        serde_json::to_string(&marshaling_protocol::ServerEvent::Error {
-            message: msg.into(),
-        })
-    else {
+    let Ok(json) = serde_json::to_string(&marshaling_protocol::ServerEvent::Error {
+        message: msg.into(),
+    }) else {
         return;
     };
     let _ = socket.send(Message::Text(json.into())).await;
@@ -334,9 +321,7 @@ fn history_dir_for_session(
     base_history_dir.join(runtime_session_key)
 }
 
-fn resolve_request_context(
-    request: &marshaling_protocol::ChatRequest,
-) -> Result<RequestContext> {
+fn resolve_request_context(request: &marshaling_protocol::ChatRequest) -> Result<RequestContext> {
     let workspace_raw = request
         .workspace_root
         .as_ref()
@@ -359,10 +344,7 @@ fn resolve_request_context(
         )
     })?;
     if !workspace.is_dir() {
-        anyhow::bail!(
-            "workspace_root is not a directory: {}",
-            workspace.display()
-        );
+        anyhow::bail!("workspace_root is not a directory: {}", workspace.display());
     }
 
     let runtime_session_key = request
@@ -419,9 +401,8 @@ async fn resolve_role_aware_context(
     // When model_override and/or provider_override are set, build the
     // effective agent model to reflect both overrides for provider resolution.
     let effective_agent_model: Option<String> = {
-        let prov = provider_override.or_else(|| {
-            model_override.and_then(|m| m.split_once('/').map(|(p, _)| p))
-        });
+        let prov = provider_override
+            .or_else(|| model_override.and_then(|m| m.split_once('/').map(|(p, _)| p)));
         let mid = model_override.map(|s| {
             s.split_once('/')
                 .map(|(_, m)| m.to_string())
@@ -431,38 +412,32 @@ async fn resolve_role_aware_context(
             let prov = prov
                 .map(|s| s.to_owned())
                 .unwrap_or_else(|| config.effective_provider(agent_model));
-            let mid =
-                mid.unwrap_or_else(|| config.effective_model_id(agent_model));
+            let mid = mid.unwrap_or_else(|| config.effective_model_id(agent_model));
             Some(format!("{prov}/{mid}"))
         } else {
             agent_model.map(|s| s.to_string())
         }
     };
 
-    let mut provider_cache: HashMap<String, Arc<dyn llm::LlmProvider>> =
-        HashMap::new();
-    let mut resolved_roles: Vec<agent::ResolvedRole> =
-        Vec::with_capacity(roles.len());
+    let mut provider_cache: HashMap<String, Arc<dyn llm::LlmProvider>> = HashMap::new();
+    let mut resolved_roles: Vec<agent::ResolvedRole> = Vec::with_capacity(roles.len());
 
     for role in roles {
         // Resolve provider + model_id for this role
-        let (role_prov_name, role_model_id) = config.effective_role_model(
-            role.model.as_deref(),
-            effective_agent_model.as_deref(),
-        );
+        let (role_prov_name, role_model_id) =
+            config.effective_role_model(role.model.as_deref(), effective_agent_model.as_deref());
 
         // Deduplicate provider instances by provider name
         let provider = match provider_cache.get(&role_prov_name) {
             Some(p) => Arc::clone(p),
             None => {
                 let p: Arc<dyn llm::LlmProvider> = Arc::from(
-                    llm::build_provider_for(config, auth, &role_prov_name)
-                        .with_context(|| {
-                            format!(
-                                "Failed to build provider '{}' for role '{}'",
-                                role_prov_name, role.name
-                            )
-                        })?,
+                    llm::build_provider_for(config, auth, &role_prov_name).with_context(|| {
+                        format!(
+                            "Failed to build provider '{}' for role '{}'",
+                            role_prov_name, role.name
+                        )
+                    })?,
                 );
                 provider_cache.insert(role_prov_name.clone(), Arc::clone(&p));
                 p
@@ -475,14 +450,11 @@ async fn resolve_role_aware_context(
             .unwrap_or_default();
 
         // Resolve temperature: role -> agent -> config default
-        let temperature = config
-            .effective_temperature(role.temperature.or(agent_cfg.temperature));
+        let temperature = config.effective_temperature(role.temperature.or(agent_cfg.temperature));
 
         // Resolve max_tokens: role -> agent -> provider default -> global
-        let max_tokens = config.effective_max_tokens(
-            role.max_tokens.or(agent_cfg.max_tokens),
-            &role_prov_name,
-        );
+        let max_tokens =
+            config.effective_max_tokens(role.max_tokens.or(agent_cfg.max_tokens), &role_prov_name);
 
         resolved_roles.push(agent::ResolvedRole {
             name: role.name.clone(),
@@ -500,13 +472,9 @@ async fn resolve_role_aware_context(
     // Determine the orchestrator's effective provider name from overrides + role config
     let orc_provider_name = provider_override
         .map(|s| s.to_string())
-        .or_else(|| {
-            model_override
-                .and_then(|m| m.split_once('/').map(|(p, _)| p.to_string()))
-        })
+        .or_else(|| model_override.and_then(|m| m.split_once('/').map(|(p, _)| p.to_string())))
         .unwrap_or_else(|| {
-            let (pn, _) = config
-                .effective_role_model(roles[0].model.as_deref(), agent_model);
+            let (pn, _) = config.effective_role_model(roles[0].model.as_deref(), agent_model);
             pn
         });
 
@@ -520,18 +488,15 @@ async fn resolve_role_aware_context(
         .unwrap_or_else(|| orchestrator.model_id.clone());
 
     // Assemble shared layers (1-4, 6) using orchestrator identity
-    let prompt_assembler =
-        prompt::PromptAssembler::for_agent(config, Some(agent_cfg))
-            .with_workspace_context(
-                Some(req_ctx.workspace.clone()),
-                req_ctx.repo_agents_md.clone(),
-            );
+    let prompt_assembler = prompt::PromptAssembler::for_agent(config, Some(agent_cfg))
+        .with_workspace_context(
+            Some(req_ctx.workspace.clone()),
+            req_ctx.repo_agents_md.clone(),
+        );
     let orc_provider_name_for_closure = orc_provider_name.clone();
     let system_layers = tokio::task::spawn_blocking(move || {
-        prompt_assembler.assemble_shared_layers(
-            &orc_provider_name_for_closure,
-            &orc_model_id_for_prompt,
-        )
+        prompt_assembler
+            .assemble_shared_layers(&orc_provider_name_for_closure, &orc_model_id_for_prompt)
     })
     .await
     .map_err(|e| anyhow::anyhow!("Prompt assembly panicked: {:#}", e))??;
@@ -539,9 +504,7 @@ async fn resolve_role_aware_context(
     // Build canonical options from orchestrator (used for compaction, session metadata)
     let opts = llm::ChatOptions {
         model_id: orchestrator.model_id.clone(),
-        temperature: orchestrator
-            .temperature
-            .unwrap_or(config.model.temperature),
+        temperature: orchestrator.temperature.unwrap_or(config.model.temperature),
         max_tokens: orchestrator.max_tokens.unwrap_or(config.model.max_tokens),
         tools: Vec::new(),
     };
@@ -574,9 +537,7 @@ pub(crate) async fn resolve_agent_context(
     let agent_model = agent_cfg.and_then(|a| a.model.as_deref());
 
     // ── Role-aware mode ──────────────────────────────────
-    if let Some((agent, roles)) =
-        agent_cfg.and_then(|a| a.roles.as_ref().map(|roles| (a, roles)))
-    {
+    if let Some((agent, roles)) = agent_cfg.and_then(|a| a.roles.as_ref().map(|roles| (a, roles))) {
         return resolve_role_aware_context(
             config,
             auth,
@@ -598,10 +559,7 @@ pub(crate) async fn resolve_agent_context(
     // 3. Default: config + agent settings
     let eff_provider = provider_override
         .map(|s| s.to_string())
-        .or_else(|| {
-            model_override
-                .and_then(|m| m.split_once('/').map(|(p, _)| p.to_string()))
-        })
+        .or_else(|| model_override.and_then(|m| m.split_once('/').map(|(p, _)| p.to_string())))
         .unwrap_or_else(|| config.effective_provider(agent_model));
 
     // Model ID: when model_override is provided, it's just the model name (no provider/ prefix).
@@ -614,22 +572,18 @@ pub(crate) async fn resolve_agent_context(
         })
         .unwrap_or_else(|| config.effective_model_id(agent_model));
 
-    let eff_temperature =
-        config.effective_temperature(agent_cfg.and_then(|a| a.temperature));
+    let eff_temperature = config.effective_temperature(agent_cfg.and_then(|a| a.temperature));
 
     // Build LLM provider
     let provider: Arc<dyn llm::LlmProvider> =
         Arc::from(llm::build_provider_for(config, auth, &eff_provider)?);
 
     // Build system prompt (in blocking thread — reads filesystem)
-    let prompt = prompt::PromptAssembler::for_agent(
-        config,
-        merged_agents.get(agent_name),
-    )
-    .with_workspace_context(
-        Some(req_ctx.workspace.clone()),
-        req_ctx.repo_agents_md.clone(),
-    );
+    let prompt = prompt::PromptAssembler::for_agent(config, merged_agents.get(agent_name))
+        .with_workspace_context(
+            Some(req_ctx.workspace.clone()),
+            req_ctx.repo_agents_md.clone(),
+        );
     let eff_provider_clone = eff_provider.clone();
     let eff_model_id_clone = eff_model_id.clone();
     let system_layers = tokio::task::spawn_blocking(move || {
@@ -639,10 +593,8 @@ pub(crate) async fn resolve_agent_context(
     .map_err(|e| anyhow::anyhow!("Prompt assembly panicked: {:#}", e))??;
 
     // Build options
-    let eff_max_tokens = config.effective_max_tokens(
-        agent_cfg.and_then(|a| a.max_tokens),
-        &eff_provider,
-    );
+    let eff_max_tokens =
+        config.effective_max_tokens(agent_cfg.and_then(|a| a.max_tokens), &eff_provider);
     let opts = llm::ChatOptions {
         model_id: eff_model_id.clone(),
         temperature: eff_temperature,
@@ -711,8 +663,7 @@ fn build_augmented_tools(
     permission_broker: &agent::PermissionBroker,
     remembered_allow_tools: HashSet<String>,
 ) -> Arc<llm::ToolRegistry> {
-    let mut augmented: Vec<Box<dyn llm::Tool>> =
-        llm::builtin_tools(workspace.to_path_buf());
+    let mut augmented: Vec<Box<dyn llm::Tool>> = llm::builtin_tools(workspace.to_path_buf());
     augmented.push(Box::new(tools::UseSkillTool));
     augmented.push(Box::new(tools::FinishTaskTool));
 
@@ -756,17 +707,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     // Wait for the first message: ChatRequest
     let request = match socket.recv().await {
-        Some(Ok(Message::Text(text))) => match serde_json::from_str::<
-            marshaling_protocol::ChatRequest,
-        >(&text)
-        {
-            Ok(req) => req,
-            Err(e) => {
-                send_error(&mut socket, format!("Invalid chat request: {e}"))
-                    .await;
-                return;
+        Some(Ok(Message::Text(text))) => {
+            match serde_json::from_str::<marshaling_protocol::ChatRequest>(&text) {
+                Ok(req) => req,
+                Err(e) => {
+                    send_error(&mut socket, format!("Invalid chat request: {e}")).await;
+                    return;
+                }
             }
-        },
+        }
         _ => return,
     };
     debug!(
@@ -778,13 +727,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // Attaching to an existing run needs none of the agent setup below (and
     // must not fail because of it, e.g. after a /model change mid-run).
     if let Some(run_id) = request.run_id.clone() {
-        attach_socket_to_run(
-            socket,
-            state,
-            run_id,
-            request.replay_from.unwrap_or(0),
-        )
-        .await;
+        attach_socket_to_run(socket, state, run_id, request.replay_from.unwrap_or(0)).await;
         return;
     }
 
@@ -805,10 +748,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     } else {
         None
     };
-    let session_dir = history_dir_for_session(
-        &state.config.history.dir,
-        &req_ctx.runtime_session_key,
-    );
+    let session_dir =
+        history_dir_for_session(&state.config.history.dir, &req_ctx.runtime_session_key);
     let is_new_session = selected_session_id.is_none();
     let session_id = selected_session_id.unwrap_or_else(store::new_session_id);
     let session_path = store::transcript_path(&session_dir, &session_id);
@@ -1081,10 +1022,7 @@ async fn bind_available_listener(
         let addr = format!("127.0.0.1:{port}");
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => return Ok((listener, port)),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::AddrInUse
-                    && port < u16::MAX =>
-            {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && port < u16::MAX => {
                 tracing::warn!("Port {port} is in use; trying {}", port + 1);
                 port += 1;
             }
@@ -1100,10 +1038,7 @@ async fn main() -> Result<()> {
     // Load config early so logging path can come from config.
     let config_path = find_config()?;
     if !config_path.exists() {
-        anyhow::bail!(
-            "No config.toml found at {} or CWD.",
-            config_path.display()
-        );
+        anyhow::bail!("No config.toml found at {} or CWD.", config_path.display());
     }
     let mut config = config::Config::load(&config_path)?;
     if let Some(port) = server_port_override()? {
@@ -1136,15 +1071,14 @@ async fn main() -> Result<()> {
         let log_path = log_dir.join("mote.log");
         // If the log file cannot be opened, discard logs rather than fail
         // to start.
-        let log_file: Box<dyn std::io::Write + Send> =
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                Ok(file) => Box::new(file),
-                Err(_) => Box::new(std::io::sink()),
-            };
+        let log_file: Box<dyn std::io::Write + Send> = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(file) => Box::new(file),
+            Err(_) => Box::new(std::io::sink()),
+        };
         let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -1155,10 +1089,7 @@ async fn main() -> Result<()> {
             .with_ansi(false)
             .init();
         Box::leak(Box::new(_guard));
-        tracing::info!(
-            "Verbose logging enabled, writing to {}",
-            log_path.display()
-        );
+        tracing::info!("Verbose logging enabled, writing to {}", log_path.display());
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -1345,10 +1276,7 @@ read = "allow"
         RunPersistence {
             session_lock: Arc::default(),
             writer: Some(store::TranscriptWriter::create(
-                store::transcript_path(
-                    &dir.join("history").join("sess"),
-                    "chat-test",
-                ),
+                store::transcript_path(&dir.join("history").join("sess"), "chat-test"),
                 "chat-test".into(),
                 "p".into(),
                 "m".into(),
@@ -1360,9 +1288,7 @@ read = "allow"
         }
     }
 
-    fn test_run(
-        client_instance_id: Option<&str>,
-    ) -> (ActiveRun, watch::Receiver<bool>) {
+    fn test_run(client_instance_id: Option<&str>) -> (ActiveRun, watch::Receiver<bool>) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         (
             ActiveRun::new(
@@ -1377,10 +1303,7 @@ read = "allow"
         )
     }
 
-    async fn insert_test_run(
-        state: &Arc<AppState>,
-        run_id: &str,
-    ) -> watch::Receiver<bool> {
+    async fn insert_test_run(state: &Arc<AppState>, run_id: &str) -> watch::Receiver<bool> {
         let (run, cancel_rx) = test_run(None);
         state.runs.lock().await.insert(run_id.to_string(), run);
         cancel_rx
@@ -1389,31 +1312,21 @@ read = "allow"
     #[test]
     fn test_claim_run_slot_rejects_second_run_for_same_client_instance() {
         let mut runs = HashMap::new();
-        assert!(
-            claim_run_slot(&mut runs, "run_1", test_run(Some("tui-a")).0)
-                .is_ok()
-        );
+        assert!(claim_run_slot(&mut runs, "run_1", test_run(Some("tui-a")).0).is_ok());
         assert_eq!(
             claim_run_slot(&mut runs, "run_2", test_run(Some("tui-a")).0),
             Err(RunSlotConflict::SameClient("run_1".to_string()))
         );
         assert!(!runs.contains_key("run_2"));
         // Other instances and requests without an instance id are unaffected.
-        assert!(
-            claim_run_slot(&mut runs, "run_3", test_run(Some("tui-b")).0)
-                .is_ok()
-        );
+        assert!(claim_run_slot(&mut runs, "run_3", test_run(Some("tui-b")).0).is_ok());
         assert!(claim_run_slot(&mut runs, "run_4", test_run(None).0).is_ok());
         assert!(claim_run_slot(&mut runs, "run_5", test_run(None).0).is_ok());
     }
 
     const LEGACY_MD: &str = "---\nid: chat-old\ncreated: 2026-05-25T23:36:58Z\nupdated: 2026-05-25T23:40:00Z\nmodel_provider: ollama\nmodel_id: qwen\ntokens_input: 10\ntokens_output: 5\nversion: 0.1.0\nsummary: What is 99-1?\n---\n\n## User — 23:36:58\nWhat is 99-1?\n\n## Assistant — 23:36:59\n98\n";
 
-    fn write_transcript(
-        dir: &std::path::Path,
-        id: &str,
-        messages: &[llm::ChatMessage],
-    ) {
+    fn write_transcript(dir: &std::path::Path, id: &str, messages: &[llm::ChatMessage]) {
         let mut writer = store::TranscriptWriter::create(
             store::transcript_path(dir, id),
             id.into(),
@@ -1437,9 +1350,7 @@ read = "allow"
             Err(RunSlotConflict::SessionBusy("run_1".into()))
         );
         runs.get_mut("run_1").unwrap().finished = true;
-        assert!(
-            claim_run_slot(&mut runs, "run_3", with_session("tui-b")).is_ok()
-        );
+        assert!(claim_run_slot(&mut runs, "run_3", with_session("tui-b")).is_ok());
     }
 
     #[test]
@@ -1497,8 +1408,7 @@ read = "allow"
         assert!(store::transcript_path(dir.path(), "chat-old").exists());
         assert_eq!(std::fs::read_to_string(&md).unwrap(), LEGACY_MD);
         // Loading again uses the transcript, not a second conversion.
-        let transcript =
-            load_or_convert_session(dir.path(), "chat-old").unwrap();
+        let transcript = load_or_convert_session(dir.path(), "chat-old").unwrap();
         assert_eq!(transcript.messages.len(), 2);
         assert_eq!(transcript.tokens_input, 10);
         // The session is listed once, from the transcript.
@@ -1532,11 +1442,10 @@ read = "allow"
                 llm::ChatMessage::assistant_text("Added."),
             ],
         );
-        let mut ids: Vec<String> =
-            session_infos(dir.path(), &Default::default())
-                .into_iter()
-                .map(|i| i.id)
-                .collect();
+        let mut ids: Vec<String> = session_infos(dir.path(), &Default::default())
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
         ids.sort();
         assert_eq!(ids, ["chat-new", "chat-old"]);
 
@@ -1558,18 +1467,13 @@ read = "allow"
     fn test_session_list_cache_follows_file_changes() {
         let dir = tempfile::tempdir().unwrap();
         let cache = std::sync::Mutex::new(SessionInfoCache::new());
-        write_transcript(
-            dir.path(),
-            "chat-1",
-            &[llm::ChatMessage::user("one")],
-        );
+        write_transcript(dir.path(), "chat-1", &[llm::ChatMessage::user("one")]);
         assert_eq!(session_infos(dir.path(), &cache)[0].message_count, 1);
         assert_eq!(cache.lock().unwrap().len(), 1);
 
         // An unchanged file is served from the cache.
         let path = store::transcript_path(dir.path(), "chat-1");
-        cache.lock().unwrap().get_mut(&path).unwrap().2.summary =
-            Some("from cache".into());
+        cache.lock().unwrap().get_mut(&path).unwrap().2.summary = Some("from cache".into());
         assert_eq!(
             session_infos(dir.path(), &cache)[0].summary.as_deref(),
             Some("from cache")
@@ -1653,8 +1557,7 @@ read = "allow"
                 ),
             ],
         );
-        let transcript =
-            store::load(&store::transcript_path(dir.path(), "chat-1")).unwrap();
+        let transcript = store::load(&store::transcript_path(dir.path(), "chat-1")).unwrap();
         let history = model_history(&transcript, None);
         assert_eq!(history.len(), 3);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("c1"));
@@ -1692,9 +1595,7 @@ read = "allow"
         assert_eq!(compaction_cut(&messages[..3]), 3);
         // A single oversized step is still compacted, but never split.
         let huge = [
-            llm::ChatMessage::user(
-                "x".repeat(MAX_COMPACT_CONVERSATION_CHARS * 2),
-            ),
+            llm::ChatMessage::user("x".repeat(MAX_COMPACT_CONVERSATION_CHARS * 2)),
             call("c"),
             llm::ChatMessage::tool_result("c", "ok"),
             llm::ChatMessage::user("next"),
@@ -1853,8 +1754,7 @@ read = "allow"
             "chat-1",
             &[llm::ChatMessage::user("q"), thinking],
         );
-        let transcript =
-            store::load(&store::transcript_path(dir.path(), "chat-1")).unwrap();
+        let transcript = store::load(&store::transcript_path(dir.path(), "chat-1")).unwrap();
         // `write_transcript` records provider "p".
         let same = model_history(&transcript, Some("p"));
         assert!(same[1].reasoning_content.is_some());
@@ -1886,11 +1786,7 @@ read = "allow"
         assert!(text.contains("<previous_compaction>\nearlier summary"));
         assert!(text.contains("USER:\nfix main.rs"));
         assert!(text.contains("ASSISTANT:\nReading it."));
-        assert!(
-            text.contains(
-                r#"ASSISTANT called read({"file_path":"src/main.rs"})"#
-            )
-        );
+        assert!(text.contains(r#"ASSISTANT called read({"file_path":"src/main.rs"})"#));
         assert!(text.contains("TOOL RESULT:\n"));
         assert!(!text.contains(&long_result), "tool results are excerpted");
         assert!(text.contains("INTERNAL NOTE:\nreview it"));
@@ -1901,15 +1797,11 @@ read = "allow"
         let mut runs = HashMap::new();
         claim_run_slot(&mut runs, "run_1", test_run(Some("tui-a")).0).unwrap();
         runs.get_mut("run_1").unwrap().finished = true;
-        assert!(
-            claim_run_slot(&mut runs, "run_2", test_run(Some("tui-a")).0)
-                .is_ok()
-        );
+        assert!(claim_run_slot(&mut runs, "run_2", test_run(Some("tui-a")).0).is_ok());
     }
 
     #[tokio::test]
-    async fn test_record_run_event_marks_finished_and_clears_pending_permissions()
-     {
+    async fn test_record_run_event_marks_finished_and_clears_pending_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let state = empty_test_state(dir.path());
         let _cancel_rx = insert_test_run(&state, "run_1").await;
@@ -1972,13 +1864,10 @@ read = "allow"
             },
         )
         .await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            cancel_rx.changed(),
-        )
-        .await
-        .expect("watchdog should cancel the detached run")
-        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancel_rx.changed())
+            .await
+            .expect("watchdog should cancel the detached run")
+            .unwrap();
         assert!(*cancel_rx.borrow());
     }
 
@@ -2132,9 +2021,7 @@ read = "allow"
         assert_eq!(journal[0].tool_name, "edit");
         assert!(matches!(
             state.runs.lock().await["run_1"].events.last(),
-            Some(
-                marshaling_protocol::ServerEvent::SubagentToolCompleted { .. }
-            )
+            Some(marshaling_protocol::ServerEvent::SubagentToolCompleted { .. })
         ));
     }
 
@@ -2175,8 +2062,7 @@ read = "allow"
         // Later notes go straight to the transcript, with the next seq.
         note_rollback_in_transcript(&state, &change).await;
         let transcript = store::load(&path).unwrap();
-        let seqs: Vec<u64> =
-            transcript.messages.iter().map(|m| m.seq).collect();
+        let seqs: Vec<u64> = transcript.messages.iter().map(|m| m.seq).collect();
         assert_eq!(seqs, [0, 1]);
     }
 
@@ -2227,8 +2113,7 @@ read = "allow"
         let forwarder = tokio::spawn(async {
             panic!("save exploded");
         });
-        supervise_forwarder(Arc::clone(&state), "run_1".into(), forwarder)
-            .await;
+        supervise_forwarder(Arc::clone(&state), "run_1".into(), forwarder).await;
         assert!(cancel_rx.has_changed().unwrap());
         assert!(*cancel_rx.borrow_and_update());
         let runs = state.runs.lock().await;
@@ -2285,8 +2170,7 @@ read = "allow"
         let (agent_tx, agent_rx) = mpsc::unbounded_channel();
         let _extra_sender = agent_tx.clone();
         let run_handle = tokio::spawn(async move {
-            let _ =
-                agent_tx.send(Ok(agent::AgentEvent::TextDelta("hi".into())));
+            let _ = agent_tx.send(Ok(agent::AgentEvent::TextDelta("hi".into())));
             panic!("loop exploded");
         });
 
@@ -2421,8 +2305,7 @@ base_url = "http://localhost:11434"
             }]),
             ..Default::default()
         };
-        let perms =
-            build_permission_map(&config, Some(&agent_with_roles), &tool_names);
+        let perms = build_permission_map(&config, Some(&agent_with_roles), &tool_names);
         assert_eq!(perms.get("switch_role"), Some(&config::Permission::Allow));
 
         // Agent without roles
@@ -2430,20 +2313,17 @@ base_url = "http://localhost:11434"
             roles: None,
             ..Default::default()
         };
-        let perms2 =
-            build_permission_map(&config, Some(&agent_no_roles), &tool_names);
+        let perms2 = build_permission_map(&config, Some(&agent_no_roles), &tool_names);
         assert!(
             !perms2.contains_key("switch_role")
-                || perms2.get("switch_role")
-                    != Some(&config::Permission::Allow)
+                || perms2.get("switch_role") != Some(&config::Permission::Allow)
         );
 
         // No agent at all
         let perms3 = build_permission_map(&config, None, &tool_names);
         assert!(
             !perms3.contains_key("switch_role")
-                || perms3.get("switch_role")
-                    != Some(&config::Permission::Allow)
+                || perms3.get("switch_role") != Some(&config::Permission::Allow)
         );
     }
 }

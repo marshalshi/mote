@@ -58,11 +58,7 @@ impl Auth {
         match Self::load_from(&path) {
             Ok(auth) => auth,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to parse auth.json at {}: {:#}",
-                    path.display(),
-                    e
-                );
+                tracing::warn!("Failed to parse auth.json at {}: {:#}", path.display(), e);
                 Self::default()
             }
         }
@@ -76,10 +72,7 @@ impl Auth {
             Err(primary_err) => {
                 let repaired = repair_missing_commas_between_fields(&raw);
                 json5::from_str(&repaired).with_context(|| {
-                    format!(
-                        "Failed to parse JSON5 in {}: {primary_err}",
-                        path.display()
-                    )
+                    format!("Failed to parse JSON5 in {}: {primary_err}", path.display())
                 })?
             }
         };
@@ -164,13 +157,11 @@ pub fn save_credential(provider: &str, field: &str, value: &str) -> Result<()> {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
         // Parse as JSON5 (supports comments), fall back to plain JSON
-        json5::from_str(&raw)
-            .unwrap_or_else(|_| serde_json::from_str(&raw).unwrap_or_default())
+        json5::from_str(&raw).unwrap_or_else(|_| serde_json::from_str(&raw).unwrap_or_default())
     } else {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create ~/.config/mote")?;
+            std::fs::create_dir_all(parent).context("Failed to create ~/.config/mote")?;
         }
         Auth::default()
     };
@@ -188,10 +179,8 @@ pub fn save_credential(provider: &str, field: &str, value: &str) -> Result<()> {
         }
     }
 
-    let json = serde_json::to_string_pretty(&auth)
-        .context("Failed to serialize auth.json")?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    let json = serde_json::to_string_pretty(&auth).context("Failed to serialize auth.json")?;
+    std::fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
 
     tracing::info!(
         "Saved credential '{field}' for provider '{provider}' to {}",
@@ -296,15 +285,13 @@ mod tests {
     fn test_load_from_nonexistent_file_returns_empty() {
         // load() won't find our test file since it looks in ~/.config/mote/
         // But load_from should fail with an error
-        let result =
-            Auth::load_from(Path::new("/tmp/__nonexistent_auth_file_xyz__"));
+        let result = Auth::load_from(Path::new("/tmp/__nonexistent_auth_file_xyz__"));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_json5_with_extra_field() {
-        let json5_str =
-            r#"{"custom_provider": { "api_key": "k", "extra_field": "v" }}"#;
+        let json5_str = r#"{"custom_provider": { "api_key": "k", "extra_field": "v" }}"#;
         let auth: Auth = json5::from_str(json5_str).unwrap();
         let pa = auth.for_provider("custom_provider").unwrap();
         assert_eq!(pa.api_key(), Some("k"));
@@ -328,9 +315,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&auth).unwrap();
         std::fs::write(&path, &json).unwrap();
 
-        let read: Auth =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
-                .unwrap();
+        let read: Auth = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(read.token("custom").unwrap(), "ghp_test_token");
         assert!(read.api_key("custom").is_none());
     }
@@ -362,9 +347,7 @@ mod tests {
         std::fs::write(&path, &json).unwrap();
 
         // Read back and verify
-        let read: Auth =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
-                .unwrap();
+        let read: Auth = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(read.api_key("deepseek").unwrap(), "sk-test");
         assert!(read.token("deepseek").is_none());
     }
@@ -384,9 +367,7 @@ mod tests {
         std::fs::write(&path, &json).unwrap();
 
         // Read back and verify
-        let read: Auth =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
-                .unwrap();
+        let read: Auth = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(read.token("custom").unwrap(), "ghp-test");
         assert!(read.api_key("custom").is_none());
     }

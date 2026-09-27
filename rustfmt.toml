@@ -1,0 +1,4 @@
+# Pinned in the repo so local runs match CI: without this file rustfmt
+# falls back to a user's ~/.rustfmt.toml and reformats every file.
+edition = "2024"
+max_width = 100

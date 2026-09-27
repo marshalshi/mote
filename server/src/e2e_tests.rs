@@ -69,11 +69,8 @@ async fn fake_chat(
         }))
         .into_response(),
         Some(Reply::Status(code, body, retry_after_ms)) => {
-            let mut response = (
-                axum::http::StatusCode::from_u16(code).unwrap(),
-                body,
-            )
-                .into_response();
+            let mut response =
+                (axum::http::StatusCode::from_u16(code).unwrap(), body).into_response();
             if let Some(ms) = retry_after_ms {
                 response
                     .headers_mut()
@@ -141,10 +138,7 @@ const CLIENT_KEY: &str = "e2e-key";
 impl Harness {
     async fn start() -> Self {
         let (fake, fake_url) = start_fake_provider().await;
-        let dirs = Arc::new((
-            tempfile::tempdir().unwrap(),
-            tempfile::tempdir().unwrap(),
-        ));
+        let dirs = Arc::new((tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()));
         std::fs::write(
             dirs.1.path().join("notes.txt"),
             "The secret word is: lighthouse\n",
@@ -193,8 +187,7 @@ impl Harness {
 
     async fn connect(&self, request: &ChatRequest) -> Ws {
         let ws_url = format!("{}/chat", self.url.replace("http://", "ws://"));
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         ws.send(WsMessage::Text(serde_json::to_string(request).unwrap()))
             .await
             .unwrap();
@@ -233,10 +226,8 @@ write = "ask"
     .unwrap();
     config.history.dir = history_dir.to_path_buf();
     // Keep tests independent of the developer's ~/.config/mote/AGENTS.md.
-    let build_agent = config::parse_agent_markdown(
-        "---\ndisable_user_agents_md: true\n---\n",
-    )
-    .unwrap();
+    let build_agent =
+        config::parse_agent_markdown("---\ndisable_user_agents_md: true\n---\n").unwrap();
     let state = Arc::new(AppState {
         config,
         auth: RwLock::new(auth::Auth::default()),
@@ -257,9 +248,8 @@ write = "ask"
 
 // ── WebSocket client ──────────────────────────────────────
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn next_event(ws: &mut Ws) -> ServerEvent {
     loop {
@@ -356,8 +346,7 @@ async fn tool_turn_is_stored_and_sent_back_on_the_next_turn() {
     let session = session_id(&events);
 
     // The transcript holds the tool call and its result.
-    let transcript =
-        store::load(&store::transcript_path(&h.history(), &session)).unwrap();
+    let transcript = store::load(&store::transcript_path(&h.history(), &session)).unwrap();
     assert!(transcript.messages.iter().any(|m| {
         m.message.tool_call_id.as_deref() == Some("call_1")
             && m.message
@@ -477,11 +466,8 @@ async fn fatal_provider_error_ends_the_run_and_keeps_the_message() {
         1,
         "context overflow is not retried"
     );
-    let transcript = store::load(&store::transcript_path(
-        &h.history(),
-        &session_id(&events),
-    ))
-    .unwrap();
+    let transcript =
+        store::load(&store::transcript_path(&h.history(), &session_id(&events))).unwrap();
     assert_eq!(
         transcript.messages[0].message.content.as_deref(),
         Some("a very long question")
@@ -519,8 +505,7 @@ async fn second_request_from_the_same_client_attaches_to_the_active_run() {
 #[tokio::test]
 async fn session_continues_after_a_server_restart() {
     let (fake, fake_url) = start_fake_provider().await;
-    let dirs =
-        Arc::new((tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()));
+    let dirs = Arc::new((tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()));
     let first = Harness {
         url: serve(&fake_url, dirs.0.path()).await,
         fake: Arc::clone(&fake),
@@ -603,16 +588,15 @@ async fn rollback_is_noted_for_the_model() {
     let session = session_id(&until_terminal(&mut ws, true).await);
     assert!(h.workspace().join("made.txt").exists());
 
-    let result: marshaling_protocol::RollbackResultPayload =
-        reqwest::Client::new()
-            .post(format!("{}/rollback/last", h.url))
-            .json(&json!({"runtime_session_key": CLIENT_KEY}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let result: marshaling_protocol::RollbackResultPayload = reqwest::Client::new()
+        .post(format!("{}/rollback/last", h.url))
+        .json(&json!({"runtime_session_key": CLIENT_KEY}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert!(result.success, "{}", result.message);
     assert!(!h.workspace().join("made.txt").exists());
 
@@ -645,11 +629,8 @@ async fn context_overflow_prunes_old_tool_output_and_retries() {
     let h = Harness::start().await;
     std::fs::write(h.workspace().join("big.txt"), "data ".repeat(200)).unwrap();
     for id in ["c1", "c2", "c3"] {
-        h.fake.push(tool_reply(&[(
-            id,
-            "read",
-            json!({"file_path": "big.txt"}),
-        )]));
+        h.fake
+            .push(tool_reply(&[(id, "read", json!({"file_path": "big.txt"}))]));
     }
     h.fake.push(Reply::Status(
         400,
@@ -695,9 +676,7 @@ async fn rollback_during_a_run_reaches_the_running_model() {
     // Approve the first write; stop at the second prompt.
     let mut prompts = 0;
     let second_prompt = loop {
-        if let ServerEvent::PermissionRequest { id, .. } =
-            next_event(&mut ws).await
-        {
+        if let ServerEvent::PermissionRequest { id, .. } = next_event(&mut ws).await {
             prompts += 1;
             if prompts == 1 {
                 answer(&mut ws, &id, true).await;
@@ -709,16 +688,15 @@ async fn rollback_during_a_run_reaches_the_running_model() {
     assert!(h.workspace().join("a.txt").exists());
 
     // While the run waits, the user rolls back the first write.
-    let result: marshaling_protocol::RollbackResultPayload =
-        reqwest::Client::new()
-            .post(format!("{}/rollback/last", h.url))
-            .json(&json!({"runtime_session_key": CLIENT_KEY}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let result: marshaling_protocol::RollbackResultPayload = reqwest::Client::new()
+        .post(format!("{}/rollback/last", h.url))
+        .json(&json!({"runtime_session_key": CLIENT_KEY}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert!(result.success, "{}", result.message);
     assert!(!h.workspace().join("a.txt").exists());
 

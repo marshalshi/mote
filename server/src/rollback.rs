@@ -37,8 +37,7 @@ pub(crate) async fn apply_rollback_last(
         let Some(session) = sessions.get_mut(runtime_session_key) else {
             return marshaling_protocol::RollbackResultPayload {
                 success: false,
-                message: "No reversible changes available in this session."
-                    .into(),
+                message: "No reversible changes available in this session.".into(),
                 changes: Vec::new(),
             };
         };
@@ -47,8 +46,7 @@ pub(crate) async fn apply_rollback_last(
             None => {
                 return marshaling_protocol::RollbackResultPayload {
                     success: false,
-                    message: "No reversible changes available in this session."
-                        .into(),
+                    message: "No reversible changes available in this session.".into(),
                     changes: Vec::new(),
                 };
             }
@@ -59,8 +57,7 @@ pub(crate) async fn apply_rollback_last(
     for entry in &cs.entries {
         match entry.kind {
             llm::RollbackKind::Modified => {
-                let content = match tokio::fs::read_to_string(&entry.path).await
-                {
+                let content = match tokio::fs::read_to_string(&entry.path).await {
                     Ok(c) => c,
                     Err(e) => {
                         return marshaling_protocol::RollbackResultPayload {
@@ -95,8 +92,7 @@ pub(crate) async fn apply_rollback_last(
                         changes: Vec::new(),
                     };
                 }
-                let content = match tokio::fs::read_to_string(&entry.path).await
-                {
+                let content = match tokio::fs::read_to_string(&entry.path).await {
                     Ok(c) => c,
                     Err(e) => {
                         return marshaling_protocol::RollbackResultPayload {
@@ -144,10 +140,7 @@ pub(crate) async fn apply_rollback_last(
                 {
                     return marshaling_protocol::RollbackResultPayload {
                         success: false,
-                        message: format!(
-                            "Rollback failed writing {}: {e}",
-                            entry.path.display()
-                        ),
+                        message: format!("Rollback failed writing {}: {e}", entry.path.display()),
                         changes: Vec::new(),
                     };
                 }
@@ -156,10 +149,7 @@ pub(crate) async fn apply_rollback_last(
                 if let Err(e) = tokio::fs::remove_file(&entry.path).await {
                     return marshaling_protocol::RollbackResultPayload {
                         success: false,
-                        message: format!(
-                            "Rollback failed removing {}: {e}",
-                            entry.path.display()
-                        ),
+                        message: format!("Rollback failed removing {}: {e}", entry.path.display()),
                         changes: Vec::new(),
                     };
                 }
@@ -171,15 +161,11 @@ pub(crate) async fn apply_rollback_last(
                     {
                         return marshaling_protocol::RollbackResultPayload {
                             success: false,
-                            message: format!(
-                                "Rollback failed creating {}: {e}",
-                                parent.display()
-                            ),
+                            message: format!("Rollback failed creating {}: {e}", parent.display()),
                             changes: Vec::new(),
                         };
                     }
-                    if let Err(e) = tokio::fs::write(&entry.path, before).await
-                    {
+                    if let Err(e) = tokio::fs::write(&entry.path, before).await {
                         return marshaling_protocol::RollbackResultPayload {
                             success: false,
                             message: format!(
@@ -216,10 +202,7 @@ pub(crate) async fn apply_rollback_last(
 /// a run that is just starting: a run claims its slot before it takes the
 /// lock to open the transcript, so it is either seen here as running or
 /// opens the transcript after the note was written.
-pub(crate) async fn note_rollback_in_transcript(
-    state: &Arc<AppState>,
-    cs: &RollbackChangeSet,
-) {
+pub(crate) async fn note_rollback_in_transcript(state: &Arc<AppState>, cs: &RollbackChangeSet) {
     let Some(path) = cs.transcript.clone() else {
         return;
     };

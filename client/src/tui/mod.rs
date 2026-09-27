@@ -74,8 +74,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
     let mut health_interval = tokio::time::interval(Duration::from_secs(5));
     health_interval.reset();
 
-    let mut animation_interval =
-        tokio::time::interval(Duration::from_millis(120));
+    let mut animation_interval = tokio::time::interval(Duration::from_millis(120));
     animation_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -88,8 +87,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
         }
 
         // Process events
-        let animate_loading =
-            should_animate_loading(&app, chat_stream.is_some());
+        let animate_loading = should_animate_loading(&app, chat_stream.is_some());
 
         if let Some(ref mut stream) = chat_stream {
             tokio::select! {
@@ -211,19 +209,10 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
         if app.pending_audio_toggle {
             app.pending_audio_toggle = false;
             if audio_stream.is_some() || audio_capture.is_some() {
-                stop_audio_transcription(
-                    &mut app,
-                    &audio_stream,
-                    &mut audio_capture,
-                );
+                stop_audio_transcription(&mut app, &audio_stream, &mut audio_capture);
             } else {
-                start_audio_transcription(
-                    client,
-                    &mut app,
-                    &mut audio_stream,
-                    &mut audio_capture,
-                )
-                .await;
+                start_audio_transcription(client, &mut app, &mut audio_stream, &mut audio_capture)
+                    .await;
             }
         }
 
@@ -252,44 +241,31 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                 },
                 SlashAction::OpenSessions => {
                     if chat_stream.is_some() || app.state != AppState::Idle {
-                        app.messages.push(
-                            self::state::DisplayMessage::command(
-                                crate::llm::Role::Assistant,
-                                "Cannot open sessions while agent is running."
-                                    .into(),
-                            ),
-                        );
+                        app.messages.push(self::state::DisplayMessage::command(
+                            crate::llm::Role::Assistant,
+                            "Cannot open sessions while agent is running.".into(),
+                        ));
                     } else {
-                        match client
-                            .list_sessions(&app.runtime_session_key)
-                            .await
-                        {
+                        match client.list_sessions(&app.runtime_session_key).await {
                             Ok(sessions) => app.open_session_picker(sessions),
-                            Err(e) => {
-                                app.messages.push(self::state::DisplayMessage {
-                                    role: crate::llm::Role::Assistant,
-                                    content: format!("Error: {e}"),
-                                    thinking: None,
-                                    source: self::state::MessageSource::Error,
-                                })
-                            }
+                            Err(e) => app.messages.push(self::state::DisplayMessage {
+                                role: crate::llm::Role::Assistant,
+                                content: format!("Error: {e}"),
+                                thinking: None,
+                                source: self::state::MessageSource::Error,
+                            }),
                         }
                     }
                 }
                 SlashAction::LoadSession(id) => {
                     if chat_stream.is_some() || app.state != AppState::Idle {
-                        app.messages.push(
-                            self::state::DisplayMessage::command(
-                                crate::llm::Role::Assistant,
-                                "Cannot load a session while agent is running."
-                                    .into(),
-                            ),
-                        );
+                        app.messages.push(self::state::DisplayMessage::command(
+                            crate::llm::Role::Assistant,
+                            "Cannot load a session while agent is running.".into(),
+                        ));
                         continue;
                     }
-                    let result = client
-                        .load_session(&app.runtime_session_key, &id)
-                        .await;
+                    let result = client.load_session(&app.runtime_session_key, &id).await;
                     match result {
                         Ok(session) => {
                             app.reset_for_loaded_session();
@@ -310,44 +286,27 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                             app.server_context_chars = session.context_chars;
                             app.active_session_id = Some(id.clone());
                             app.scroll_to_bottom();
-                            app.messages.push(
-                                self::state::DisplayMessage::command(
-                                    crate::llm::Role::Assistant,
-                                    format!("Resumed session: {id}"),
-                                ),
-                            );
+                            app.messages.push(self::state::DisplayMessage::command(
+                                crate::llm::Role::Assistant,
+                                format!("Resumed session: {id}"),
+                            ));
                         }
-                        Err(e) => {
-                            app.messages.push(self::state::DisplayMessage {
-                                role: crate::llm::Role::Assistant,
-                                content: format!(
-                                    "Failed to load session {id}: {e}"
-                                ),
-                                thinking: None,
-                                source: self::state::MessageSource::Error,
-                            })
-                        }
+                        Err(e) => app.messages.push(self::state::DisplayMessage {
+                            role: crate::llm::Role::Assistant,
+                            content: format!("Failed to load session {id}: {e}"),
+                            thinking: None,
+                            source: self::state::MessageSource::Error,
+                        }),
                     }
                 }
                 SlashAction::Compact {
                     include_latest_user,
                 } => {
-                    start_compaction(
-                        client,
-                        &mut app,
-                        include_latest_user,
-                        &background_tx,
-                    );
+                    start_compaction(client, &mut app, include_latest_user, &background_tx);
                 }
                 SlashAction::SaveCredential(provider, key, value) => {
-                    let result = match client
-                        .save_credential(&provider, &key, &value)
-                        .await
-                    {
-                        Ok(()) => format!(
-                            "✅ {} API key saved to auth.json.",
-                            provider
-                        ),
+                    let result = match client.save_credential(&provider, &key, &value).await {
+                        Ok(()) => format!("✅ {} API key saved to auth.json.", provider),
                         Err(e) => format!("Error: {e}"),
                     };
                     app.messages.push(self::state::DisplayMessage {
@@ -358,17 +317,20 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     });
                 }
                 SlashAction::RollbackLast => {
-                    let result = match client
-                        .rollback_last(&app.runtime_session_key)
-                        .await
-                    {
+                    let result = match client.rollback_last(&app.runtime_session_key).await {
                         Ok(payload) => {
                             let mut lines = vec![payload.message];
                             for ch in payload.changes {
                                 match ch.kind {
-                                    marshaling_protocol::FileChangeKind::Added => lines.push(format!("! new file added: {}", ch.path)),
-                                    marshaling_protocol::FileChangeKind::Removed => lines.push(format!("! file removed: {}", ch.path)),
-                                    marshaling_protocol::FileChangeKind::Modified => lines.push(format!("~ modified: {}", ch.path)),
+                                    marshaling_protocol::FileChangeKind::Added => {
+                                        lines.push(format!("! new file added: {}", ch.path))
+                                    }
+                                    marshaling_protocol::FileChangeKind::Removed => {
+                                        lines.push(format!("! file removed: {}", ch.path))
+                                    }
+                                    marshaling_protocol::FileChangeKind::Modified => {
+                                        lines.push(format!("~ modified: {}", ch.path))
+                                    }
                                 }
                             }
                             lines.join("\n")
@@ -383,12 +345,9 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     });
                 }
                 SlashAction::RunShell(command) => {
-                    let result =
-                        run_shell_command(&command, &app.workspace_root).await;
+                    let result = run_shell_command(&command, &app.workspace_root).await;
                     let (content, source) = match result {
-                        Ok(output) => {
-                            (output, self::state::MessageSource::Command)
-                        }
+                        Ok(output) => (output, self::state::MessageSource::Command),
                         Err(e) => (
                             format!("Shell command failed to start: {e:#}"),
                             self::state::MessageSource::Error,
@@ -403,24 +362,16 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     app.scroll_to_bottom();
                 }
                 SlashAction::RunCustomCommand(invocation) => {
-                    let workspace_root =
-                        std::path::PathBuf::from(&app.workspace_root);
-                    match crate::slash_command::expand_custom_command(
-                        &invocation,
-                        &workspace_root,
-                    )
-                    .await
+                    let workspace_root = std::path::PathBuf::from(&app.workspace_root);
+                    match crate::slash_command::expand_custom_command(&invocation, &workspace_root)
+                        .await
                     {
-                        Ok(prompt) => {
-                            app.submit_expanded_custom_command(prompt)
-                        }
+                        Ok(prompt) => app.submit_expanded_custom_command(prompt),
                         Err(e) => {
                             app.clear_pending_command_overrides();
                             app.messages.push(self::state::DisplayMessage {
                                 role: crate::llm::Role::Assistant,
-                                content: format!(
-                                    "Custom command failed: {e:#}"
-                                ),
+                                content: format!("Custom command failed: {e:#}"),
                                 thinking: None,
                                 source: self::state::MessageSource::Error,
                             });
@@ -433,12 +384,8 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
         // Ctrl+C pressed again while a cancel is stuck waiting for the
         // connection: stop reconnecting and give control back to the user.
-        if std::mem::take(&mut app.stop_reattach_requested)
-            && reattach_attempt.take().is_some()
-        {
-            app.connection_lost(
-                "Stopped reconnecting. The run may still be active on the server.",
-            );
+        if std::mem::take(&mut app.stop_reattach_requested) && reattach_attempt.take().is_some() {
+            app.connection_lost("Stopped reconnecting. The run may still be active on the server.");
         }
 
         // Send pending permission response if any. While reattaching, keep it
@@ -450,12 +397,11 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
             app.answered_permissions
                 .insert(id.clone(), (allowed, remember));
             if let Some(ref mut stream) = chat_stream {
-                let resp =
-                    marshaling_protocol::ClientEvent::PermissionResponse {
-                        id,
-                        allowed,
-                        remember,
-                    };
+                let resp = marshaling_protocol::ClientEvent::PermissionResponse {
+                    id,
+                    allowed,
+                    remember,
+                };
                 // Send synchronously — quick operation, won't block
                 if let Err(e) = stream.send(resp).await {
                     tracing::warn!("Failed to send permission response: {e}");
@@ -465,9 +411,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
         // Send cancel signal if user pressed Escape/CancelAgent during streaming.
         // While reattaching, keep it pending until the websocket is back.
-        if app.pending_cancel
-            && (reattach_attempt.is_none() || chat_stream.is_some())
-        {
+        if app.pending_cancel && (reattach_attempt.is_none() || chat_stream.is_some()) {
             app.pending_cancel = false;
             if let Some(ref mut stream) = chat_stream {
                 let cancel_event = marshaling_protocol::ClientEvent::Cancel;
@@ -506,11 +450,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 }
 
 /// Start a chat via WebSocket, returning a receiver for server events.
-async fn start_chat(
-    client: &MoteClient,
-    app: &mut App,
-    chat_stream: &mut Option<ChatStream>,
-) {
+async fn start_chat(client: &MoteClient, app: &mut App, chat_stream: &mut Option<ChatStream>) {
     let user_msg = match app.pending_user_message_content() {
         Some(content) => content.to_string(),
         None => return,
@@ -536,8 +476,7 @@ async fn start_chat(
                     *chat_stream = Some(stream);
                 }
                 Err(e) => {
-                    app.server_health =
-                        ServerHealth::Disconnected(format!("{:#}", e));
+                    app.server_health = ServerHealth::Disconnected(format!("{:#}", e));
                     app.set_error(&format!("Failed to connect: {:#}", e));
                 }
             }
@@ -553,8 +492,7 @@ fn start_compaction(
 ) {
     // The server compacts its own transcript of the session; the local
     // view only decides whether there is anything worth compacting.
-    let nothing_new =
-        app.compact_history_messages(include_latest_user).is_empty();
+    let nothing_new = app.compact_history_messages(include_latest_user).is_empty();
     if app.active_session_id.is_none() || nothing_new {
         // Don't ask again for this message; if it was an auto-compaction
         // prompt, the message is still sent (`pending_auto_compact_send`).
@@ -571,8 +509,7 @@ fn start_compaction(
         return;
     }
 
-    let (model_override, provider_override) =
-        app.current_model_override_parts();
+    let (model_override, provider_override) = app.current_model_override_parts();
     let request = marshaling_protocol::CompactRequest {
         agent: app.request_agent().to_string(),
         model_override,
@@ -601,10 +538,7 @@ fn handle_background_event(app: &mut App, event: BackgroundEvent) {
             app.finish_background_activity();
             match result {
                 Ok(response) => {
-                    app.apply_compaction(
-                        response.session_id,
-                        response.compaction,
-                    );
+                    app.apply_compaction(response.session_id, response.compaction);
                 }
                 Err(e) => {
                     app.pending_auto_compact_send = false;
@@ -626,16 +560,11 @@ fn handle_background_event(app: &mut App, event: BackgroundEvent) {
 }
 
 fn should_animate_loading(app: &App, chat_stream_active: bool) -> bool {
-    app.loading_progress.is_some()
-        || (chat_stream_active && app.has_running_tool_animation())
+    app.loading_progress.is_some() || (chat_stream_active && app.has_running_tool_animation())
 }
 
-fn build_chat_request(
-    app: &App,
-    user_msg: String,
-) -> marshaling_protocol::ChatRequest {
-    let (model_override, provider_override) =
-        app.current_model_override_parts();
+fn build_chat_request(app: &App, user_msg: String) -> marshaling_protocol::ChatRequest {
+    let (model_override, provider_override) = app.current_model_override_parts();
 
     // Only the new message is sent: the server continues the session from
     // its own transcript (full tool history included).
@@ -682,53 +611,35 @@ async fn start_audio_transcription(
     match client.audio_transcription_stream(config).await {
         Ok(mut stream) => {
             tracing::debug!("audio transcription websocket connected");
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                stream.rx.recv(),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_secs(10), stream.rx.recv()).await {
                 Ok(Some(marshaling_protocol::AudioServerEvent::Started)) => {
                     tracing::debug!("audio transcription server is ready")
                 }
-                Ok(Some(marshaling_protocol::AudioServerEvent::Error {
-                    message,
-                })) => {
-                    tracing::warn!(
-                        "audio transcription failed before recording: {message}"
-                    );
+                Ok(Some(marshaling_protocol::AudioServerEvent::Error { message })) => {
+                    tracing::warn!("audio transcription failed before recording: {message}");
                     stream.cancel();
                     app.audio_state = AudioState::Error(message.clone());
                     return;
                 }
                 Ok(Some(event)) => {
-                    tracing::warn!(
-                        ?event,
-                        "unexpected audio event before recording"
-                    );
+                    tracing::warn!(?event, "unexpected audio event before recording");
                     stream.cancel();
-                    app.audio_state = AudioState::Error(
-                        "Unexpected audio server event before recording".into(),
-                    );
+                    app.audio_state =
+                        AudioState::Error("Unexpected audio server event before recording".into());
                     return;
                 }
                 Ok(None) => {
-                    tracing::warn!(
-                        "audio transcription websocket closed before server ready"
-                    );
+                    tracing::warn!("audio transcription websocket closed before server ready");
                     app.audio_state = AudioState::Error(
                         "Audio transcription connection closed before recording started".into(),
                     );
                     return;
                 }
                 Err(_) => {
-                    tracing::warn!(
-                        "timed out waiting for audio transcription server readiness"
-                    );
+                    tracing::warn!("timed out waiting for audio transcription server readiness");
                     stream.cancel();
                     app.audio_state = AudioState::Error(
-                        "Timed out waiting for audio transcription server"
-                            .into(),
+                        "Timed out waiting for audio transcription server".into(),
                     );
                     return;
                 }
@@ -741,9 +652,7 @@ async fn start_audio_transcription(
                     app.audio_state = AudioState::Recording;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "failed to start microphone recording: {e:#}"
-                    );
+                    tracing::warn!("failed to start microphone recording: {e:#}");
                     stream.cancel();
                     app.audio_state = AudioState::Error(format!("{e:#}"));
                 }
@@ -791,34 +700,23 @@ fn handle_audio_event(
             tracing::debug!("audio transcription server reported started");
             app.audio_state = AudioState::Recording;
         }
-        Some(marshaling_protocol::AudioServerEvent::TranscriptDelta {
-            ..
-        }) => {}
-        Some(marshaling_protocol::AudioServerEvent::TranscriptFinal {
-            text,
-        }) => {
-            tracing::debug!(
-                chars = text.chars().count(),
-                "audio transcript finalized"
-            );
+        Some(marshaling_protocol::AudioServerEvent::TranscriptDelta { .. }) => {}
+        Some(marshaling_protocol::AudioServerEvent::TranscriptFinal { text }) => {
+            tracing::debug!(chars = text.chars().count(), "audio transcript finalized");
             app.insert_transcript(&text);
             app.audio_state = AudioState::Idle;
             *audio_stream = None;
             *audio_capture = None;
         }
         Some(marshaling_protocol::AudioServerEvent::Stopped) => {
-            tracing::warn!(
-                "audio transcription stopped without a final transcript"
-            );
+            tracing::warn!("audio transcription stopped without a final transcript");
             app.audio_state = AudioState::Idle;
             *audio_stream = None;
             *audio_capture = None;
             app.touch_response_render();
         }
         None => {
-            tracing::warn!(
-                "audio transcription channel closed without a final event"
-            );
+            tracing::warn!("audio transcription channel closed without a final event");
             app.audio_state = AudioState::Idle;
             *audio_stream = None;
             *audio_capture = None;
@@ -860,8 +758,7 @@ fn handle_key_event(
             }
             if app.pending_compact_confirmation {
                 match key.code {
-                    crossterm::event::KeyCode::Char('y')
-                    | crossterm::event::KeyCode::Char('Y') => {
+                    crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
                         app.accept_auto_compact();
                     }
                     crossterm::event::KeyCode::Char('n')
@@ -876,9 +773,7 @@ fn handle_key_event(
             if app.session_picker_open {
                 match key.code {
                     crossterm::event::KeyCode::Up => app.session_picker_up(),
-                    crossterm::event::KeyCode::Down => {
-                        app.session_picker_down()
-                    }
+                    crossterm::event::KeyCode::Down => app.session_picker_down(),
                     crossterm::event::KeyCode::Esc => {
                         app.close_session_picker();
                     }
@@ -888,8 +783,7 @@ fn handle_key_event(
                             .get(app.session_picker_index)
                             .cloned()
                         {
-                            app.pending_slash =
-                                Some(SlashAction::LoadSession(s.id));
+                            app.pending_slash = Some(SlashAction::LoadSession(s.id));
                         }
                         app.close_session_picker();
                     }
@@ -971,8 +865,7 @@ fn handle_action(
                 (Some(Action::SendMessage), _)
                     | (
                         None,
-                        crossterm::event::KeyCode::Char('y')
-                            | crossterm::event::KeyCode::Char('Y')
+                        crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y')
                     )
             );
             let should_cancel = matches!(
@@ -980,15 +873,13 @@ fn handle_action(
                 (Some(Action::Quit), _)
                     | (
                         None,
-                        crossterm::event::KeyCode::Char('n')
-                            | crossterm::event::KeyCode::Char('N')
+                        crossterm::event::KeyCode::Char('n') | crossterm::event::KeyCode::Char('N')
                     )
             );
             if should_confirm {
                 // User confirmed "Allow Always" — remember for the session
                 app.auto_allowed_tools.insert(perm.tool_name.clone());
-                app.pending_permission_response =
-                    Some((perm.id.clone(), true, true));
+                app.pending_permission_response = Some((perm.id.clone(), true, true));
             } else if should_cancel {
                 // Cancel confirmation — back to permission prompt
                 perm.confirming_always = false;
@@ -1004,16 +895,14 @@ fn handle_action(
                 (Some(Action::SendMessage), _)
                     | (
                         None,
-                        crossterm::event::KeyCode::Char('y')
-                            | crossterm::event::KeyCode::Char('Y')
+                        crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y')
                     )
             );
             let should_always = matches!(
                 (action, code),
                 (
                     None,
-                    crossterm::event::KeyCode::Char('a')
-                        | crossterm::event::KeyCode::Char('A')
+                    crossterm::event::KeyCode::Char('a') | crossterm::event::KeyCode::Char('A')
                 )
             );
             let should_deny = matches!(
@@ -1021,8 +910,7 @@ fn handle_action(
                 (Some(Action::Quit), _)
                     | (
                         None,
-                        crossterm::event::KeyCode::Char('n')
-                            | crossterm::event::KeyCode::Char('N')
+                        crossterm::event::KeyCode::Char('n') | crossterm::event::KeyCode::Char('N')
                     )
             );
             if should_always {
@@ -1030,8 +918,7 @@ fn handle_action(
                 perm.confirming_always = true;
                 app.pending_permission = Some(perm);
             } else if should_allow || should_deny {
-                app.pending_permission_response =
-                    Some((perm.id.clone(), should_allow, false));
+                app.pending_permission_response = Some((perm.id.clone(), should_allow, false));
             } else {
                 // Unhandled key — restore permission
                 app.pending_permission = Some(perm);
@@ -1067,8 +954,7 @@ fn handle_action(
                 } else {
                     app.messages.push(self::state::DisplayMessage::command(
                         crate::llm::Role::Assistant,
-                        "Press Esc again within 2s to stop running agent."
-                            .into(),
+                        "Press Esc again within 2s to stop running agent.".into(),
                     ));
                 }
             } else if app.state == AppState::WaitingResponse {
@@ -1153,15 +1039,12 @@ fn handle_action(
                     app.history_up();
                 }
             }
-            Some(Action::HistoryDown)
-                if !handle_input_vertical_scroll(app, false) =>
-            {
+            Some(Action::HistoryDown) if !handle_input_vertical_scroll(app, false) => {
                 app.history_down();
             }
             None => {
                 if let crossterm::event::KeyCode::Char(c) = code {
-                    let clean = modifiers == KeyModifiers::NONE
-                        || modifiers == KeyModifiers::SHIFT;
+                    let clean = modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT;
                     if clean {
                         app.insert_char(c);
                     }
@@ -1180,9 +1063,7 @@ fn handle_action(
                     app.history_up();
                 }
             }
-            Some(Action::HistoryDown)
-                if !handle_input_vertical_scroll(app, false) =>
-            {
+            Some(Action::HistoryDown) if !handle_input_vertical_scroll(app, false) => {
                 app.history_down();
             }
             _ => {}
@@ -1302,8 +1183,7 @@ fn normal_action(
         }
         None => {
             if let crossterm::event::KeyCode::Char(c) = code {
-                let clean = modifiers == KeyModifiers::NONE
-                    || modifiers == KeyModifiers::SHIFT;
+                let clean = modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT;
                 if clean && app.state == AppState::Idle {
                     app.insert_char(c);
                 }
@@ -1314,8 +1194,7 @@ fn normal_action(
 }
 
 fn handle_input_vertical_scroll(app: &mut App, upward: bool) -> bool {
-    let Some((term_width, term_height)) = crossterm::terminal::size().ok()
-    else {
+    let Some((term_width, term_height)) = crossterm::terminal::size().ok() else {
         return false;
     };
     let full_area = Rect::new(0, 0, term_width, term_height);
@@ -1353,8 +1232,7 @@ fn handle_permission_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
     match (perm.confirming_always, action) {
         (true, PermissionMouseAction::ConfirmAlways) => {
             app.auto_allowed_tools.insert(perm.tool_name.clone());
-            app.pending_permission_response =
-                Some((perm.id.clone(), true, true));
+            app.pending_permission_response = Some((perm.id.clone(), true, true));
         }
         (true, PermissionMouseAction::CancelAlways) => {
             perm.confirming_always = false;
@@ -1365,12 +1243,10 @@ fn handle_permission_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
             app.pending_permission = Some(perm);
         }
         (false, PermissionMouseAction::AllowOnce) => {
-            app.pending_permission_response =
-                Some((perm.id.clone(), true, false));
+            app.pending_permission_response = Some((perm.id.clone(), true, false));
         }
         (false, PermissionMouseAction::Deny) => {
-            app.pending_permission_response =
-                Some((perm.id.clone(), false, false));
+            app.pending_permission_response = Some((perm.id.clone(), false, false));
         }
         _ => {
             app.pending_permission = Some(perm);
@@ -1400,11 +1276,7 @@ fn login_picker_index_at(app: &App, column: u16, row: u16) -> Option<usize> {
     }
     let (term_width, term_height) = crossterm::terminal::size().ok()?;
     let area = Rect::new(0, 0, term_width, term_height);
-    let rect = centered_rect_local(
-        area,
-        area.width.clamp(44, 92),
-        area.height.clamp(9, 22),
-    );
+    let rect = centered_rect_local(area, area.width.clamp(44, 92), area.height.clamp(9, 22));
     let inner = inset_local(rect, 2, 1);
     let available_rows = inner.height.saturating_sub(4) as usize;
     let visible_items = (available_rows / 2).max(1);
@@ -1426,11 +1298,7 @@ fn login_picker_index_at(app: &App, column: u16, row: u16) -> Option<usize> {
     None
 }
 
-fn picker_window(
-    total_items: usize,
-    selected: usize,
-    visible: usize,
-) -> (usize, usize) {
+fn picker_window(total_items: usize, selected: usize, visible: usize) -> (usize, usize) {
     if total_items == 0 {
         return (0, 0);
     }
@@ -1461,13 +1329,10 @@ fn permission_popup_action_at(
     let content_width = inner.width.saturating_sub(2) as usize;
 
     let mut button_row_index: usize = 4;
-    let mut args_lines =
-        render::json_to_yaml_lines_for_popup(&perm.args, content_width);
-    let max_args =
-        inner
-            .height
-            .saturating_sub(if perm.confirming_always { 8 } else { 7 })
-            as usize;
+    let mut args_lines = render::json_to_yaml_lines_for_popup(&perm.args, content_width);
+    let max_args = inner
+        .height
+        .saturating_sub(if perm.confirming_always { 8 } else { 7 }) as usize;
     if args_lines.len() > max_args {
         args_lines.truncate(max_args.saturating_sub(1));
         args_lines.push("... (args truncated)".into());
@@ -1547,10 +1412,7 @@ fn inset_local(rect: Rect, x: u16, y: u16) -> Rect {
     )
 }
 
-async fn run_shell_command(
-    command: &str,
-    workspace_root: &str,
-) -> Result<String> {
+async fn run_shell_command(command: &str, workspace_root: &str) -> Result<String> {
     const MAX_OUTPUT_BYTES: usize = 16 * 1024;
     let output = tokio::process::Command::new("/bin/bash")
         .arg("-lc")
@@ -1579,10 +1441,10 @@ async fn run_shell_command(
     if !output.status.success() {
         sections.push(format!(
             "exit status: {}",
-            output.status.code().map_or_else(
-                || "terminated by signal".into(),
-                |c| c.to_string()
-            )
+            output
+                .status
+                .code()
+                .map_or_else(|| "terminated by signal".into(), |c| c.to_string())
         ));
     }
 
@@ -1913,17 +1775,15 @@ mod tests {
 
         handle_background_event(
             &mut app,
-            BackgroundEvent::CompactFinished(Ok(
-                marshaling_protocol::CompactResponse {
-                    session_id: "sess-1".into(),
-                    compaction: marshaling_protocol::CompactionState {
-                        summary: "summary".into(),
-                        compacted_message_count: 2,
-                        model_provider: "deepseek".into(),
-                        model_id: "deepseek-chat".into(),
-                    },
+            BackgroundEvent::CompactFinished(Ok(marshaling_protocol::CompactResponse {
+                session_id: "sess-1".into(),
+                compaction: marshaling_protocol::CompactionState {
+                    summary: "summary".into(),
+                    compacted_message_count: 2,
+                    model_provider: "deepseek".into(),
+                    model_id: "deepseek-chat".into(),
                 },
-            )),
+            })),
         );
 
         assert_eq!(app.state, AppState::Idle);
@@ -2038,8 +1898,7 @@ mod tests {
             provider: Some("kimi".into()),
             model_id: "kimi-k2.6".into(),
         });
-        let (model_override, provider_override) =
-            app.current_model_override_parts();
+        let (model_override, provider_override) = app.current_model_override_parts();
 
         assert_eq!(app.request_agent(), "review");
         assert_eq!(model_override.as_deref(), Some("kimi-k2.6"));
@@ -2206,8 +2065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reattach_result_ignores_stale_and_gives_up_after_last_attempt()
-     {
+    async fn test_reattach_result_ignores_stale_and_gives_up_after_last_attempt() {
         let client = MoteClient::new("http://127.0.0.1:1");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = reattach_test_app();
@@ -2282,8 +2140,7 @@ mod tests {
 
         // Already answered locally (response queued while reconnecting).
         app.pending_permission = None;
-        app.pending_permission_response =
-            Some(("perm_0_c".into(), true, false));
+        app.pending_permission_response = Some(("perm_0_c".into(), true, false));
         app.show_pending_permission("perm_0_c".into(), "bash".into(), &args);
         assert!(app.pending_permission.is_none());
 
@@ -2414,8 +2271,7 @@ mod tests {
         app.start_agent();
         app.handle_session_busy("run_old".into());
         app.queue_input("later");
-        app.pending_permission_response =
-            Some(("perm_0_x".into(), true, false));
+        app.pending_permission_response = Some(("perm_0_x".into(), true, false));
         app.finish_discarded_run();
         assert!(app.pending_permission_response.is_none());
         assert_eq!(app.input_queue.len(), 1);

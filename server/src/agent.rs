@@ -102,8 +102,7 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 }
 
 fn role_brief(instructions: &str) -> String {
-    let Some(line) = instructions.lines().find(|line| !line.trim().is_empty())
-    else {
+    let Some(line) = instructions.lines().find(|line| !line.trim().is_empty()) else {
         return "(no description)".to_string();
     };
     let trimmed = line.trim();
@@ -120,18 +119,14 @@ const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 const RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 /// Shortest wait before a retry, even when a provider says `Retry-After: 0`,
 /// so retries never go out as a burst.
-const RETRY_MIN_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(250);
+const RETRY_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 /// Longest `Retry-After` honored. A provider asking for longer (e.g. a quota
 /// exhausted for hours) fails the run instead of silently stalling it.
 const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Delay before the `retry`-th retry (1-based) of a failed provider step, or
 /// `None` if the failure must not be retried.
-fn retry_delay(
-    error: &anyhow::Error,
-    retry: usize,
-) -> Option<std::time::Duration> {
+fn retry_delay(error: &anyhow::Error, retry: usize) -> Option<std::time::Duration> {
     match error.downcast_ref::<ProviderError>() {
         Some(provider_error) => match provider_error.kind {
             ProviderErrorKind::RateLimited | ProviderErrorKind::Transient => {
@@ -141,9 +136,7 @@ fn retry_delay(
                     None => Some(backoff_delay(retry)),
                 }
             }
-            ProviderErrorKind::ContextOverflow | ProviderErrorKind::Fatal => {
-                None
-            }
+            ProviderErrorKind::ContextOverflow | ProviderErrorKind::Fatal => None,
         },
         // Errors not produced by a provider (should be rare): retry only
         // clear network failures, matched by phrase, never by bare digits.
@@ -189,12 +182,7 @@ fn is_network_failure(error: &anyhow::Error) -> bool {
 #[derive(Clone, Default)]
 pub struct PermissionBroker {
     pending: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                tokio::sync::oneshot::Sender<bool>,
-            >,
-        >,
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     >,
     /// Prepended to permission ids so subagent ids cannot collide with the
     /// parent's (providers may reuse tool-call ids such as `call_0`).
@@ -229,10 +217,7 @@ impl PermissionBroker {
 
     /// Register a wait for the tool call `tool_call_id`. Returns the
     /// permission id to send to the client and the receiver for the answer.
-    pub fn register(
-        &self,
-        tool_call_id: &str,
-    ) -> (String, tokio::sync::oneshot::Receiver<bool>) {
+    pub fn register(&self, tool_call_id: &str) -> (String, tokio::sync::oneshot::Receiver<bool>) {
         let seq = self
             .next_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -264,36 +249,24 @@ pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-fn reap_stream_task(
-    mut stream_handle: tokio::task::JoinHandle<()>,
-    abort: bool,
-) {
+fn reap_stream_task(mut stream_handle: tokio::task::JoinHandle<()>, abort: bool) {
     if abort {
         stream_handle.abort();
     }
     tokio::spawn(async move {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            &mut stream_handle,
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut stream_handle).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) if error.is_cancelled() => {}
             Ok(Err(error)) => {
                 tracing::warn!("agent stream task ended unexpectedly: {error}");
             }
             Err(_) => {
-                tracing::warn!(
-                    "agent stream task did not stop within five seconds; aborting it"
-                );
+                tracing::warn!("agent stream task did not stop within five seconds; aborting it");
                 stream_handle.abort();
                 if let Err(error) = stream_handle.await
                     && !error.is_cancelled()
                 {
-                    tracing::warn!(
-                        "agent stream task ended unexpectedly after abort: {error}"
-                    );
+                    tracing::warn!("agent stream task ended unexpectedly after abort: {error}");
                 }
             }
         }
@@ -328,9 +301,7 @@ fn assistant_turn_is_finished(result: &ChatResult) -> bool {
 
 fn assistant_result_text(result: &ChatResult, streamed_text: &str) -> String {
     match result.content.as_deref() {
-        Some(content) if !content.is_empty() || streamed_text.is_empty() => {
-            content.to_string()
-        }
+        Some(content) if !content.is_empty() || streamed_text.is_empty() => content.to_string(),
         _ => streamed_text.to_string(),
     }
 }
@@ -576,8 +547,7 @@ struct Denial {
 /// Content of the terminal event when a run stops because the user denied a
 /// tool call; clients treat it as a status, not assistant text.
 pub const PERMISSION_DENIED_CONTENT: &str = "(permission denied)";
-const SKIPPED_AFTER_DENIAL: &str =
-    "Skipped: the user denied an earlier tool call in this step.";
+const SKIPPED_AFTER_DENIAL: &str = "Skipped: the user denied an earlier tool call in this step.";
 
 /// A call is refused instead of run when it would be the Nth identical call
 /// (same tool, same arguments) in a row and the previous ones all returned
@@ -597,9 +567,7 @@ pub struct UserDeniedToolCall {
 
 impl std::fmt::Display for UserDeniedToolCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "The user denied a tool call inside the subagent, so it stopped.",
-        )?;
+        f.write_str("The user denied a tool call inside the subagent, so it stopped.")?;
         if !self.summary.is_empty() {
             write!(f, " Work done before that: {}", self.summary)?;
         }
@@ -630,17 +598,13 @@ async fn wait_for_cancel(
 
 /// Replaces old tool output in requests once a run has hit the model's
 /// context limit (the transcript keeps the full output).
-const CLEARED_TOOL_OUTPUT: &str =
-    "[older tool output cleared to fit the context window]";
+const CLEARED_TOOL_OUTPUT: &str = "[older tool output cleared to fit the context window]";
 /// Tool-call steps whose results are always sent in full.
 const TOOL_STEPS_KEPT_WHEN_PRUNING: usize = 2;
 
 /// Clear the results of all but the last `keep_steps` tool-call steps.
 /// Returns whether anything changed. Call/result pairing is preserved.
-fn prune_old_tool_results(
-    history: &mut [ChatMessage],
-    keep_steps: usize,
-) -> bool {
+fn prune_old_tool_results(history: &mut [ChatMessage], keep_steps: usize) -> bool {
     let mut changed = false;
     for message in prunable_tool_results(history, keep_steps) {
         message.content = Some(CLEARED_TOOL_OUTPUT.into());
@@ -682,13 +646,10 @@ fn prunable_tool_results(
 /// blank line. Internal notes, compaction summaries and the user's message
 /// can end up adjacent, and some providers reject consecutive user turns.
 /// Applied to requests only; the transcript keeps them separate.
-fn merge_consecutive_user_messages(
-    messages: Vec<ChatMessage>,
-) -> Vec<ChatMessage> {
+fn merge_consecutive_user_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     for message in messages {
-        let plain_user =
-            |m: &ChatMessage| m.role == Role::User && m.tool_call_id.is_none();
+        let plain_user = |m: &ChatMessage| m.role == Role::User && m.tool_call_id.is_none();
         if let Some(last) = merged.last_mut().filter(|last| plain_user(last))
             && plain_user(&message)
         {
@@ -724,10 +685,7 @@ const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
 ///
 /// Only messages from index `from` on are considered, so a run never
 /// "answers" calls that belong to earlier history.
-pub(crate) fn close_unanswered_tool_calls(
-    history: &mut Vec<ChatMessage>,
-    from: usize,
-) {
+pub(crate) fn close_unanswered_tool_calls(history: &mut Vec<ChatMessage>, from: usize) {
     let Some(idx) = history
         .get(from..)
         .unwrap_or_default()
@@ -801,11 +759,7 @@ struct AgentRun {
 }
 
 impl AgentRun {
-    fn new(
-        mut cfg: RunConfig,
-        channels: RunChannels,
-        history: Vec<ChatMessage>,
-    ) -> Self {
+    fn new(mut cfg: RunConfig, channels: RunChannels, history: Vec<ChatMessage>) -> Self {
         if cfg.max_steps == 0 {
             cfg.max_steps = DEFAULT_MAX_STEPS;
         }
@@ -833,12 +787,9 @@ impl AgentRun {
         if self.prune_tool_output {
             return false;
         }
-        if prunable_tool_results(
-            &mut self.history,
-            TOOL_STEPS_KEPT_WHEN_PRUNING,
-        )
-        .next()
-        .is_none()
+        if prunable_tool_results(&mut self.history, TOOL_STEPS_KEPT_WHEN_PRUNING)
+            .next()
+            .is_none()
         {
             return false;
         }
@@ -904,13 +855,11 @@ impl AgentRun {
                 tokens_input,
                 tokens_output,
             },
-            Terminal::NeedsContinuation(content) => {
-                AgentEvent::NeedsContinuation {
-                    content,
-                    tokens_input,
-                    tokens_output,
-                }
-            }
+            Terminal::NeedsContinuation(content) => AgentEvent::NeedsContinuation {
+                content,
+                tokens_input,
+                tokens_output,
+            },
             Terminal::Failed(error) => AgentEvent::Failed {
                 error,
                 tokens_input,
@@ -954,9 +903,7 @@ impl AgentRun {
             }
             self.take_notes();
             if step > soft_final_step {
-                return self.finish(Terminal::NeedsContinuation(
-                    "(max steps reached)".into(),
-                ));
+                return self.finish(Terminal::NeedsContinuation("(max steps reached)".into()));
             }
             let final_text_only_step = step == soft_final_step;
 
@@ -968,10 +915,7 @@ impl AgentRun {
                 Err(Terminal::Failed(error))
                     if is_context_overflow(&error) && self.start_pruning() =>
                 {
-                    tracing::warn!(
-                        step,
-                        "context limit hit; pruning old tool output"
-                    );
+                    tracing::warn!(step, "context limit hit; pruning old tool output");
                     self.emit(AgentEvent::Retrying {
                         attempt: 1,
                         max_attempts: 1,
@@ -985,12 +929,7 @@ impl AgentRun {
                 Err(terminal) => return self.finish(terminal),
             };
             if let Some(terminal) = self
-                .handle_response(
-                    step,
-                    final_text_only_step,
-                    &request.options,
-                    response,
-                )
+                .handle_response(step, final_text_only_step, &request.options, response)
                 .await
             {
                 return self.finish(terminal);
@@ -1000,11 +939,7 @@ impl AgentRun {
     }
 
     /// Assemble the messages, options, and provider for one step.
-    fn build_step_request(
-        &self,
-        step: usize,
-        final_text_only_step: bool,
-    ) -> StepRequest {
+    fn build_step_request(&self, step: usize, final_text_only_step: bool) -> StepRequest {
         let system_layers = &self.cfg.system_layers;
         let role_config = self.cfg.role_config.as_ref();
 
@@ -1038,13 +973,11 @@ impl AgentRun {
                 let brief = role_brief(&role.instructions);
                 roster.push_str(&format!("  {} — {}\n", role.name, brief));
             }
-            roster
-                .push_str("\nUse switch_role to delegate tasks between roles.");
+            roster.push_str("\nUse switch_role to delegate tasks between roles.");
             messages.push(ChatMessage::system(&roster));
 
             // Current role's specific instructions
-            let role_instructions =
-                &rc.roles[self.current_role_idx].instructions;
+            let role_instructions = &rc.roles[self.current_role_idx].instructions;
             if !role_instructions.is_empty() {
                 messages.push(ChatMessage::system(role_instructions));
             }
@@ -1052,14 +985,11 @@ impl AgentRun {
 
         // Inject skills layer (6) after role layers
         if has_skills {
-            messages.push(ChatMessage::system(
-                &system_layers[system_layers.len() - 1],
-            ));
+            messages.push(ChatMessage::system(&system_layers[system_layers.len() - 1]));
         }
 
         // Build and inject the dynamic system reminder (Layer 7)
-        let mut tool_defs =
-            advertised_tool_defs(&self.cfg.tools, &self.cfg.permissions);
+        let mut tool_defs = advertised_tool_defs(&self.cfg.tools, &self.cfg.permissions);
         // When in role mode, inject the switch_role tool def so the model can
         // delegate to other roles. This is an internal loop tool, not a filesystem tool.
         if role_config.is_some() && !final_text_only_step {
@@ -1102,9 +1032,7 @@ impl AgentRun {
                 (
                     ChatOptions {
                         model_id: role.model_id.clone(),
-                        temperature: role
-                            .temperature
-                            .unwrap_or(base.temperature),
+                        temperature: role.temperature.unwrap_or(base.temperature),
                         max_tokens: role.max_tokens.unwrap_or(base.max_tokens),
                         tools: Vec::new(), // populated below
                     },
@@ -1139,8 +1067,7 @@ impl AgentRun {
         'stream_attempt: loop {
             // Each retry gets a fresh channel and task. Retrying only before any
             // streamed output avoids duplicating visible assistant text.
-            let (stream_tx, mut stream_rx) =
-                tokio::sync::mpsc::unbounded_channel();
+            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
             let provider = Arc::clone(&request.provider);
             let attempt_messages = request.messages.clone();
             let attempt_opts = request.options.clone();
@@ -1210,9 +1137,7 @@ impl AgentRun {
                             retry = retries,
                             max_retries = MAX_STREAM_RETRIES,
                             retry_delay_ms = delay.as_millis(),
-                            status = error
-                                .downcast_ref::<ProviderError>()
-                                .and_then(|e| e.status),
+                            status = error.downcast_ref::<ProviderError>().and_then(|e| e.status),
                             discarded_output,
                             "retrying failed agent stream: {reason}"
                         );
@@ -1363,9 +1288,7 @@ impl AgentRun {
             Err(terminal) => return Some(terminal),
         };
 
-        if let Some(final_answer) =
-            batch.finish_answer.filter(|_| !batch.failed)
-        {
+        if let Some(final_answer) = batch.finish_answer.filter(|_| !batch.failed) {
             self.history
                 .push(ChatMessage::assistant_text(final_answer.clone()));
             tracing::info!(
@@ -1476,21 +1399,16 @@ impl AgentRun {
     }
 
     /// `finish_task` is an internal completion marker handled by the loop.
-    fn finish_task_call(
-        &mut self,
-        tc: &ToolCall,
-        content: &Option<String>,
-    ) -> ToolOutcome {
-        let final_answer =
-            serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                .ok()
-                .and_then(|args| {
-                    args.get("final_answer")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .or_else(|| content.clone())
-                .unwrap_or_else(|| "(task finished)".to_string());
+    fn finish_task_call(&mut self, tc: &ToolCall, content: &Option<String>) -> ToolOutcome {
+        let final_answer = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("final_answer")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| content.clone())
+            .unwrap_or_else(|| "(task finished)".to_string());
         self.history.push(ChatMessage::tool_result(
             &tc.id,
             "Task completion acknowledged.",
@@ -1508,21 +1426,18 @@ impl AgentRun {
             name: "switch_role".into(),
         });
 
-        let args: serde_json::Value =
-            match serde_json::from_str(&tc.function.arguments) {
-                Ok(v) => v,
-                Err(e) => {
-                    let err = format!("Invalid switch_role arguments: {e}");
-                    return self.record_tool_failure(tc, err.clone(), err);
-                }
-            };
-        let target_role =
-            args.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = format!("Invalid switch_role arguments: {e}");
+                return self.record_tool_failure(tc, err.clone(), err);
+            }
+        };
+        let target_role = args.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
 
         let role_config = self.cfg.role_config.as_ref();
-        let Some(idx) = role_config.and_then(|rc| rc.find_role(target_role))
-        else {
+        let Some(idx) = role_config.and_then(|rc| rc.find_role(target_role)) else {
             let available = role_config
                 .map(|rc| {
                     rc.roles
@@ -1532,10 +1447,7 @@ impl AgentRun {
                         .join(", ")
                 })
                 .unwrap_or_else(|| "none".into());
-            let err = format!(
-                "Unknown role: '{}'. Available: {}",
-                target_role, available
-            );
+            let err = format!("Unknown role: '{}'. Available: {}", target_role, available);
             return self.record_tool_failure(tc, err.clone(), err);
         };
 
@@ -1572,13 +1484,11 @@ impl AgentRun {
 
         // Emit skill selected event when use_skill is called
         if name == "use_skill"
-            && let Some(skill) = serde_json::from_str::<serde_json::Value>(
-                &tc.function.arguments,
-            )
-            .ok()
-            .as_ref()
-            .and_then(|args| args.get("skill_name"))
-            .and_then(|v| v.as_str())
+            && let Some(skill) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                .ok()
+                .as_ref()
+                .and_then(|args| args.get("skill_name"))
+                .and_then(|v| v.as_str())
         {
             self.emit(AgentEvent::SkillSelected {
                 name: skill.to_string(),
@@ -1597,25 +1507,16 @@ impl AgentRun {
 
         if !self.cfg.tools.contains(name) {
             let err = format!("Unknown tool: {}", name);
-            return Ok(self.record_tool_failure(
-                tc,
-                err.clone(),
-                format!("Error: {}", err),
-            ));
+            return Ok(self.record_tool_failure(tc, err.clone(), format!("Error: {}", err)));
         }
 
-        let args: serde_json::Value =
-            match serde_json::from_str(&tc.function.arguments) {
-                Ok(v) => v,
-                Err(e) => {
-                    let err = format!("Failed to parse arguments: {}", e);
-                    return Ok(self.record_tool_failure(
-                        tc,
-                        err.clone(),
-                        format!("Error: {}", err),
-                    ));
-                }
-            };
+        let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = format!("Failed to parse arguments: {}", e);
+                return Ok(self.record_tool_failure(tc, err.clone(), format!("Error: {}", err)));
+            }
+        };
 
         // `Value`'s map is ordered by key, so this is canonical.
         let call_key = format!("{name}\0{args}");
@@ -1623,11 +1524,7 @@ impl AgentRun {
             let err = format!(
                 "Refused: this would be the {DOOM_LOOP_REPEATS}th identical '{name}' call in a row, and the previous ones returned the same result. Change your approach: use different arguments, another tool, or explain to the user what is blocking you."
             );
-            return Ok(self.record_tool_failure(
-                tc,
-                err.clone(),
-                format!("Error: {}", err),
-            ));
+            return Ok(self.record_tool_failure(tc, err.clone(), format!("Error: {}", err)));
         }
 
         if let Some(denial) = self.check_permission(tc, &args).await? {
@@ -1668,14 +1565,10 @@ impl AgentRun {
                 Ok(ToolOutcome::succeeded(tc, name, output.changes))
             }
             Err(e) => {
-                let user_denied =
-                    e.downcast_ref::<UserDeniedToolCall>().is_some();
+                let user_denied = e.downcast_ref::<UserDeniedToolCall>().is_some();
                 let err = format!("{:#}", e);
-                let mut outcome = self.record_tool_failure(
-                    tc,
-                    err.clone(),
-                    format!("Error: {}", err),
-                );
+                let mut outcome =
+                    self.record_tool_failure(tc, err.clone(), format!("Error: {}", err));
                 outcome.user_denied = user_denied;
                 Ok(outcome)
             }
@@ -1687,9 +1580,10 @@ impl AgentRun {
     fn is_stuck_repeating(&self, call_key: &str) -> bool {
         self.recent_calls.len() == DOOM_LOOP_REPEATS - 1
             && self.recent_calls.iter().all(|(key, _)| key == call_key)
-            && self.recent_calls.iter().all(|(_, result)| {
-                Some(result) == self.recent_calls.front().map(|(_, r)| r)
-            })
+            && self
+                .recent_calls
+                .iter()
+                .all(|(_, result)| Some(result) == self.recent_calls.front().map(|(_, r)| r))
     }
 
     /// Remember an executed call and a digest of its result.
@@ -1727,8 +1621,7 @@ impl AgentRun {
                 by_user: false,
             })),
             Permission::Ask => {
-                let (perm_id, response_rx) =
-                    self.permission_broker.register(&tc.id);
+                let (perm_id, response_rx) = self.permission_broker.register(&tc.id);
                 self.emit(AgentEvent::PermissionRequest {
                     id: perm_id.clone(),
                     tool_name: name.clone(),
@@ -1747,17 +1640,11 @@ impl AgentRun {
                 Ok(match answer {
                     Some(true) => None,
                     Some(false) => Some(Denial {
-                        message: format!(
-                            "Permission denied by user for tool '{}'",
-                            name
-                        ),
+                        message: format!("Permission denied by user for tool '{}'", name),
                         by_user: true,
                     }),
                     None => Some(Denial {
-                        message: format!(
-                            "Permission request for tool '{}' was not answered",
-                            name
-                        ),
+                        message: format!("Permission request for tool '{}' was not answered", name),
                         by_user: false,
                     }),
                 })
@@ -1767,9 +1654,7 @@ impl AgentRun {
 }
 
 /// Extract tool results from the most recent turn in history.
-fn extract_last_turn_results(
-    history: &[ChatMessage],
-) -> Vec<ToolResultSummary> {
+fn extract_last_turn_results(history: &[ChatMessage]) -> Vec<ToolResultSummary> {
     // Find the most recent assistant message with tool calls
     let last_tool_call_map: std::collections::HashMap<&str, &str> = history
         .iter()
@@ -1831,8 +1716,7 @@ fn tool_result_succeeded(content: &str) -> bool {
     let last_line = content.trim_end().lines().last().unwrap_or("");
     !content.trim_start().starts_with("Error:")
         && !last_line.starts_with("[exit code:")
-        && !(last_line.starts_with("[command timed out")
-            && last_line.ends_with(']'))
+        && !(last_line.starts_with("[command timed out") && last_line.ends_with(']'))
 }
 
 /// Extract the most recent user message for context.
@@ -1951,10 +1835,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             Ok(ToolExecutionResult {
                 output: "ok".into(),
                 changes: Vec::new(),
@@ -1978,10 +1859,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             std::future::pending().await
         }
     }
@@ -1992,9 +1870,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::MessagesCommitted(messages) => {
-                    Some(messages.clone())
-                }
+                AgentEvent::MessagesCommitted(messages) => Some(messages.clone()),
                 _ => None,
             })
             .flatten()
@@ -2013,9 +1889,7 @@ mod tests {
 
     /// Receive events up to and including the terminal one.
     async fn events_until_terminal(
-        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
-            Result<AgentEvent>,
-        >,
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Result<AgentEvent>>,
     ) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         while let Some(event) = events_rx.recv().await {
@@ -2044,10 +1918,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             panic!("tool exploded");
         }
     }
@@ -2235,10 +2106,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok(ToolExecutionResult {
                 output: "slow done".into(),
@@ -2250,8 +2118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropping_cancel_sender_mid_tool_lets_run_finish() {
-        let tools: Arc<ToolRegistry> =
-            Arc::new(ToolRegistry::new(vec![Box::new(SlowTool)]));
+        let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![Box::new(SlowTool)]));
         let permissions = std::collections::HashMap::from([(
             "slow".to_string(),
             crate::config::Permission::Allow,
@@ -2298,8 +2165,7 @@ mod tests {
         let mut last = None;
         while let Ok(event) = events_rx.try_recv() {
             let event = event.unwrap();
-            if matches!(&event, AgentEvent::ToolCompleted { result, .. } if result == "slow done")
-            {
+            if matches!(&event, AgentEvent::ToolCompleted { result, .. } if result == "slow done") {
                 saw_completed = true;
             }
             last = Some(event);
@@ -2350,8 +2216,7 @@ mod tests {
         );
     }
 
-    type AttemptScript =
-        Vec<Box<dyn Fn() -> Result<StreamEvent> + Send + Sync>>;
+    type AttemptScript = Vec<Box<dyn Fn() -> Result<StreamEvent> + Send + Sync>>;
 
     /// Replays one scripted list of stream events per attempt.
     struct StreamScriptProvider {
@@ -2390,13 +2255,9 @@ mod tests {
         }
     }
 
-    fn provider_error(
-        kind: ProviderErrorKind,
-        retry_after_ms: Option<u64>,
-    ) -> anyhow::Error {
+    fn provider_error(kind: ProviderErrorKind, retry_after_ms: Option<u64>) -> anyhow::Error {
         let mut error = ProviderError::new(kind, format!("{kind:?} failure"));
-        error.retry_after =
-            retry_after_ms.map(std::time::Duration::from_millis);
+        error.retry_after = retry_after_ms.map(std::time::Duration::from_millis);
         error.into()
     }
 
@@ -2453,9 +2314,7 @@ mod tests {
         let attempts: Vec<AttemptScript> = vec![
             vec![
                 Box::new(|| Ok(StreamEvent::Chunk("partial ".into()))),
-                Box::new(|| {
-                    Err(provider_error(ProviderErrorKind::Transient, Some(5)))
-                }),
+                Box::new(|| Err(provider_error(ProviderErrorKind::Transient, Some(5)))),
             ],
             vec![
                 Box::new(|| Ok(StreamEvent::Chunk("full answer".into()))),
@@ -2483,21 +2342,19 @@ mod tests {
                 )
             })
             .expect("a Retrying event");
-        assert!(
-            matches!(&events[retry - 1], AgentEvent::TextDelta(t) if t == "partial ")
-        );
-        assert!(
-            matches!(&events[retry + 1], AgentEvent::TextDelta(t) if t == "full answer")
-        );
+        assert!(matches!(&events[retry - 1], AgentEvent::TextDelta(t) if t == "partial "));
+        assert!(matches!(&events[retry + 1], AgentEvent::TextDelta(t) if t == "full answer"));
         match events.last() {
             Some(AgentEvent::Done { content, .. }) => {
                 assert_eq!(content, "full answer");
             }
             other => panic!("expected Done, got {other:?}"),
         }
-        assert!(!committed_history(&events).iter().any(|m| {
-            m.content.as_deref().is_some_and(|c| c.contains("partial"))
-        }));
+        assert!(
+            !committed_history(&events)
+                .iter()
+                .any(|m| { m.content.as_deref().is_some_and(|c| c.contains("partial")) })
+        );
     }
 
     #[tokio::test]
@@ -2556,10 +2413,7 @@ mod tests {
             retry_delay(&anyhow::anyhow!("bad parameter value 70500"), 1),
             None
         );
-        assert!(
-            retry_delay(&anyhow::anyhow!("connection reset by peer"), 1)
-                .is_some()
-        );
+        assert!(retry_delay(&anyhow::anyhow!("connection reset by peer"), 1).is_some());
         // Retry-After wins over backoff.
         assert_eq!(
             retry_delay(
@@ -2570,17 +2424,11 @@ mod tests {
         );
         // `Retry-After: 0` still waits a little, never a burst.
         assert_eq!(
-            retry_delay(
-                &provider_error(ProviderErrorKind::Transient, Some(0)),
-                1
-            ),
+            retry_delay(&provider_error(ProviderErrorKind::Transient, Some(0)), 1),
             Some(RETRY_MIN_DELAY)
         );
         let first = backoff_delay(1);
-        assert!(
-            first >= RETRY_BASE_DELAY
-                && first <= RETRY_BASE_DELAY.mul_f64(1.25)
-        );
+        assert!(first >= RETRY_BASE_DELAY && first <= RETRY_BASE_DELAY.mul_f64(1.25));
         assert!(backoff_delay(3) >= RETRY_BASE_DELAY * 4);
         assert!(backoff_delay(50) <= RETRY_MAX_DELAY);
     }
@@ -2608,9 +2456,8 @@ mod tests {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             if *calls == 1 {
-                let mut error = ProviderError::transient(
-                    "provider API error (503): temporarily unavailable",
-                );
+                let mut error =
+                    ProviderError::transient("provider API error (503): temporarily unavailable");
                 error.retry_after = Some(std::time::Duration::from_millis(10));
                 let _ = sender.send(Err(error.into()));
                 return;
@@ -2765,46 +2612,41 @@ mod tests {
         let calls = Arc::new(Mutex::new(0usize));
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::clone(&calls),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [
-                    ChatResult {
-                        content: Some("working...".into()),
-                        tool_calls: Vec::new(),
-                        usage: Usage {
-                            prompt_tokens: 1,
-                            completion_tokens: 1,
-                            total_tokens: 2,
-                        },
-                        finish_reason: None,
-                        reasoning_content: None,
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: Some("working...".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
                     },
-                    ChatResult {
-                        content: Some("still working...".into()),
-                        tool_calls: Vec::new(),
-                        usage: Usage {
-                            prompt_tokens: 1,
-                            completion_tokens: 1,
-                            total_tokens: 2,
-                        },
-                        finish_reason: None,
-                        reasoning_content: None,
+                    finish_reason: None,
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some("still working...".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
                     },
-                    ChatResult {
-                        content: Some(
-                            "Maximum steps reached. Summary before continuation."
-                                .into(),
-                        ),
-                        tool_calls: Vec::new(),
-                        usage: Usage {
-                            prompt_tokens: 1,
-                            completion_tokens: 1,
-                            total_tokens: 2,
-                        },
-                        finish_reason: Some("stop".into()),
-                        reasoning_content: None,
+                    finish_reason: None,
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some("Maximum steps reached. Summary before continuation.".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
                     },
-                ],
-            ))),
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+            ]))),
         });
         let tools: Arc<ToolRegistry> =
             Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
@@ -2864,19 +2706,17 @@ mod tests {
         let calls = Arc::new(Mutex::new(0usize));
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::clone(&calls),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [ChatResult {
-                    content: Some("all done".into()),
-                    tool_calls: Vec::new(),
-                    usage: Usage {
-                        prompt_tokens: 1,
-                        completion_tokens: 1,
-                        total_tokens: 2,
-                    },
-                    finish_reason: Some("stop".into()),
-                    reasoning_content: None,
-                }],
-            ))),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([ChatResult {
+                content: Some("all done".into()),
+                tool_calls: Vec::new(),
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                finish_reason: Some("stop".into()),
+                reasoning_content: None,
+            }]))),
         });
         let tools: Arc<ToolRegistry> =
             Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
@@ -2919,9 +2759,7 @@ mod tests {
                     break;
                 }
                 AgentEvent::TurnDone { .. } => {
-                    panic!(
-                        "terminal finish reason should not continue the loop"
-                    )
+                    panic!("terminal finish reason should not continue the loop")
                 }
                 _ => {}
             }
@@ -2985,47 +2823,44 @@ mod tests {
         let calls = Arc::new(Mutex::new(0usize));
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::clone(&calls),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [
-                    ChatResult {
-                        content: Some("checking".into()),
-                        tool_calls: vec![ToolCall {
-                            id: "call_read".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: "read".into(),
-                                arguments: "{}".into(),
-                            },
-                        }],
-                        usage: Usage {
-                            prompt_tokens: 1,
-                            completion_tokens: 1,
-                            total_tokens: 2,
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: Some("checking".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_read".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "read".into(),
+                            arguments: "{}".into(),
                         },
-                        finish_reason: Some("stop".into()),
-                        reasoning_content: None,
+                    }],
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
                     },
-                    ChatResult {
-                        content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call_finish".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: "finish_task".into(),
-                                arguments: r#"{"final_answer":"final answer"}"#
-                                    .into(),
-                            },
-                        }],
-                        usage: Usage {
-                            prompt_tokens: 1,
-                            completion_tokens: 1,
-                            total_tokens: 2,
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_finish".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "finish_task".into(),
+                            arguments: r#"{"final_answer":"final answer"}"#.into(),
                         },
-                        finish_reason: Some("tool_calls".into()),
-                        reasoning_content: None,
+                    }],
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
                     },
-                ],
-            ))),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                },
+            ]))),
         });
         let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![
             Box::new(NamedTool("read")),
@@ -3084,38 +2919,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_loop_tool_call_turn_preserves_assistant_text_in_history()
-    {
+    async fn test_run_loop_tool_call_turn_preserves_assistant_text_in_history() {
         let calls = Arc::new(Mutex::new(0usize));
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::clone(&calls),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [
-                    ChatResult {
-                        content: Some(
-                            "I need to inspect the file first".into(),
-                        ),
-                        tool_calls: vec![ToolCall {
-                            id: "call_read".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: "read".into(),
-                                arguments: "{}".into(),
-                            },
-                        }],
-                        usage: Usage::default(),
-                        finish_reason: Some("tool_calls".into()),
-                        reasoning_content: None,
-                    },
-                    ChatResult {
-                        content: Some("The answer after reading.".into()),
-                        tool_calls: Vec::new(),
-                        usage: Usage::default(),
-                        finish_reason: Some("stop".into()),
-                        reasoning_content: None,
-                    },
-                ],
-            ))),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: Some("I need to inspect the file first".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_read".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some("The answer after reading.".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+            ]))),
         });
         let tools: Arc<ToolRegistry> =
             Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
@@ -3177,34 +3007,32 @@ mod tests {
             calls: Arc::clone(&calls),
             tool_counts: Arc::clone(&tool_counts),
             saw_max_steps_prompt: Arc::clone(&saw_max_steps_prompt),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [
-                    ChatResult {
-                        content: Some("checking".into()),
-                        tool_calls: vec![ToolCall {
-                            id: "call_read".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: "read".into(),
-                                arguments: "{}".into(),
-                            },
-                        }],
-                        usage: Usage::default(),
-                        finish_reason: Some("tool_calls".into()),
-                        reasoning_content: None,
-                    },
-                    ChatResult {
-                        content: Some(
-                            "Maximum steps reached. I checked the file and need user continuation."
-                                .into(),
-                        ),
-                        tool_calls: Vec::new(),
-                        usage: Usage::default(),
-                        finish_reason: Some("stop".into()),
-                        reasoning_content: None,
-                    },
-                ],
-            ))),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: Some("checking".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_read".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some(
+                        "Maximum steps reached. I checked the file and need user continuation."
+                            .into(),
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+            ]))),
         });
         let tools: Arc<ToolRegistry> =
             Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("read"))]));
@@ -3252,9 +3080,7 @@ mod tests {
         assert!(*saw_max_steps_prompt.lock().unwrap());
         assert_eq!(
             done_content.as_deref(),
-            Some(
-                "Maximum steps reached. I checked the file and need user continuation."
-            )
+            Some("Maximum steps reached. I checked the file and need user continuation.")
         );
     }
 
@@ -3303,9 +3129,7 @@ mod tests {
 
         let mut needs_continuation = None;
         while let Some(event) = events_rx.recv().await {
-            if let AgentEvent::NeedsContinuation { content, .. } =
-                event.unwrap()
-            {
+            if let AgentEvent::NeedsContinuation { content, .. } = event.unwrap() {
                 needs_continuation = Some(content);
                 break;
             }
@@ -3320,33 +3144,30 @@ mod tests {
     async fn test_run_loop_completes_batched_tools_before_finish_task() {
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::new(Mutex::new(0)),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [ChatResult {
-                    content: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "finish".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: "finish_task".into(),
-                                arguments: r#"{"final_answer":"complete"}"#
-                                    .into(),
-                            },
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([ChatResult {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "finish".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "finish_task".into(),
+                            arguments: r#"{"final_answer":"complete"}"#.into(),
                         },
-                        ToolCall {
-                            id: "read".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: "read".into(),
-                                arguments: "{}".into(),
-                            },
+                    },
+                    ToolCall {
+                        id: "read".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "read".into(),
+                            arguments: "{}".into(),
                         },
-                    ],
-                    usage: Usage::default(),
-                    finish_reason: Some("tool_calls".into()),
-                    reasoning_content: None,
-                }],
-            ))),
+                    },
+                ],
+                usage: Usage::default(),
+                finish_reason: Some("tool_calls".into()),
+                reasoning_content: None,
+            }]))),
         });
         let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![
             Box::new(NamedTool("read")),
@@ -3400,42 +3221,39 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::clone(&calls),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [
-                    ChatResult {
-                        content: None,
-                        tool_calls: vec![
-                            ToolCall {
-                                id: "finish".into(),
-                                call_type: "function".into(),
-                                function: ToolFunction {
-                                    name: "finish_task".into(),
-                                    arguments:
-                                        r#"{"final_answer":"premature"}"#.into(),
-                                },
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "finish".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "finish_task".into(),
+                                arguments: r#"{"final_answer":"premature"}"#.into(),
                             },
-                            ToolCall {
-                                id: "denied".into(),
-                                call_type: "function".into(),
-                                function: ToolFunction {
-                                    name: "read".into(),
-                                    arguments: "{}".into(),
-                                },
+                        },
+                        ToolCall {
+                            id: "denied".into(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: "read".into(),
+                                arguments: "{}".into(),
                             },
-                        ],
-                        usage: Usage::default(),
-                        finish_reason: Some("tool_calls".into()),
-                        reasoning_content: None,
-                    },
-                    ChatResult {
-                        content: Some("recovered after tool failure".into()),
-                        tool_calls: Vec::new(),
-                        usage: Usage::default(),
-                        finish_reason: Some("stop".into()),
-                        reasoning_content: None,
-                    },
-                ],
-            ))),
+                        },
+                    ],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some("recovered after tool failure".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+            ]))),
         });
         let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![
             Box::new(NamedTool("read")),
@@ -3473,9 +3291,7 @@ mod tests {
         .await;
 
         let content = loop {
-            if let Ok(AgentEvent::Done { content, .. }) =
-                events_rx.recv().await.unwrap()
-            {
+            if let Ok(AgentEvent::Done { content, .. }) = events_rx.recv().await.unwrap() {
                 break content;
             }
         };
@@ -3597,25 +3413,22 @@ mod tests {
     async fn test_run_loop_cancels_during_active_tool_execution() {
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::new(Mutex::new(0)),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [ChatResult {
-                    content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "block".into(),
-                        call_type: "function".into(),
-                        function: ToolFunction {
-                            name: "block".into(),
-                            arguments: "{}".into(),
-                        },
-                    }],
-                    usage: Usage::default(),
-                    finish_reason: Some("tool_calls".into()),
-                    reasoning_content: None,
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([ChatResult {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "block".into(),
+                    call_type: "function".into(),
+                    function: ToolFunction {
+                        name: "block".into(),
+                        arguments: "{}".into(),
+                    },
                 }],
-            ))),
+                usage: Usage::default(),
+                finish_reason: Some("tool_calls".into()),
+                reasoning_content: None,
+            }]))),
         });
-        let tools: Arc<ToolRegistry> =
-            Arc::new(ToolRegistry::new(vec![Box::new(BlockingTool)]));
+        let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![Box::new(BlockingTool)]));
         let permissions = std::collections::HashMap::from([(
             "block".to_string(),
             crate::config::Permission::Allow,
@@ -3679,34 +3492,31 @@ mod tests {
     async fn test_run_loop_reports_tool_panic_as_tool_failure() {
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
             calls: Arc::new(Mutex::new(0)),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [
-                    ChatResult {
-                        content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call_boom".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: "boom".into(),
-                                arguments: "{}".into(),
-                            },
-                        }],
-                        usage: Usage::default(),
-                        finish_reason: Some("tool_calls".into()),
-                        reasoning_content: None,
-                    },
-                    ChatResult {
-                        content: Some("recovered".into()),
-                        tool_calls: Vec::new(),
-                        usage: Usage::default(),
-                        finish_reason: Some("stop".into()),
-                        reasoning_content: None,
-                    },
-                ],
-            ))),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_boom".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: "boom".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some("recovered".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+            ]))),
         });
-        let tools: Arc<ToolRegistry> =
-            Arc::new(ToolRegistry::new(vec![Box::new(PanickingTool)]));
+        let tools: Arc<ToolRegistry> = Arc::new(ToolRegistry::new(vec![Box::new(PanickingTool)]));
         let permissions = std::collections::HashMap::from([(
             "boom".to_string(),
             crate::config::Permission::Allow,
@@ -3792,31 +3602,29 @@ mod tests {
     fn single_tool_call_then_stop(tool: &str) -> Arc<dyn LlmProvider> {
         Arc::new(ScriptedProvider {
             calls: Arc::new(Mutex::new(0)),
-            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(
-                [
-                    ChatResult {
-                        content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call_0".into(),
-                            call_type: "function".into(),
-                            function: ToolFunction {
-                                name: tool.into(),
-                                arguments: "{}".into(),
-                            },
-                        }],
-                        usage: Usage::default(),
-                        finish_reason: Some("tool_calls".into()),
-                        reasoning_content: None,
-                    },
-                    ChatResult {
-                        content: Some("done".into()),
-                        tool_calls: Vec::new(),
-                        usage: Usage::default(),
-                        finish_reason: Some("stop".into()),
-                        reasoning_content: None,
-                    },
-                ],
-            ))),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                ChatResult {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_0".into(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: tool.into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    usage: Usage::default(),
+                    finish_reason: Some("tool_calls".into()),
+                    reasoning_content: None,
+                },
+                ChatResult {
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    finish_reason: Some("stop".into()),
+                    reasoning_content: None,
+                },
+            ]))),
         })
     }
 
@@ -3857,12 +3665,10 @@ mod tests {
             Vec::new(),
         ));
         let mut events = Vec::new();
-        while let Some(event) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            events_rx.recv(),
-        )
-        .await
-        .expect("loop stalled")
+        while let Some(event) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events_rx.recv())
+                .await
+                .expect("loop stalled")
         {
             let event = event.unwrap();
             if let AgentEvent::PermissionRequest { id, .. } = &event {
@@ -3877,21 +3683,22 @@ mod tests {
     #[tokio::test]
     async fn test_run_loop_waits_for_permission_and_executes_when_allowed() {
         let broker = PermissionBroker::default();
-        let events =
-            run_with_permission_answer(broker.clone(), broker, true).await;
+        let events = run_with_permission_answer(broker.clone(), broker, true).await;
         assert!(events.iter().any(|e| matches!(
             e,
             AgentEvent::PermissionRequest { id, .. } if id == "perm_0_call_0"
         )));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolCompleted { id, .. } if id == "call_0")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCompleted { id, .. } if id == "call_0"))
+        );
         assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
         // The wait ends before the tool runs, so observers can separate user
         // wait time from tool run time.
-        let resolved = events.iter().position(|e| {
-            matches!(e, AgentEvent::PermissionResolved { id } if id == "perm_0_call_0")
-        });
+        let resolved = events.iter().position(
+            |e| matches!(e, AgentEvent::PermissionResolved { id } if id == "perm_0_call_0"),
+        );
         let completed = events
             .iter()
             .position(|e| matches!(e, AgentEvent::ToolCompleted { .. }));
@@ -3903,9 +3710,7 @@ mod tests {
         // Mirrors a subagent: its loop uses a scoped broker while the answer
         // arrives through the parent's broker.
         let parent = PermissionBroker::default();
-        let events =
-            run_with_permission_answer(parent.scoped("sub_x:"), parent, false)
-                .await;
+        let events = run_with_permission_answer(parent.scoped("sub_x:"), parent, false).await;
         assert!(events.iter().any(|e| matches!(
             e,
             AgentEvent::PermissionRequest { id, .. } if id == "sub_x:perm_0_call_0"
@@ -3954,9 +3759,7 @@ mod tests {
             Vec::new(),
         ));
         let perm_id = loop {
-            if let Ok(AgentEvent::PermissionRequest { id, .. }) =
-                events_rx.recv().await.unwrap()
-            {
+            if let Ok(AgentEvent::PermissionRequest { id, .. }) = events_rx.recv().await.unwrap() {
                 break id;
             }
         };
@@ -3980,19 +3783,13 @@ mod tests {
     fn test_close_unanswered_tool_calls_fills_only_missing_results() {
         let mut history = vec![
             make_user("go"),
-            make_tool_call_msg(vec![
-                ("a", "read"),
-                ("b", "bash"),
-                ("c", "read"),
-            ]),
+            make_tool_call_msg(vec![("a", "read"), ("b", "bash"), ("c", "read")]),
             make_tool_result("a", "done"),
         ];
         close_unanswered_tool_calls(&mut history, 0);
         let results: Vec<(&str, &str)> = history
             .iter()
-            .filter_map(|m| {
-                Some((m.tool_call_id.as_deref()?, m.content.as_deref()?))
-            })
+            .filter_map(|m| Some((m.tool_call_id.as_deref()?, m.content.as_deref()?)))
             .collect();
         assert_eq!(
             results,
@@ -4010,8 +3807,7 @@ mod tests {
         close_unanswered_tool_calls(&mut plain, 0);
         assert_eq!(plain.len(), 2);
         // Calls before `from` belong to earlier history and are left alone.
-        let mut earlier =
-            vec![make_tool_call_msg(vec![("z", "read")]), make_user("new")];
+        let mut earlier = vec![make_tool_call_msg(vec![("z", "read")]), make_user("new")];
         close_unanswered_tool_calls(&mut earlier, 1);
         assert_eq!(earlier.len(), 2);
     }
@@ -4124,10 +3920,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ToolExecutionResult {
                 output: "same result".into(),
@@ -4176,12 +3969,10 @@ mod tests {
             Vec::new(),
         ));
         let mut events = Vec::new();
-        while let Some(event) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            events_rx.recv(),
-        )
-        .await
-        .expect("loop stalled")
+        while let Some(event) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events_rx.recv())
+                .await
+                .expect("loop stalled")
         {
             let event = event.unwrap();
             if let AgentEvent::PermissionRequest { id, .. } = &event {
@@ -4263,10 +4054,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             let n = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ToolExecutionResult {
                 output: format!("status check #{n}"),
@@ -4310,10 +4098,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             Err(UserDeniedToolCall {
                 summary: "[Tools used: edit a.txt]".into(),
             }
@@ -4365,10 +4150,7 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<ToolExecutionResult> {
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolExecutionResult> {
             let n = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             anyhow::bail!("failure #{n}")
         }
@@ -4409,9 +4191,7 @@ mod tests {
                         .into(),
                     )),
                 }),
-                tools: Arc::new(ToolRegistry::new(vec![Box::new(NamedTool(
-                    "guarded",
-                ))])),
+                tools: Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("guarded"))])),
                 system_layers: Vec::new(),
                 options: ChatOptions::default(),
                 permissions: std::collections::HashMap::from([(
@@ -4485,9 +4265,7 @@ mod tests {
         let history = committed_history(&events);
         let results: Vec<(&str, &str)> = history
             .iter()
-            .filter_map(|m| {
-                Some((m.tool_call_id.as_deref()?, m.content.as_deref()?))
-            })
+            .filter_map(|m| Some((m.tool_call_id.as_deref()?, m.content.as_deref()?)))
             .collect();
         assert_eq!(results.len(), 2);
         assert!(results[0].1.contains("Permission denied by user"));
@@ -4550,8 +4328,7 @@ mod tests {
     async fn test_reminder_position_follows_config() {
         for at_end in [false, true] {
             let seen = Arc::new(Mutex::new(Vec::new()));
-            let (events_tx, _events_rx) =
-                tokio::sync::mpsc::unbounded_channel();
+            let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
             let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
             run_loop(
                 RunConfig {
@@ -4588,10 +4365,7 @@ mod tests {
                 assert_eq!(idx, messages.len() - 1);
             } else {
                 assert_eq!(idx, 1, "right after the system prompt");
-                assert_eq!(
-                    messages.last().unwrap().content.as_deref(),
-                    Some("hi")
-                );
+                assert_eq!(messages.last().unwrap().content.as_deref(), Some("hi"));
             }
         }
     }

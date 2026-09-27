@@ -3,8 +3,7 @@ use std::path::PathBuf;
 
 /// Load keybinding overrides from a `keybindings.toml` file if it exists.
 /// Checks `~/.config/mote/` first, then project root.
-pub fn load_keybindings()
--> Option<HashMap<String, crate::tui::keybinding::KeyList>> {
+pub fn load_keybindings() -> Option<HashMap<String, crate::tui::keybinding::KeyList>> {
     let path = resolve_config_path("keybindings.toml");
     if !path.exists() {
         return None;

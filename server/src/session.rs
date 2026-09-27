@@ -65,15 +65,11 @@ mod tests {
     #[test]
     fn test_summary_from_user_content_takes_first_words() {
         assert_eq!(
-            summary_from_user_content("first line\nsecond line words here")
-                .as_deref(),
+            summary_from_user_content("first line\nsecond line words here").as_deref(),
             Some("first line second line words here")
         );
         assert_eq!(
-            summary_from_user_content(
-                "one two three four five six seven eight nine"
-            )
-            .as_deref(),
+            summary_from_user_content("one two three four five six seven eight nine").as_deref(),
             Some("one two three four five six seven eight...")
         );
         assert_eq!(summary_from_user_content("   "), None);

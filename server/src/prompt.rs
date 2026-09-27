@@ -36,16 +36,11 @@ impl PromptAssembler {
     }
 
     /// Create an assembler for a specific agent, applying per-agent overrides.
-    pub fn for_agent(
-        config: &Config,
-        agent: Option<&crate::config::AgentConfig>,
-    ) -> Self {
+    pub fn for_agent(config: &Config, agent: Option<&crate::config::AgentConfig>) -> Self {
         let cfg = config.clone();
         let instructions = agent.and_then(|a| a.instructions.clone());
-        let disable_user_agents_md =
-            agent.is_some_and(|a| a.disable_user_agents_md);
-        let disable_system_prompt =
-            agent.is_some_and(|a| a.disable_system_prompt);
+        let disable_user_agents_md = agent.is_some_and(|a| a.disable_user_agents_md);
+        let disable_system_prompt = agent.is_some_and(|a| a.disable_system_prompt);
         Self {
             config: cfg,
             agent_instructions: instructions,
@@ -77,9 +72,7 @@ impl PromptAssembler {
         let mut layers: Vec<String> = Vec::new();
 
         // Layer 1: Environment
-        layers.push(
-            self.build_env_block(model_id, self.workspace_root.as_deref()),
-        );
+        layers.push(self.build_env_block(model_id, self.workspace_root.as_deref()));
 
         // Layer 2: Shared system prompt
         if let Some(layer) = self.load_system_prompt_layer(model_provider)? {
@@ -115,13 +108,8 @@ impl PromptAssembler {
     /// 4. Workspace AGENTS.md passed by client (optional)
     /// 5. Agent-specific instructions (from agent config `instructions` field, optional)
     /// 6. Skills — ~/.config/mote/skills/*.md (optional)
-    pub fn assemble(
-        &self,
-        model_provider: &str,
-        model_id: &str,
-    ) -> Result<Vec<String>> {
-        let mut layers =
-            self.assemble_shared_layers(model_provider, model_id)?;
+    pub fn assemble(&self, model_provider: &str, model_id: &str) -> Result<Vec<String>> {
+        let mut layers = self.assemble_shared_layers(model_provider, model_id)?;
 
         // Layer 5: agent-specific instructions (inserted before skills if present)
         if let Some(layer) = self.agent_instructions_layer() {
@@ -138,15 +126,11 @@ impl PromptAssembler {
         Ok(layers)
     }
 
-    fn load_system_prompt_layer(
-        &self,
-        _model_provider: &str,
-    ) -> Result<Option<String>> {
+    fn load_system_prompt_layer(&self, _model_provider: &str) -> Result<Option<String>> {
         if self.disable_system_prompt {
             return Ok(None);
         }
-        let prompt =
-            self.load_file_or_default(&self.config.prompts.default, "")?;
+        let prompt = self.load_file_or_default(&self.config.prompts.default, "")?;
         Ok((!prompt.is_empty()).then_some(prompt))
     }
 
@@ -163,10 +147,8 @@ impl PromptAssembler {
             return Ok(None);
         }
 
-        let content =
-            std::fs::read_to_string(&agents_path).with_context(|| {
-                format!("Failed to read: {}", agents_path.display())
-            })?;
+        let content = std::fs::read_to_string(&agents_path)
+            .with_context(|| format!("Failed to read: {}", agents_path.display()))?;
         Ok(Self::format_instructions_layer(
             agents_path.display().to_string(),
             &content,
@@ -186,9 +168,7 @@ impl PromptAssembler {
 
     /// Build the agent-specific instructions layer from the given text.
     /// Returns None when the text is empty or all whitespace.
-    pub fn build_agent_instructions_layer(
-        instructions: Option<&str>,
-    ) -> Option<String> {
+    pub fn build_agent_instructions_layer(instructions: Option<&str>) -> Option<String> {
         instructions
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -217,9 +197,8 @@ impl PromptAssembler {
             "Skills available:\n\
              Review the skills below. If a skill's description matches the current task, ",
         );
-        skills_text.push_str(
-            "call use_skill(\"<name>\") to load its full guidance, then apply it.\n",
-        );
+        skills_text
+            .push_str("call use_skill(\"<name>\") to load its full guidance, then apply it.\n");
         for (name, desc) in &skill_entries {
             if desc.is_empty() {
                 skills_text.push_str(&format!("  {}\n", name));
@@ -235,8 +214,7 @@ impl PromptAssembler {
             return Vec::new();
         };
 
-        let mut folders: Vec<_> =
-            entries.flatten().filter(|e| e.path().is_dir()).collect();
+        let mut folders: Vec<_> = entries.flatten().filter(|e| e.path().is_dir()).collect();
         folders.sort_by_key(|e| e.file_name());
 
         folders
@@ -245,10 +223,7 @@ impl PromptAssembler {
             .collect()
     }
 
-    fn load_skill_entry(
-        &self,
-        entry: &std::fs::DirEntry,
-    ) -> Option<(String, String)> {
+    fn load_skill_entry(&self, entry: &std::fs::DirEntry) -> Option<(String, String)> {
         let folder_name = entry.file_name().to_string_lossy().to_string();
         let skill_path = entry.path().join("SKILL.md");
         if !skill_path.exists() {
@@ -286,21 +261,13 @@ impl PromptAssembler {
         (serde_yaml::from_str(yaml_text).ok(), body)
     }
 
-    fn format_instructions_layer(
-        source: String,
-        content: &str,
-    ) -> Option<String> {
+    fn format_instructions_layer(source: String, content: &str) -> Option<String> {
         let trimmed = content.trim();
-        (!trimmed.is_empty())
-            .then(|| format!("Instructions from: {}\n{}", source, trimmed))
+        (!trimmed.is_empty()).then(|| format!("Instructions from: {}\n{}", source, trimmed))
     }
 
     /// Build the environment info block (Layer 1).
-    fn build_env_block(
-        &self,
-        model_id: &str,
-        workspace_root: Option<&Path>,
-    ) -> String {
+    fn build_env_block(&self, model_id: &str, workspace_root: Option<&Path>) -> String {
         let cwd = workspace_root
             .map(|p| p.display().to_string())
             .or_else(|| {
@@ -331,11 +298,7 @@ Here is some useful information about the environment you are running in:
     }
 
     /// Load a file, return empty string if not found.
-    fn load_file_or_default(
-        &self,
-        path: &std::path::Path,
-        default: &str,
-    ) -> Result<String> {
+    fn load_file_or_default(&self, path: &std::path::Path, default: &str) -> Result<String> {
         if path.exists() {
             Ok(std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()))?
@@ -504,23 +467,14 @@ default = "/nonexistent/prompts/system/mote.md"
 
     #[test]
     fn test_build_agent_instructions_layer_empty() {
-        assert!(
-            PromptAssembler::build_agent_instructions_layer(None).is_none()
-        );
-        assert!(
-            PromptAssembler::build_agent_instructions_layer(Some("")).is_none()
-        );
-        assert!(
-            PromptAssembler::build_agent_instructions_layer(Some("  "))
-                .is_none()
-        );
+        assert!(PromptAssembler::build_agent_instructions_layer(None).is_none());
+        assert!(PromptAssembler::build_agent_instructions_layer(Some("")).is_none());
+        assert!(PromptAssembler::build_agent_instructions_layer(Some("  ")).is_none());
     }
 
     #[test]
     fn test_build_agent_instructions_layer_present() {
-        let layer = PromptAssembler::build_agent_instructions_layer(Some(
-            "ROLE INSTRUCTIONS",
-        ));
+        let layer = PromptAssembler::build_agent_instructions_layer(Some("ROLE INSTRUCTIONS"));
         assert!(layer.is_some());
         assert_eq!(layer.unwrap(), "ROLE INSTRUCTIONS");
     }
@@ -531,11 +485,8 @@ default = "/nonexistent/prompts/system/mote.md"
         let full = a.assemble("test", "test-model").unwrap();
 
         // Build shared layers + inject role instructions manually
-        let mut shared =
-            a.assemble_shared_layers("test", "test-model").unwrap();
-        if let Some(layer) =
-            PromptAssembler::build_agent_instructions_layer(Some("AGENT RULES"))
-        {
+        let mut shared = a.assemble_shared_layers("test", "test-model").unwrap();
+        if let Some(layer) = PromptAssembler::build_agent_instructions_layer(Some("AGENT RULES")) {
             let has_skills = shared
                 .last()
                 .is_some_and(|l| l.starts_with("Skills available:"));
@@ -638,18 +589,12 @@ default = "/nonexistent/prompts/system/mote.md"
             .iter()
             .position(|l| l.contains("Instructions from: /tmp/repo/AGENTS.md"));
         if let Some(home) = dirs::home_dir() {
-            let global_path =
-                home.join(".config").join("mote").join("AGENTS.md");
+            let global_path = home.join(".config").join("mote").join("AGENTS.md");
             if global_path.exists() {
-                let global_marker =
-                    format!("Instructions from: {}", global_path.display());
-                let global_idx =
-                    layers.iter().position(|l| l.contains(&global_marker));
+                let global_marker = format!("Instructions from: {}", global_path.display());
+                let global_idx = layers.iter().position(|l| l.contains(&global_marker));
                 if let (Some(g), Some(w)) = (global_idx, workspace_idx) {
-                    assert!(
-                        g < w,
-                        "global AGENTS should appear before workspace AGENTS"
-                    );
+                    assert!(g < w, "global AGENTS should appear before workspace AGENTS");
                 }
             }
         }
@@ -664,8 +609,8 @@ default = "/nonexistent/prompts/system/mote.md"
         assert!(!layers.is_empty());
         assert!(layers[0].contains("test-model"));
         // If AGENTS.md exists, it should be the last layer
-        let agents_path = dirs::home_dir()
-            .map(|h| h.join(".config").join("mote").join("AGENTS.md"));
+        let agents_path =
+            dirs::home_dir().map(|h| h.join(".config").join("mote").join("AGENTS.md"));
         if let Some(ref p) = agents_path
             && p.exists()
         {
@@ -677,10 +622,7 @@ default = "/nonexistent/prompts/system/mote.md"
     fn test_load_file_or_default_empty_on_missing() {
         let a = test_assembler();
         let content = a
-            .load_file_or_default(
-                Path::new("/nonexistent/file.txt"),
-                "fallback",
-            )
+            .load_file_or_default(Path::new("/nonexistent/file.txt"), "fallback")
             .unwrap();
         assert_eq!(content, "fallback");
     }
@@ -754,8 +696,7 @@ Follow PEP 8.
         // Also test: folder without frontmatter (name falls back to folder name)
         let skill_folder2 = skills_dir.join("rust-rules");
         std::fs::create_dir_all(&skill_folder2).unwrap();
-        std::fs::write(skill_folder2.join("SKILL.md"), "Use edition 2024.")
-            .unwrap();
+        std::fs::write(skill_folder2.join("SKILL.md"), "Use edition 2024.").unwrap();
 
         // Note: actual skills loading reads from ~/.config/mote/skills/
         // which is determined by dirs::home_dir(). This test creates files in

@@ -372,10 +372,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 
 impl App {
     #[allow(dead_code)]
-    pub fn new(
-        ui_config: &marshaling_protocol::UiConfig,
-        model_info: String,
-    ) -> Self {
+    pub fn new(ui_config: &marshaling_protocol::UiConfig, model_info: String) -> Self {
         let workspace_root = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".into());
@@ -502,8 +499,7 @@ impl App {
     }
 
     fn invalidate_response_render_cache(&mut self) {
-        self.response_render_revision =
-            self.response_render_revision.wrapping_add(1);
+        self.response_render_revision = self.response_render_revision.wrapping_add(1);
         self.response_render_cache = None;
     }
 
@@ -583,9 +579,7 @@ impl App {
         } else if self.login_picker_open {
             Some("Close the login picker before entering selection mode.")
         } else if self.pending_permission.is_some() {
-            Some(
-                "Resolve the permission prompt before entering selection mode.",
-            )
+            Some("Resolve the permission prompt before entering selection mode.")
         } else {
             None
         }
@@ -595,9 +589,7 @@ impl App {
         self.agent_model_overrides.get(&self.current_agent)
     }
 
-    pub fn current_model_override_parts(
-        &self,
-    ) -> (Option<String>, Option<String>) {
+    pub fn current_model_override_parts(&self) -> (Option<String>, Option<String>) {
         if let Some(ov) = &self.pending_command_model {
             return (Some(ov.model_id.clone()), ov.provider.clone());
         }
@@ -645,8 +637,7 @@ impl App {
     }
 
     fn sync_current_agent_model_info(&mut self) {
-        self.model_info =
-            self.effective_model_info_for_agent(&self.current_agent);
+        self.model_info = self.effective_model_info_for_agent(&self.current_agent);
     }
 
     // ── Input submission ──────────────────────────────────
@@ -710,9 +701,7 @@ impl App {
 
     fn remember_input(&mut self, text: &str) {
         // Save to history first (including slash commands), dedup against last entry
-        if !text.is_empty()
-            && self.input_history.last().is_none_or(|last| last != text)
-        {
+        if !text.is_empty() && self.input_history.last().is_none_or(|last| last != text) {
             self.input_history.push(text.to_string());
         }
         self.input_history_idx = None;
@@ -726,10 +715,7 @@ impl App {
         self.reset_suggestions();
         self.handled_slash_command = true;
         if command.is_empty() {
-            self.push_command_message(
-                Role::Assistant,
-                "Usage: ! <shell command>",
-            );
+            self.push_command_message(Role::Assistant, "Usage: ! <shell command>");
         } else {
             self.push_command_message(Role::User, format!("$ {command}"));
             self.pending_slash = Some(SlashAction::RunShell(command));
@@ -790,13 +776,8 @@ impl App {
     }
 
     fn handle_secret_login_input(&mut self, text: String) {
-        let Some(secret) =
-            (!text.trim().is_empty()).then_some(text.trim().to_string())
-        else {
-            self.push_command_message(
-                Role::Assistant,
-                "No API key entered. Login cancelled.",
-            );
+        let Some(secret) = (!text.trim().is_empty()).then_some(text.trim().to_string()) else {
+            self.push_command_message(Role::Assistant, "No API key entered. Login cancelled.");
             self.pending_secret_login = None;
             return;
         };
@@ -827,10 +808,7 @@ impl App {
         self.invalidate_response_render_cache();
     }
 
-    pub fn set_custom_commands(
-        &mut self,
-        mut commands: Vec<CustomSlashCommand>,
-    ) {
+    pub fn set_custom_commands(&mut self, mut commands: Vec<CustomSlashCommand>) {
         commands.sort_by(|a, b| a.name.cmp(&b.name));
         self.custom_commands = commands;
         self.update_suggestions();
@@ -880,8 +858,7 @@ impl App {
         // the count only marks where compaction happened in this view (for
         // the context-size heuristic), so use the local position: every
         // conversation message except a still-unsent user message.
-        let pending =
-            usize::from(self.pending_user_message_content().is_some());
+        let pending = usize::from(self.pending_user_message_content().is_some());
         compaction.compacted_message_count =
             self.conversation_message_count().saturating_sub(pending);
         self.active_session_id = Some(session_id);
@@ -914,8 +891,7 @@ impl App {
                 .unwrap_or(usize::MAX)
                 .saturating_add(last_content.len())
         });
-        self.uncompacted_context_chars(false).max(server)
-            > AUTO_COMPACT_CHAR_THRESHOLD
+        self.uncompacted_context_chars(false).max(server) > AUTO_COMPACT_CHAR_THRESHOLD
     }
 
     pub fn request_auto_compact_confirmation(&mut self) {
@@ -959,8 +935,7 @@ impl App {
             .rev()
             .find(|m| m.source == MessageSource::Conversation)?;
 
-        (latest_conversation.role == Role::User)
-            .then_some(latest_conversation.content.as_str())
+        (latest_conversation.role == Role::User).then_some(latest_conversation.content.as_str())
     }
 
     fn conversation_message_count(&self) -> usize {
@@ -970,10 +945,7 @@ impl App {
             .count()
     }
 
-    fn uncompacted_conversation_message_count(
-        &self,
-        include_latest_user: bool,
-    ) -> usize {
+    fn uncompacted_conversation_message_count(&self, include_latest_user: bool) -> usize {
         self.compact_history_messages(include_latest_user).len()
     }
 
@@ -1028,8 +1000,7 @@ impl App {
         if parts.is_empty() {
             return;
         }
-        if let Some(invocation) = self.custom_command_invocation(cmd, parts[0])
-        {
+        if let Some(invocation) = self.custom_command_invocation(cmd, parts[0]) {
             self.handle_custom_command(invocation);
             return;
         }
@@ -1068,16 +1039,14 @@ impl App {
             "## Keybindings".to_string(),
             "- `Enter` — Send message".to_string(),
             "- `Alt+Enter` — Newline".to_string(),
-            "- `F6` — Toggle selection mode for native terminal copy"
-                .to_string(),
+            "- `F6` — Toggle selection mode for native terminal copy".to_string(),
             "- `Ctrl+A / Ctrl+E` — Line start / end".to_string(),
             "- `Ctrl+D` — Delete current char".to_string(),
             "- `Ctrl+K` — Clear current line".to_string(),
             "- `Esc` — Press twice within 2s to stop running agent".to_string(),
             "- `Ctrl+C` — Quit / cancel immediately".to_string(),
             "- `Tab` — Cycle agent".to_string(),
-            "- `Up/Down` — Input history, or scroll overflowing draft"
-                .to_string(),
+            "- `Up/Down` — Input history, or scroll overflowing draft".to_string(),
             "- `PgUp/PgDn, Ctrl+↑/↓` — Scroll".to_string(),
             "- `Ctrl+P` — Agent command".to_string(),
             "- `F5` — Cycle subagent views".to_string(),
@@ -1086,8 +1055,7 @@ impl App {
             lines.push(String::new());
             lines.push("## Custom Commands".to_string());
             lines.extend(self.custom_commands.iter().map(|command| {
-                let description =
-                    command.description.as_deref().unwrap_or("Custom prompt");
+                let description = command.description.as_deref().unwrap_or("Custom prompt");
                 format!("- `/{}` — {}", command.name, description)
             }));
         }
@@ -1105,8 +1073,7 @@ impl App {
             .iter()
             .find(|command| command.name == name)?
             .clone();
-        let arguments =
-            full_input[command_token.len()..].trim_start().to_string();
+        let arguments = full_input[command_token.len()..].trim_start().to_string();
         Some(CustomCommandInvocation { command, arguments })
     }
 
@@ -1123,8 +1090,7 @@ impl App {
         }
         if let Some(model) = invocation.command.model.as_deref() {
             let (model_id, provider) = self.resolve_model_selection(model);
-            self.pending_command_model =
-                Some(AgentModelOverride { provider, model_id });
+            self.pending_command_model = Some(AgentModelOverride { provider, model_id });
         }
         self.push_command_message(
             Role::User,
@@ -1166,19 +1132,11 @@ impl App {
             .iter()
             .find(|(name, _, _)| *name == provider)
         {
-            self.handle_api_key_login_command(
-                parts,
-                provider,
-                display_name,
-                key_url,
-            );
+            self.handle_api_key_login_command(parts, provider, display_name, key_url);
         } else {
             self.push_command_message(
                 Role::Assistant,
-                format!(
-                    "Unknown provider: {provider}.\n\n{}",
-                    login_provider_help()
-                ),
+                format!("Unknown provider: {provider}.\n\n{}", login_provider_help()),
             );
         }
     }
@@ -1193,17 +1151,12 @@ impl App {
         let Some(key) = parts.get(2) else {
             self.push_command_message(
                 Role::Assistant,
-                format!(
-                    "Usage: /login {provider} <api_key>\nGet your key at: {key_url}"
-                ),
+                format!("Usage: /login {provider} <api_key>\nGet your key at: {key_url}"),
             );
             return;
         };
 
-        self.push_command_message(
-            Role::Assistant,
-            format!("Saving {display_name} API key..."),
-        );
+        self.push_command_message(Role::Assistant, format!("Saving {display_name} API key..."));
         self.pending_slash = Some(SlashAction::SaveCredential(
             provider.into(),
             "api_key".into(),
@@ -1231,31 +1184,21 @@ impl App {
 
     fn handle_compact_command(&mut self) {
         if self.state != AppState::Idle {
-            self.push_command_message(
-                Role::Assistant,
-                "Cannot compact while agent is running.",
-            );
+            self.push_command_message(Role::Assistant, "Cannot compact while agent is running.");
             return;
         }
         if self.uncompacted_conversation_message_count(true) == 0 {
-            self.push_command_message(
-                Role::Assistant,
-                "Nothing new to compact.",
-            );
+            self.push_command_message(Role::Assistant, "Nothing new to compact.");
             return;
         }
-        self.push_command_message(
-            Role::Assistant,
-            "Compacting older conversation context...",
-        );
+        self.push_command_message(Role::Assistant, "Compacting older conversation context...");
         self.pending_slash = Some(SlashAction::Compact {
             include_latest_user: true,
         });
     }
 
     fn handle_agent_command(&mut self, parts: &[&str]) {
-        let all_agents =
-            all_agent_names(&self.agent_names, &self.default_agent);
+        let all_agents = all_agent_names(&self.agent_names, &self.default_agent);
         if parts.len() < 2 {
             self.push_command_message(
                 Role::Assistant,
@@ -1268,9 +1211,7 @@ impl App {
         }
 
         let name = parts[1];
-        if name == self.default_agent.as_str()
-            || self.agent_names.contains(&name.to_string())
-        {
+        if name == self.default_agent.as_str() || self.agent_names.contains(&name.to_string()) {
             self.current_agent = name.to_string();
             self.input_accent = agent_accent_color(&self.current_agent);
             self.sync_current_agent_model_info();
@@ -1292,10 +1233,7 @@ impl App {
 
     fn handle_model_command(&mut self, parts: &[&str]) {
         if parts.len() < 2 {
-            self.push_command_message(
-                Role::Assistant,
-                "Fetching available models...",
-            );
+            self.push_command_message(Role::Assistant, "Fetching available models...");
             self.pending_slash = Some(SlashAction::FetchModels);
             return;
         }
@@ -1344,13 +1282,7 @@ impl App {
             let status = if sv.done { "done" } else { "running" };
             let viewing = self.current_subagent_index == Some(i);
             let marker = if viewing { " ←" } else { "" };
-            lines.push(format!(
-                "  {}. {} ({}){}",
-                i + 1,
-                sv.name,
-                status,
-                marker
-            ));
+            lines.push(format!("  {}. {} ({}){}", i + 1, sv.name, status, marker));
         }
         lines.push(String::new());
         lines.push("Press F5 to cycle between views.".into());
@@ -1432,10 +1364,7 @@ impl App {
         if streamed.is_empty() {
             return content.to_string();
         }
-        if content.is_empty()
-            || streamed == content
-            || streamed.contains(content)
-        {
+        if content.is_empty() || streamed == content || streamed.contains(content) {
             return streamed.to_string();
         }
         if content.starts_with(streamed) {
@@ -1481,11 +1410,7 @@ impl App {
 
     /// Called at the end of each agent turn. Saves the intermediate text
     /// and tool calls to the conversation history.
-    pub fn agent_turn_done(
-        &mut self,
-        text: &str,
-        tool_calls: &[ToolCallDisplay],
-    ) {
+    pub fn agent_turn_done(&mut self, text: &str, tool_calls: &[ToolCallDisplay]) {
         let change_summary = render_change_summary(tool_calls);
         let final_text = if change_summary.is_empty() {
             text.to_string()
@@ -1560,10 +1485,7 @@ impl App {
         // Sentinel values from the agent loop — don't display as assistant messages
         if matches!(
             content,
-            "(cancelled)"
-                | "(max steps reached)"
-                | "(interrupted)"
-                | "(permission denied)"
+            "(cancelled)" | "(max steps reached)" | "(interrupted)" | "(permission denied)"
         ) {
             if thinking.is_some() {
                 self.messages.push(DisplayMessage {
@@ -1609,15 +1531,11 @@ impl App {
     ///
     /// Returns false when the event is a replayed duplicate that has already
     /// been applied and must be ignored.
-    pub fn accept_run_log_event(
-        &mut self,
-        event: &marshaling_protocol::ServerEvent,
-    ) -> bool {
+    pub fn accept_run_log_event(&mut self, event: &marshaling_protocol::ServerEvent) -> bool {
         if !event.is_run_log_event() {
             return true;
         }
-        if matches!(event, marshaling_protocol::ServerEvent::RunStarted { .. })
-        {
+        if matches!(event, marshaling_protocol::ServerEvent::RunStarted { .. }) {
             self.run_event_count = 0;
         }
         self.run_event_count += 1;
@@ -1669,8 +1587,7 @@ impl App {
         tool_name: String,
         args: &serde_json::Value,
     ) {
-        let shown =
-            self.pending_permission.as_ref().is_some_and(|p| p.id == id);
+        let shown = self.pending_permission.as_ref().is_some_and(|p| p.id == id);
         let queued = self
             .pending_permission_response
             .as_ref()
@@ -1680,8 +1597,7 @@ impl App {
         }
         match self.answered_permissions.get(&id).copied() {
             Some((allowed, remember)) => {
-                self.pending_permission_response =
-                    Some((id, allowed, remember));
+                self.pending_permission_response = Some((id, allowed, remember));
             }
             None => self.show_permission_request(id, tool_name, args),
         }
@@ -1746,8 +1662,7 @@ impl App {
         // Queued inputs are not sent here: the restored message in the input
         // box comes first, and the queue drains after that run as usual.
         let notice = match self.input_queue.len() {
-            0 => "Earlier run stopped. Press Enter to send your message."
-                .to_string(),
+            0 => "Earlier run stopped. Press Enter to send your message.".to_string(),
             n => format!(
                 "Earlier run stopped. Press Enter to send your message; {n} queued message(s) will follow after it."
             ),
@@ -1987,8 +1902,7 @@ impl App {
     }
 
     pub fn input_scroll_down(&mut self, amount: usize) {
-        self.input_scroll_offset =
-            self.input_scroll_offset.saturating_sub(amount);
+        self.input_scroll_offset = self.input_scroll_offset.saturating_sub(amount);
     }
 
     pub fn reset_input_scroll(&mut self) {
@@ -2010,14 +1924,9 @@ impl App {
         self.sync_current_agent_model_info();
     }
 
-    pub fn open_session_picker(
-        &mut self,
-        mut items: Vec<marshaling_protocol::SessionInfo>,
-    ) {
+    pub fn open_session_picker(&mut self, mut items: Vec<marshaling_protocol::SessionInfo>) {
         // Newest sessions first in the popup (top = latest).
-        items.sort_by(|a, b| {
-            b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id))
-        });
+        items.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id)));
         self.session_picker_open = true;
         self.session_picker_items = items;
         self.session_picker_index = 0;
@@ -2085,8 +1994,7 @@ impl App {
         if self.login_picker_items.is_empty() {
             return;
         }
-        self.login_picker_index =
-            (self.login_picker_index + 1) % self.login_picker_items.len();
+        self.login_picker_index = (self.login_picker_index + 1) % self.login_picker_items.len();
     }
 
     pub fn selected_login_choice(&self) -> Option<LoginProviderChoice> {
@@ -2128,8 +2036,7 @@ impl App {
         if self.model_picker_items.is_empty() {
             return;
         }
-        self.model_picker_index =
-            (self.model_picker_index + 1) % self.model_picker_items.len();
+        self.model_picker_index = (self.model_picker_index + 1) % self.model_picker_items.len();
     }
 
     pub fn selected_model_choice(&self) -> Option<ModelChoice> {
@@ -2308,9 +2215,7 @@ impl App {
         if let Some(cmd) = input.split_whitespace().next() {
             let after = input[cmd.len()..].trim_start();
             if !after.is_empty() && (cmd == "/agent" || cmd == "/a") {
-                for name in
-                    all_agent_names(&self.agent_names, &self.default_agent)
-                {
+                for name in all_agent_names(&self.agent_names, &self.default_agent) {
                     if name.starts_with(after) {
                         self.suggestions.push(format!("/agent {}", name));
                     }
@@ -2326,8 +2231,7 @@ impl App {
         for command in &self.custom_commands {
             let cmd = format!("/{}", command.name);
             if cmd.starts_with(&lower) {
-                let desc =
-                    command.description.as_deref().unwrap_or("Custom prompt");
+                let desc = command.description.as_deref().unwrap_or("Custom prompt");
                 self.suggestions.push(format!("{}  — {}", cmd, desc));
             }
         }
@@ -2340,8 +2244,7 @@ impl App {
 
     pub fn suggestion_next(&mut self) {
         if !self.suggestions.is_empty() {
-            self.suggestion_index =
-                (self.suggestion_index + 1).min(self.suggestions.len());
+            self.suggestion_index = (self.suggestion_index + 1).min(self.suggestions.len());
         }
     }
 
@@ -2352,9 +2255,7 @@ impl App {
     }
 
     pub fn selected_suggestion(&self) -> Option<&str> {
-        if self.suggestion_index > 0
-            && self.suggestion_index <= self.suggestions.len()
-        {
+        if self.suggestion_index > 0 && self.suggestion_index <= self.suggestions.len() {
             let s = &self.suggestions[self.suggestion_index - 1];
             Some(s.split("  —").next().unwrap_or(s))
         } else {
@@ -3550,10 +3451,7 @@ mod tests {
         app.agent_done("output with details");
 
         assert_eq!(app.messages.len(), 1);
-        assert_eq!(
-            app.messages[0].content,
-            "full streamed output with details"
-        );
+        assert_eq!(app.messages[0].content, "full streamed output with details");
     }
 
     #[test]
@@ -3586,9 +3484,7 @@ mod tests {
         app.agent_tool_started("c2", "bash");
         app.agent_tool_failed("c2", "error msg");
         assert_eq!(app.tool_calls.len(), 2);
-        assert!(
-            matches!(&app.tool_calls[1].status, ToolStatus::Failed(e) if e == "error msg")
-        );
+        assert!(matches!(&app.tool_calls[1].status, ToolStatus::Failed(e) if e == "error msg"));
     }
 
     #[test]
@@ -3628,9 +3524,7 @@ mod tests {
         });
 
         // Append text delta
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.stream_buffer.push_str("Hello ");
             sv.stream_buffer.push_str("World");
         }
@@ -3652,9 +3546,7 @@ mod tests {
         });
 
         // Mark done
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.done = true;
             sv.content = "No bugs found.".into();
             sv.stream_buffer.clear();
@@ -3730,9 +3622,7 @@ mod tests {
             content: String::new(),
         });
 
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.tool_calls.push(marshaling_protocol::ToolCallDisplay {
                 id: "tc_1".into(),
                 name: "read".into(),
@@ -3763,9 +3653,7 @@ mod tests {
             content: String::new(),
         });
 
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.reasoning_buffer.push_str("thinking...");
         }
         assert!(app.subagent_views[0].reasoning_buffer.contains("thinking"));
@@ -3801,9 +3689,7 @@ mod tests {
         assert_eq!(app.subagent_views[1].name, "wiki");
 
         // Update specific subagent by ID
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_002")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_002") {
             sv.stream_buffer.push_str(" done");
         }
         assert_eq!(app.subagent_views[1].stream_buffer, "researching... done");
@@ -3825,9 +3711,7 @@ mod tests {
         });
 
         // Simulate SubagentDone
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.done = true;
             sv.content = "No bugs found.".into();
         }

@@ -2,8 +2,7 @@
 
 use super::*;
 
-pub(crate) const COMPACTION_CONTEXT_MARKER: &str =
-    "[mote compacted conversation context]";
+pub(crate) const COMPACTION_CONTEXT_MARKER: &str = "[mote compacted conversation context]";
 /// POST /compact — summarize older conversation turns for future context.
 pub(crate) async fn compact_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -57,10 +56,7 @@ pub(crate) async fn compact_conversation(
     let Some(session_id) = request.session_id.clone() else {
         anyhow::bail!("Nothing to compact yet");
     };
-    let dir = history_dir_for_session(
-        &state.config.history.dir,
-        &req_ctx.runtime_session_key,
-    );
+    let dir = history_dir_for_session(&state.config.history.dir, &req_ctx.runtime_session_key);
     let path = store::transcript_path(&dir, &session_id);
     let session_lock = state.session_lock(&path).await;
     // Load under the lock but release it for the (slow) summarization, so
@@ -129,11 +125,9 @@ pub(crate) async fn compact_conversation(
     };
     {
         let _guard = session_lock.lock().await;
-        tokio::task::spawn_blocking(move || {
-            store::append(&path, &[record], false)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("session write task failed: {e}"))??;
+        tokio::task::spawn_blocking(move || store::append(&path, &[record], false))
+            .await
+            .map_err(|e| anyhow::anyhow!("session write task failed: {e}"))??;
     }
     transcript.compaction = Some(store::StoredCompaction {
         upto_seq,
@@ -141,8 +135,8 @@ pub(crate) async fn compact_conversation(
         model_provider: ctx.eff_provider.clone(),
         model_id: ctx.eff_model_id.clone(),
     });
-    let compaction = protocol_compaction(&transcript)
-        .context("compaction state missing after compacting")?;
+    let compaction =
+        protocol_compaction(&transcript).context("compaction state missing after compacting")?;
     Ok(marshaling_protocol::CompactResponse {
         session_id,
         compaction,
@@ -227,9 +221,7 @@ pub(crate) fn compact_part(message: &llm::ChatMessage) -> String {
 /// is never separated from its results. If even the first step is larger,
 /// that step alone. Messages after the cut stay verbatim for the model.
 pub(crate) fn compaction_cut(messages: &[llm::ChatMessage]) -> usize {
-    let starts_step = |m: &llm::ChatMessage| {
-        m.role == llm::Role::User && m.tool_call_id.is_none()
-    };
+    let starts_step = |m: &llm::ChatMessage| m.role == llm::Role::User && m.tool_call_id.is_none();
     let mut size = 0;
     let mut best = None;
     let mut first_boundary = None;

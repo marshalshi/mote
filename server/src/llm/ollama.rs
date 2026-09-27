@@ -33,8 +33,7 @@ fn ollama_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
                 .and_then(serde_json::Value::as_array_mut)
             {
                 for call in calls {
-                    if let Some(arguments) =
-                        call.pointer_mut("/function/arguments")
+                    if let Some(arguments) = call.pointer_mut("/function/arguments")
                         && let Some(text) = arguments.as_str()
                     {
                         // Ollama requires an object; anything else
@@ -76,8 +75,7 @@ impl OllamaProvider {
             }
         });
         if !options.tools.is_empty() {
-            body["tools"] =
-                serde_json::to_value(&options.tools).unwrap_or_default();
+            body["tools"] = serde_json::to_value(&options.tools).unwrap_or_default();
         }
         body
     }
@@ -134,11 +132,7 @@ struct OllamaChatResponse {
 
 #[async_trait]
 impl LlmProvider for OllamaProvider {
-    async fn chat(
-        &self,
-        messages: &[ChatMessage],
-        options: &ChatOptions,
-    ) -> Result<ChatResult> {
+    async fn chat(&self, messages: &[ChatMessage], options: &ChatOptions) -> Result<ChatResult> {
         let url = format!("{}/api/chat", self.base_url);
         let body = self.build_request(messages, options, false);
         tracing::debug!(
@@ -160,10 +154,7 @@ impl LlmProvider for OllamaProvider {
         if !status.is_success() {
             let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::from_response(
-                "Ollama", status, &headers, &text,
-            )
-            .into());
+            return Err(ProviderError::from_response("Ollama", status, &headers, &text).into());
         }
 
         let completion: OllamaChatResponse = response.json().await?;
@@ -199,8 +190,7 @@ impl LlmProvider for OllamaProvider {
                 call_type: "function".into(),
                 function: ToolFunction {
                     name: tc.function.name,
-                    arguments: serde_json::to_string(&tc.function.arguments)
-                        .unwrap_or_default(),
+                    arguments: serde_json::to_string(&tc.function.arguments).unwrap_or_default(),
                 },
             })
             .collect();
@@ -244,30 +234,22 @@ impl LlmProvider for OllamaProvider {
             .send();
         // Ollama loads the model and evaluates the prompt before replying,
         // so the first response gets the longer limit.
-        let response =
-            match with_idle_timeout(timeouts.first_response, "Ollama", request)
-                .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    return fail(ProviderError::from_send_error("Ollama", &e));
-                }
-                Err(stalled) => return fail(stalled),
-            };
+        let response = match with_idle_timeout(timeouts.first_response, "Ollama", request).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return fail(ProviderError::from_send_error("Ollama", &e));
+            }
+            Err(stalled) => return fail(stalled),
+        };
 
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
-            let text = match with_idle_timeout(
-                timeouts.stream_idle,
-                "Ollama",
-                response.text(),
-            )
-            .await
-            {
-                Ok(Ok(t)) => t,
-                _ => "unknown".into(),
-            };
+            let text =
+                match with_idle_timeout(timeouts.stream_idle, "Ollama", response.text()).await {
+                    Ok(Ok(t)) => t,
+                    _ => "unknown".into(),
+                };
             return fail(ProviderError::from_response(
                 "Ollama", status, &headers, &text,
             ));
@@ -286,12 +268,11 @@ impl LlmProvider for OllamaProvider {
             } else {
                 timeouts.first_response
             };
-            let chunk_result =
-                match with_idle_timeout(limit, "Ollama", stream.next()).await {
-                    Ok(Some(chunk_result)) => chunk_result,
-                    Ok(None) => break,
-                    Err(stalled) => return fail(stalled),
-                };
+            let chunk_result = match with_idle_timeout(limit, "Ollama", stream.next()).await {
+                Ok(Some(chunk_result)) => chunk_result,
+                Ok(None) => break,
+                Err(stalled) => return fail(stalled),
+            };
             received_data = true;
             let chunk = match chunk_result {
                 Ok(chunk) => chunk,
@@ -325,8 +306,7 @@ impl LlmProvider for OllamaProvider {
                                 && !content.is_empty()
                             {
                                 text_content.push_str(&content);
-                                let _ = sender
-                                    .send(Ok(StreamEvent::Chunk(content)));
+                                let _ = sender.send(Ok(StreamEvent::Chunk(content)));
                             }
                             if let Some(tcs) = msg.tool_calls {
                                 for tc in tcs {
@@ -334,10 +314,7 @@ impl LlmProvider for OllamaProvider {
                                         id: format!(
                                             "ollama_{}_{}",
                                             tc.function.name,
-                                            OLLAMA_CALL_ID.fetch_add(
-                                                1,
-                                                Ordering::Relaxed
-                                            )
+                                            OLLAMA_CALL_ID.fetch_add(1, Ordering::Relaxed)
                                         ),
                                         call_type: "function".into(),
                                         function: ToolFunction {
@@ -353,19 +330,11 @@ impl LlmProvider for OllamaProvider {
                         }
                         if chunk.done {
                             let usage = Usage {
-                                prompt_tokens: chunk
-                                    .prompt_eval_count
-                                    .unwrap_or(0),
-                                completion_tokens: chunk
-                                    .eval_count
-                                    .unwrap_or(0),
+                                prompt_tokens: chunk.prompt_eval_count.unwrap_or(0),
+                                completion_tokens: chunk.eval_count.unwrap_or(0),
                                 total_tokens: 0,
                             };
-                            let result = finalize_ollama(
-                                &mut text_content,
-                                &mut tool_calls,
-                                usage,
-                            );
+                            let result = finalize_ollama(&mut text_content, &mut tool_calls, usage);
                             let _ = sender.send(Ok(StreamEvent::Done(result)));
                             return;
                         }
@@ -373,14 +342,11 @@ impl LlmProvider for OllamaProvider {
                     Err(error) => {
                         // Ollama reports runner failures in-stream
                         // as `{"error": "..."}`.
-                        let payload_error =
-                            serde_json::from_str::<serde_json::Value>(line)
-                                .ok()
-                                .and_then(|payload| {
-                                    ProviderError::from_stream_payload(
-                                        "Ollama", &payload,
-                                    )
-                                });
+                        let payload_error = serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .and_then(|payload| {
+                                ProviderError::from_stream_payload("Ollama", &payload)
+                            });
                         return fail(payload_error.unwrap_or_else(|| {
                             ProviderError::fatal(format!(
                                 "Failed to parse Ollama stream record: {error}"
@@ -417,20 +383,15 @@ impl LlmProvider for OllamaProvider {
     }
 }
 
-fn finalize_ollama(
-    text: &mut String,
-    tool_calls: &mut Vec<ToolCall>,
-    usage: Usage,
-) -> ChatResult {
+fn finalize_ollama(text: &mut String, tool_calls: &mut Vec<ToolCall>, usage: Usage) -> ChatResult {
     let calls = std::mem::take(tool_calls);
     // Keep text content even when tool calls exist — Ollama may stream text before tool calls
     let content = Some(std::mem::take(text));
-    let content =
-        if content.as_ref().is_none_or(|s| s.is_empty()) && !calls.is_empty() {
-            None
-        } else {
-            content
-        };
+    let content = if content.as_ref().is_none_or(|s| s.is_empty()) && !calls.is_empty() {
+        None
+    } else {
+        content
+    };
     ChatResult {
         content,
         finish_reason: Some(if calls.is_empty() {

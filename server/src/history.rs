@@ -12,23 +12,21 @@ const MESSAGE_HEADING_SEPARATOR: &str = " — ";
 
 /// Parse a session file (markdown + YAML frontmatter) into its metadata and messages.
 pub fn parse_file(path: &Path) -> Result<(SessionMeta, Vec<Message>)> {
-    let content = std::fs::read_to_string(path).with_context(|| {
-        format!("Failed to read session file: {}", path.display())
-    })?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read session file: {}", path.display()))?;
     parse(&content)
 }
 
 /// Parse a session file's content string.
 pub fn parse(content: &str) -> Result<(SessionMeta, Vec<Message>)> {
     // Split on the first `---` to isolate YAML frontmatter.
-    let rest = strip_frontmatter_prefix(content)
-        .context("Session file must start with `---`")?;
+    let rest = strip_frontmatter_prefix(content).context("Session file must start with `---`")?;
 
-    let (yaml_text, body) = split_frontmatter(rest)
-        .context("Session file missing closing `---` after frontmatter")?;
+    let (yaml_text, body) =
+        split_frontmatter(rest).context("Session file missing closing `---` after frontmatter")?;
 
-    let meta: SessionMeta = serde_yaml::from_str(yaml_text)
-        .context("Failed to parse YAML frontmatter")?;
+    let meta: SessionMeta =
+        serde_yaml::from_str(yaml_text).context("Failed to parse YAML frontmatter")?;
 
     let messages = parse_body(body);
 
@@ -152,8 +150,7 @@ impl ParsedMessage {
 /// legacy-format fixtures in tests.
 #[cfg(test)]
 pub fn serialize(meta: &SessionMeta, messages: &[Message]) -> Result<String> {
-    let yaml = serde_yaml::to_string(meta)
-        .context("Failed to serialize session metadata")?;
+    let yaml = serde_yaml::to_string(meta).context("Failed to serialize session metadata")?;
 
     let mut body = String::new();
     for msg in messages {
@@ -329,10 +326,7 @@ mod tests {
     fn test_serialize_preserves_content() {
         let msgs = vec![
             Message::new(Role::User, "Multi\nline\ninput".into()),
-            Message::new(
-                Role::Assistant,
-                "Code:\n```rust\nfn main() {}\n```".into(),
-            ),
+            Message::new(Role::Assistant, "Code:\n```rust\nfn main() {}\n```".into()),
         ];
         let meta = SessionMeta {
             id: "test".into(),

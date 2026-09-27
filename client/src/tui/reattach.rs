@@ -6,13 +6,11 @@ use super::*;
 
 /// Delay before each reattach attempt after the run's websocket drops. The
 /// server keeps the run alive, so these only need to cover short outages.
-pub(super) const REATTACH_DELAYS_MS: [u64; 6] =
-    [0, 500, 1_000, 2_000, 4_000, 8_000];
+pub(super) const REATTACH_DELAYS_MS: [u64; 6] = [0, 500, 1_000, 2_000, 4_000, 8_000];
 /// Upper bound for one reattach attempt, so a server that accepts TCP but
 /// never finishes the handshake cannot stall reconnection.
 pub(super) const REATTACH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const REATTACH_STATUS: &str =
-    "reconnecting to run… (Ctrl+C twice to stop waiting)";
+pub(super) const REATTACH_STATUS: &str = "reconnecting to run… (Ctrl+C twice to stop waiting)";
 
 /// Try to reattach to `run_id` after the delay for `attempt`, reporting the
 /// outcome as a `BackgroundEvent::Reattached`. Runs in the background so the
@@ -36,12 +34,9 @@ pub(super) fn schedule_reattach(
     let tx = background_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        let result = tokio::time::timeout(
-            REATTACH_CONNECT_TIMEOUT,
-            client.chat_stream(request),
-        )
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("reattach timed out")));
+        let result = tokio::time::timeout(REATTACH_CONNECT_TIMEOUT, client.chat_stream(request))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("reattach timed out")));
         let _ = tx.send(BackgroundEvent::Reattached {
             run_id,
             generation,
@@ -91,14 +86,7 @@ pub(super) fn handle_reattach_result(
         Err(e) if attempt + 1 < REATTACH_DELAYS_MS.len() => {
             tracing::warn!(attempt, "reattach to run {run_id} failed: {e:#}");
             *reattach_attempt = Some(attempt + 1);
-            schedule_reattach(
-                client,
-                app,
-                run_id,
-                attempt + 1,
-                generation,
-                background_tx,
-            );
+            schedule_reattach(client, app, run_id, attempt + 1, generation, background_tx);
         }
         Err(e) => {
             *reattach_attempt = None;
@@ -110,12 +98,8 @@ pub(super) fn handle_reattach_result(
     }
 }
 
-pub(super) fn build_attach_request(
-    app: &App,
-    run_id: String,
-) -> marshaling_protocol::ChatRequest {
-    let (model_override, provider_override) =
-        app.current_model_override_parts();
+pub(super) fn build_attach_request(app: &App, run_id: String) -> marshaling_protocol::ChatRequest {
+    let (model_override, provider_override) = app.current_model_override_parts();
     marshaling_protocol::ChatRequest {
         message: String::new(),
         agent: app.current_agent.clone(),

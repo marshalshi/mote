@@ -94,10 +94,7 @@ impl ProviderError {
     /// `data: {"error": {...}}` from OpenAI-compatible gateways, or
     /// `{"error": "..."}` from Ollama). Returns `None` when `payload` is not
     /// an error object.
-    pub fn from_stream_payload(
-        provider: &str,
-        payload: &serde_json::Value,
-    ) -> Option<Self> {
+    pub fn from_stream_payload(provider: &str, payload: &serde_json::Value) -> Option<Self> {
         let error = payload.get("error")?;
         let message = error
             .get("message")
@@ -136,9 +133,7 @@ fn classify_status(status: u16, body: &str) -> ProviderErrorKind {
     match status {
         429 => ProviderErrorKind::RateLimited,
         413 => ProviderErrorKind::ContextOverflow,
-        400 if mentions_context_overflow(body) => {
-            ProviderErrorKind::ContextOverflow
-        }
+        400 if mentions_context_overflow(body) => ProviderErrorKind::ContextOverflow,
         // Request timeout, too early, and overloaded (529).
         408 | 425 | 529 => ProviderErrorKind::Transient,
         500..=599 => ProviderErrorKind::Transient,
@@ -245,21 +240,15 @@ mod tests {
         };
         use ProviderErrorKind::*;
         assert_eq!(
-            kind(
-                serde_json::json!({"error": {"message": "Server overloaded, try again"}})
-            ),
+            kind(serde_json::json!({"error": {"message": "Server overloaded, try again"}})),
             Some(Transient)
         );
         assert_eq!(
-            kind(
-                serde_json::json!({"error": "model runner has unexpectedly stopped"})
-            ),
+            kind(serde_json::json!({"error": "model runner has unexpectedly stopped"})),
             Some(Fatal)
         );
         assert_eq!(
-            kind(
-                serde_json::json!({"error": {"message": "Rate limit reached"}})
-            ),
+            kind(serde_json::json!({"error": {"message": "Rate limit reached"}})),
             Some(RateLimited)
         );
         assert_eq!(kind(serde_json::json!({"choices": []})), None);

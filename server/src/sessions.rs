@@ -4,10 +4,8 @@
 
 use super::*;
 
-pub(crate) type SessionInfoCache = HashMap<
-    PathBuf,
-    (std::time::SystemTime, u64, marshaling_protocol::SessionInfo),
->;
+pub(crate) type SessionInfoCache =
+    HashMap<PathBuf, (std::time::SystemTime, u64, marshaling_protocol::SessionInfo)>;
 
 /// Sessions in `dir`, newest first: transcripts, plus legacy `.md` sessions
 /// that have not been converted yet. A transcript is only parsed when it is
@@ -24,10 +22,7 @@ pub(crate) fn session_infos(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut transcripts = HashSet::new();
-    let mut found: Vec<(
-        std::time::SystemTime,
-        marshaling_protocol::SessionInfo,
-    )> = Vec::new();
+    let mut found: Vec<(std::time::SystemTime, marshaling_protocol::SessionInfo)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let metadata = entry.metadata().ok();
@@ -43,9 +38,7 @@ pub(crate) fn session_infos(
                 let cached = stamp.and_then(|_| {
                     cache
                         .get(&path)
-                        .filter(|(time, len, _)| {
-                            *time == modified && *len == size
-                        })
+                        .filter(|(time, len, _)| *time == modified && *len == size)
                         .map(|(_, _, info)| info.clone())
                 });
                 let info = match cached {
@@ -54,17 +47,12 @@ pub(crate) fn session_infos(
                         Ok(transcript) => marshaling_protocol::SessionInfo {
                             id: transcript.id.clone(),
                             created: transcript.created.to_rfc3339(),
-                            model: format!(
-                                "{}/{}",
-                                transcript.model_provider, transcript.model_id
-                            ),
+                            model: format!("{}/{}", transcript.model_provider, transcript.model_id),
                             message_count: transcript.display_messages().len(),
                             summary: transcript.summary(),
                         },
                         Err(e) => {
-                            tracing::warn!(
-                                "Skipping unreadable session: {e:#}"
-                            );
+                            tracing::warn!("Skipping unreadable session: {e:#}");
                             continue;
                         }
                     },
@@ -79,10 +67,7 @@ pub(crate) fn session_infos(
                     Ok((meta, messages)) => marshaling_protocol::SessionInfo {
                         id: meta.id,
                         created: meta.created.to_rfc3339(),
-                        model: format!(
-                            "{}/{}",
-                            meta.model_provider, meta.model_id
-                        ),
+                        model: format!("{}/{}", meta.model_provider, meta.model_id),
                         message_count: messages.len(),
                         summary: meta.summary,
                     },
@@ -94,9 +79,7 @@ pub(crate) fn session_infos(
         found.push((modified, info));
     }
     // Forget sessions of this directory that no longer exist.
-    cache.retain(|path, _| {
-        path.parent() != Some(dir) || transcripts.contains(path)
-    });
+    cache.retain(|path, _| path.parent() != Some(dir) || transcripts.contains(path));
     found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     found.into_iter().map(|(_, info)| info).collect()
 }
@@ -124,20 +107,13 @@ pub(crate) fn load_session_data(
         return Some(marshaling_protocol::SessionData {
             id: transcript.id.clone(),
             created: transcript.created.to_rfc3339(),
-            model: format!(
-                "{}/{}",
-                transcript.model_provider, transcript.model_id
-            ),
+            model: format!("{}/{}", transcript.model_provider, transcript.model_id),
             compaction: protocol_compaction(&transcript),
-            context_chars: Some(store::history_chars(&model_history(
-                &transcript,
-                None,
-            ))),
+            context_chars: Some(store::history_chars(&model_history(&transcript, None))),
             messages,
         });
     }
-    let (meta, messages) =
-        history::parse_file(&dir.join(format!("{id}.md"))).ok()?;
+    let (meta, messages) = history::parse_file(&dir.join(format!("{id}.md"))).ok()?;
     Some(marshaling_protocol::SessionData {
         id: meta.id,
         created: meta.created.to_rfc3339(),
@@ -161,19 +137,14 @@ pub(crate) async fn list_sessions(
     headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let Some(runtime_session_key) = runtime_session_key_from_headers(&headers)
-    else {
+    let Some(runtime_session_key) = runtime_session_key_from_headers(&headers) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let hist_dir = history_dir_for_session(
-        &state.config.history.dir,
-        &runtime_session_key,
-    );
+    let hist_dir = history_dir_for_session(&state.config.history.dir, &runtime_session_key);
     let cache = Arc::clone(&state.session_info_cache);
-    let items =
-        tokio::task::spawn_blocking(move || session_infos(&hist_dir, &cache))
-            .await
-            .unwrap_or_default();
+    let items = tokio::task::spawn_blocking(move || session_infos(&hist_dir, &cache))
+        .await
+        .unwrap_or_default();
     Ok(Json(items))
 }
 
@@ -186,12 +157,9 @@ pub(crate) async fn load_session(
     if !validate_session_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let runtime_session_key = runtime_session_key_from_headers(&headers)
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    let dir = history_dir_for_session(
-        &state.config.history.dir,
-        &runtime_session_key,
-    );
+    let runtime_session_key =
+        runtime_session_key_from_headers(&headers).ok_or(StatusCode::BAD_REQUEST)?;
+    let dir = history_dir_for_session(&state.config.history.dir, &runtime_session_key);
     tokio::task::spawn_blocking(move || load_session_data(&dir, &id))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -208,14 +176,10 @@ pub(crate) async fn delete_session(
     if !validate_session_id(&id) {
         return StatusCode::BAD_REQUEST;
     }
-    let Some(runtime_session_key) = runtime_session_key_from_headers(&headers)
-    else {
+    let Some(runtime_session_key) = runtime_session_key_from_headers(&headers) else {
         return StatusCode::BAD_REQUEST;
     };
-    let dir = history_dir_for_session(
-        &state.config.history.dir,
-        &runtime_session_key,
-    );
+    let dir = history_dir_for_session(&state.config.history.dir, &runtime_session_key);
     // Deleting under a running run would let its next append recreate a
     // headerless (unreadable) transcript.
     let transcript = store::transcript_path(&dir, &id);
@@ -223,10 +187,12 @@ pub(crate) async fn delete_session(
     // legacy conversion recreates) the files while they are removed.
     let session_lock = state.session_lock(&transcript).await;
     let _guard = session_lock.lock().await;
-    let busy = state.runs.lock().await.values().any(|run| {
-        !run.finished
-            && run.session_path.as_deref() == Some(transcript.as_path())
-    });
+    let busy = state
+        .runs
+        .lock()
+        .await
+        .values()
+        .any(|run| !run.finished && run.session_path.as_deref() == Some(transcript.as_path()));
     if busy {
         return StatusCode::CONFLICT;
     }
@@ -275,12 +241,7 @@ pub(crate) fn open_run_session(
     model_id: String,
 ) -> Result<OpenedSession> {
     if is_new_session {
-        let writer = store::TranscriptWriter::create(
-            path,
-            session_id,
-            model_provider,
-            model_id,
-        );
+        let writer = store::TranscriptWriter::create(path, session_id, model_provider, model_id);
         return Ok(OpenedSession {
             writer,
             history: Vec::new(),
@@ -310,11 +271,7 @@ pub(crate) fn load_or_convert_session(
             anyhow::bail!("Unknown session: {id}");
         }
         let (meta, messages) = history::parse_file(&legacy)?;
-        store::append(
-            &path,
-            &store::legacy_records(id, &meta, &messages),
-            true,
-        )?;
+        store::append(&path, &store::legacy_records(id, &meta, &messages), true)?;
         tracing::info!("Converted legacy session {id} to {}", path.display());
     }
     repair_unanswered_calls(&path, store::load(&path)?)
@@ -364,14 +321,17 @@ pub(crate) fn model_history(
         history.push(compaction_context_message(&compaction));
     }
     let switched = provider.is_some_and(|p| p != transcript.model_provider);
-    history.extend(transcript.uncompacted_messages().into_iter().map(
-        |mut message| {
-            if switched {
-                message.reasoning_content = None;
-            }
-            message
-        },
-    ));
+    history.extend(
+        transcript
+            .uncompacted_messages()
+            .into_iter()
+            .map(|mut message| {
+                if switched {
+                    message.reasoning_content = None;
+                }
+                message
+            }),
+    );
     // Steps are written whole, but a crash mid-write can still lose the tail
     // of one: answer any trailing unanswered tool calls so the history is
     // valid for providers.
@@ -384,12 +344,13 @@ pub(crate) fn model_history(
 pub(crate) fn protocol_compaction(
     transcript: &store::Transcript,
 ) -> Option<marshaling_protocol::CompactionState> {
-    transcript.compaction.as_ref().map(|compaction| {
-        marshaling_protocol::CompactionState {
+    transcript
+        .compaction
+        .as_ref()
+        .map(|compaction| marshaling_protocol::CompactionState {
             summary: compaction.summary.clone(),
             compacted_message_count: transcript.compacted_display_count(),
             model_provider: compaction.model_provider.clone(),
             model_id: compaction.model_id.clone(),
-        }
-    })
+        })
 }

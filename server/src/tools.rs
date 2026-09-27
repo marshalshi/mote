@@ -8,8 +8,7 @@ use std::process::Stdio;
 use tokio::fs;
 
 use crate::llm::{
-    RollbackEntry, RollbackKind, Tool, ToolDef, ToolExecutionResult,
-    ToolFunctionDef,
+    RollbackEntry, RollbackKind, Tool, ToolDef, ToolExecutionResult, ToolFunctionDef,
 };
 
 /// Lines `read` returns when the caller gives no limit.
@@ -100,19 +99,19 @@ fn validate_path_in_workspace(
     // re-append the non-existent suffix. This prevents escapes like
     // /tmp/outside/new/file when parent doesn't exist yet.
     let canonical = if resolved.exists() {
-        resolved.canonicalize().with_context(|| {
-            format!("Failed to canonicalize {}", resolved.display())
-        })?
+        resolved
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize {}", resolved.display()))?
     } else {
         let mut ancestor = resolved;
         while !ancestor.exists() {
-            ancestor = ancestor.parent().with_context(|| {
-                format!("Invalid path: {}", resolved.display())
-            })?;
+            ancestor = ancestor
+                .parent()
+                .with_context(|| format!("Invalid path: {}", resolved.display()))?;
         }
-        let canon_ancestor = ancestor.canonicalize().with_context(|| {
-            format!("Failed to canonicalize {}", ancestor.display())
-        })?;
+        let canon_ancestor = ancestor
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize {}", ancestor.display()))?;
         let suffix = resolved
             .strip_prefix(ancestor)
             .unwrap_or(std::path::Path::new(""));
@@ -186,15 +185,11 @@ impl Tool for ReadTool {
             self.ctx.workspace.join(path)
         };
         validate_path_in_workspace(&resolved, &self.ctx.workspace)?;
-        let content =
-            tokio::fs::read_to_string(&resolved)
-                .await
-                .with_context(|| {
-                    format!("Failed to read {}", resolved.display())
-                })?;
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .with_context(|| format!("Failed to read {}", resolved.display()))?;
 
-        let offset =
-            args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -309,18 +304,16 @@ impl Tool for GlobTool {
             .canonicalize()
             .unwrap_or_else(|_| self.ctx.workspace.clone());
         // Glob traverses the filesystem — run in spawn_blocking to avoid blocking the async runtime
-        let results = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Vec<String>> {
-                let entries = glob::glob(&pattern)
-                    .context("Invalid glob pattern")?
-                    .filter_map(|e| e.ok())
-                    .filter_map(|p| p.canonicalize().ok())
-                    .filter(|p| p.starts_with(&ws_canon))
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect::<Vec<String>>();
-                Ok(entries)
-            },
-        )
+        let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            let entries = glob::glob(&pattern)
+                .context("Invalid glob pattern")?
+                .filter_map(|e| e.ok())
+                .filter_map(|p| p.canonicalize().ok())
+                .filter(|p| p.starts_with(&ws_canon))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<String>>();
+            Ok(entries)
+        })
         .await
         .map_err(|e| anyhow::anyhow!("Glob task panicked: {:#}", e))??;
         if results.is_empty() {
@@ -364,15 +357,12 @@ where
 
 /// Detected once per process: probing spawns a process, and blocking.
 async fn preferred_grep_backend() -> GrepBackend {
-    static BACKEND: tokio::sync::OnceCell<GrepBackend> =
-        tokio::sync::OnceCell::const_new();
+    static BACKEND: tokio::sync::OnceCell<GrepBackend> = tokio::sync::OnceCell::const_new();
     *BACKEND
         .get_or_init(|| async {
-            tokio::task::spawn_blocking(|| {
-                preferred_grep_backend_with(command_available)
-            })
-            .await
-            .unwrap_or(GrepBackend::Grep)
+            tokio::task::spawn_blocking(|| preferred_grep_backend_with(command_available))
+                .await
+                .unwrap_or(GrepBackend::Grep)
         })
         .await
 }
@@ -479,9 +469,7 @@ impl Tool for GrepTool {
         }
         let mut result = stdout;
         if failed {
-            result.push_str(&format!(
-                "\n[some files could not be searched: {problem}]"
-            ));
+            result.push_str(&format!("\n[some files could not be searched: {problem}]"));
         }
         // Output size is limited centrally by `ToolRegistry::execute`.
         Ok(result_no_changes(result))
@@ -494,9 +482,7 @@ fn static_glob_prefix(path: &std::path::Path) -> PathBuf {
     for c in path.components() {
         match c {
             Component::Prefix(p) => out.push(p.as_os_str()),
-            Component::RootDir => {
-                out.push(std::path::MAIN_SEPARATOR.to_string())
-            }
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
             Component::CurDir => out.push("."),
             Component::ParentDir => out.push(".."),
             Component::Normal(seg) => {
@@ -572,9 +558,11 @@ impl Tool for WriteTool {
         validate_path_in_workspace(&resolved, &self.ctx.workspace)?;
         let existed_before = resolved.exists();
         let before_content = if existed_before {
-            Some(tokio::fs::read_to_string(&resolved).await.with_context(
-                || format!("Failed to read {}", resolved.display()),
-            )?)
+            Some(
+                tokio::fs::read_to_string(&resolved)
+                    .await
+                    .with_context(|| format!("Failed to read {}", resolved.display()))?,
+            )
         } else {
             None
         };
@@ -583,15 +571,11 @@ impl Tool for WriteTool {
         }
         tokio::fs::write(&resolved, content)
             .await
-            .with_context(|| {
-                format!("Failed to write {}", resolved.display())
-            })?;
+            .with_context(|| format!("Failed to write {}", resolved.display()))?;
         let mut changes = Vec::new();
         let mut rollback_entries = Vec::new();
         if let Some(before) = before_content {
-            if let Some(fc) =
-                compute_modified_file_change(&resolved, &before, content)
-            {
+            if let Some(fc) = compute_modified_file_change(&resolved, &before, content) {
                 changes.push(fc);
             }
             rollback_entries.push(RollbackEntry {
@@ -615,11 +599,7 @@ impl Tool for WriteTool {
             });
         }
         Ok(ToolExecutionResult {
-            output: format!(
-                "Written {} bytes to {}",
-                content.len(),
-                resolved.display()
-            ),
+            output: format!("Written {} bytes to {}", content.len(), resolved.display()),
             changes,
             rollback_entries,
         })
@@ -703,12 +683,9 @@ impl Tool for EditTool {
             self.ctx.workspace.join(path)
         };
         validate_path_in_workspace(&resolved, &self.ctx.workspace)?;
-        let content =
-            tokio::fs::read_to_string(&resolved)
-                .await
-                .with_context(|| {
-                    format!("Failed to read {}", resolved.display())
-                })?;
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .with_context(|| format!("Failed to read {}", resolved.display()))?;
         let new_content = match content.matches(old).count() {
             0 => {
                 anyhow::bail!("old_string not found in {}", resolved.display())
@@ -722,13 +699,9 @@ impl Tool for EditTool {
         };
         tokio::fs::write(&resolved, &new_content)
             .await
-            .with_context(|| {
-                format!("Failed to write {}", resolved.display())
-            })?;
+            .with_context(|| format!("Failed to write {}", resolved.display()))?;
         let mut changes = Vec::new();
-        if let Some(fc) =
-            compute_modified_file_change(&resolved, &content, &new_content)
-        {
+        if let Some(fc) = compute_modified_file_change(&resolved, &content, &new_content) {
             changes.push(fc);
         }
         Ok(ToolExecutionResult {
@@ -765,7 +738,8 @@ impl Tool for DeleteTool {
             def_type: "function".into(),
             function: ToolFunctionDef {
                 name: "delete".into(),
-                description: "Delete an existing file. File-only in v1 (directories are rejected).".into(),
+                description: "Delete an existing file. File-only in v1 (directories are rejected)."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -792,10 +766,9 @@ impl Tool for DeleteTool {
         };
         validate_path_in_workspace(&resolved, &self.ctx.workspace)?;
 
-        let metadata =
-            tokio::fs::metadata(&resolved).await.with_context(|| {
-                format!("Failed to access {}", resolved.display())
-            })?;
+        let metadata = tokio::fs::metadata(&resolved)
+            .await
+            .with_context(|| format!("Failed to access {}", resolved.display()))?;
         if metadata.is_dir() {
             anyhow::bail!(
                 "Refusing to delete directory {} (file-only delete)",
@@ -805,13 +778,11 @@ impl Tool for DeleteTool {
 
         let before_content = tokio::fs::read_to_string(&resolved)
             .await
-            .with_context(|| {
-                format!("Failed to read {}", resolved.display())
-            })?;
+            .with_context(|| format!("Failed to read {}", resolved.display()))?;
 
-        tokio::fs::remove_file(&resolved).await.with_context(|| {
-            format!("Failed to delete {}", resolved.display())
-        })?;
+        tokio::fs::remove_file(&resolved)
+            .await
+            .with_context(|| format!("Failed to delete {}", resolved.display()))?;
 
         Ok(ToolExecutionResult {
             output: format!("Deleted {}", resolved.display()),
@@ -921,15 +892,13 @@ impl Tool for BashTool {
         let stdout = child.stdout.take().map(Capture::start);
         let stderr = child.stderr.take().map(Capture::start);
 
-        let status = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait(),
-        )
-        .await
-        {
-            Ok(status) => Some(status.context("Failed to execute command")?),
-            Err(_) => None,
-        };
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait())
+                .await
+            {
+                Ok(status) => Some(status.context("Failed to execute command")?),
+                Err(_) => None,
+            };
         // The shell has exited (or timed out). Anything it left running still
         // holds the output pipes, and the readers would wait for them
         // forever; end the whole group so they reach EOF.
@@ -937,25 +906,20 @@ impl Tool for BashTool {
         if status.is_none() {
             // Without process groups (non-unix) only this kills the shell.
             let _ = child.start_kill();
-            let _ =
-                tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await;
+            let _ = tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await;
         }
 
         let mut result = String::new();
         // Drain both streams at once, so a held-open pipe costs one wait.
         let finish = |capture: Option<Capture>| async move {
             match capture {
-                Some(capture) => {
-                    Some(capture.finish(OUTPUT_DRAIN_TIMEOUT).await)
-                }
+                Some(capture) => Some(capture.finish(OUTPUT_DRAIN_TIMEOUT).await),
                 None => None,
             }
         };
         let (stdout, stderr) = tokio::join!(finish(stdout), finish(stderr));
         let mut still_open = false;
-        for (i, (text, complete)) in
-            [stdout, stderr].into_iter().flatten().enumerate()
-        {
+        for (i, (text, complete)) in [stdout, stderr].into_iter().flatten().enumerate() {
             still_open |= !complete;
             if text.is_empty() {
                 continue;
@@ -986,10 +950,7 @@ impl Tool for BashTool {
                 if !result.is_empty() {
                     result.push('\n');
                 }
-                result.push_str(&format!(
-                    "[exit code: {}]",
-                    status.code().unwrap_or(-1)
-                ));
+                result.push_str(&format!("[exit code: {}]", status.code().unwrap_or(-1)));
             }
             Some(_) => {}
         }
@@ -1004,10 +965,7 @@ impl Tool for BashTool {
 /// Start `cmd` detached from the tool call: in its own process group (so the
 /// usual kill-on-exit does not apply), output appended to a log file. The
 /// child is reaped in the background when it exits.
-async fn start_background(
-    cmd: &str,
-    workspace: &std::path::Path,
-) -> Result<ToolExecutionResult> {
+async fn start_background(cmd: &str, workspace: &std::path::Path) -> Result<ToolExecutionResult> {
     let log_path = std::env::temp_dir().join(format!(
         "mote-bg-{}.log",
         chrono::Utc::now().format("%Y%m%d-%H%M%S%6f")
@@ -1056,8 +1014,7 @@ async fn start_background(
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 const MAX_BASH_TIMEOUT_SECS: u64 = 600;
 /// How long to wait for remaining output after the process group is gone.
-const OUTPUT_DRAIN_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2);
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Bytes of each output stream kept from its start and from its end; the
 /// middle of very long output (e.g. a verbose build) is dropped. Both
 /// streams together stay under the registry's output cap.
@@ -1081,9 +1038,7 @@ struct CaptureBuffer {
 }
 
 impl Capture {
-    fn start(
-        mut stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    ) -> Self {
+    fn start(mut stream: impl tokio::io::AsyncRead + Unpin + Send + 'static) -> Self {
         let buffer = Arc::new(std::sync::Mutex::new(CaptureBuffer::default()));
         let shared = Arc::clone(&buffer);
         let reader = tokio::spawn(async move {
@@ -1107,8 +1062,7 @@ impl Capture {
     /// open after `limit` is abandoned (its reader stopped) rather than
     /// discarded.
     async fn finish(mut self, limit: std::time::Duration) -> (String, bool) {
-        let complete =
-            tokio::time::timeout(limit, &mut self.reader).await.is_ok();
+        let complete = tokio::time::timeout(limit, &mut self.reader).await.is_ok();
         if !complete {
             self.reader.abort();
         }
@@ -1258,10 +1212,9 @@ impl Tool for UseSkillTool {
             );
         }
 
-        let content =
-            fs::read_to_string(&skill_path).await.with_context(|| {
-                format!("Failed to read skill file: {}", skill_path.display())
-            })?;
+        let content = fs::read_to_string(&skill_path)
+            .await
+            .with_context(|| format!("Failed to read skill file: {}", skill_path.display()))?;
 
         // Strip YAML frontmatter if present, return only the body
         let body = if let Some(rest) = content
@@ -1342,10 +1295,7 @@ pub trait SubagentRunner: Send + Sync {
 }
 
 impl SubagentTool {
-    pub fn new(
-        ctx: ToolContext,
-        runner: Box<dyn SubagentRunner + Send + Sync>,
-    ) -> Self {
+    pub fn new(ctx: ToolContext, runner: Box<dyn SubagentRunner + Send + Sync>) -> Self {
         Self { ctx, runner }
     }
 }
@@ -1403,8 +1353,7 @@ pub struct AgentSubagentRunner {
     pub tools: Arc<crate::llm::ToolRegistry>,
     pub config: crate::config::Config,
     pub auth: crate::auth::Auth,
-    pub merged_agents:
-        std::collections::HashMap<String, crate::config::AgentConfig>,
+    pub merged_agents: std::collections::HashMap<String, crate::config::AgentConfig>,
     pub repo_agents_md: Option<String>,
     /// Parent cancellation channel — subagent is cancelled when parent is.
     pub cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -1413,9 +1362,8 @@ pub struct AgentSubagentRunner {
     /// Max allowed recursion depth
     pub max_depth: u8,
     /// Channel to forward subagent events to the parent's TUI.
-    pub parent_events_tx: tokio::sync::mpsc::UnboundedSender<
-        anyhow::Result<crate::agent::AgentEvent>,
-    >,
+    pub parent_events_tx:
+        tokio::sync::mpsc::UnboundedSender<anyhow::Result<crate::agent::AgentEvent>>,
     /// The parent run's permission broker. Subagent prompts are forwarded to
     /// the parent's client and answered through it.
     pub permission_broker: crate::agent::PermissionBroker,
@@ -1441,10 +1389,7 @@ impl SubagentRunner for AgentSubagentRunner {
         let agent_cfg = self.merged_agents.get(agent_name);
         if let Some(agent) = agent_cfg {
             if !agent.is_subagent_callable() {
-                anyhow::bail!(
-                    "Agent '{}' is not available as a subagent",
-                    agent_name
-                );
+                anyhow::bail!("Agent '{}' is not available as a subagent", agent_name);
             }
         } else {
             anyhow::bail!("Unknown sub-agent: '{}'", agent_name);
@@ -1475,8 +1420,7 @@ impl SubagentRunner for AgentSubagentRunner {
             .iter()
             .map(|def| def.function.name.clone())
             .collect();
-        let mut perms =
-            crate::build_permission_map(&self.config, agent_cfg, &tool_names);
+        let mut perms = crate::build_permission_map(&self.config, agent_cfg, &tool_names);
         for tool in &self.remembered_allow_tools {
             if let Some(perm) = perms.get_mut(tool)
                 && *perm == crate::config::Permission::Ask
@@ -1491,8 +1435,7 @@ impl SubagentRunner for AgentSubagentRunner {
             .defs()
             .iter()
             .filter(|def| {
-                perms.get(&def.function.name).copied()
-                    != Some(crate::config::Permission::Deny)
+                perms.get(&def.function.name).copied() != Some(crate::config::Permission::Deny)
             })
             .cloned()
             .collect();
@@ -1508,10 +1451,8 @@ impl SubagentRunner for AgentSubagentRunner {
             let _ = sub_cancel_tx.send(true);
         });
         // Generate a unique subagent session ID
-        let sub_id =
-            format!("sub_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"));
-        let permission_broker =
-            self.permission_broker.scoped(&format!("{sub_id}:"));
+        let sub_id = format!("sub_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"));
+        let permission_broker = self.permission_broker.scoped(&format!("{sub_id}:"));
 
         let user_msg = task.to_string();
         let history: Vec<crate::llm::ChatMessage> = Vec::new();
@@ -1550,12 +1491,12 @@ impl SubagentRunner for AgentSubagentRunner {
         let sub_name = agent_name.to_string();
 
         // Signal that a subagent started
-        let _ = self.parent_events_tx.send(Ok(
-            crate::agent::AgentEvent::SubagentStarted {
+        let _ = self
+            .parent_events_tx
+            .send(Ok(crate::agent::AgentEvent::SubagentStarted {
                 id: sub_id.clone(),
                 name: sub_name.clone(),
-            },
-        ));
+            }));
 
         // Collect the result while forwarding events to the parent.
         // Subagent has a time budget (`server.subagent_timeout_secs`) to prevent blocking the parent
@@ -1569,8 +1510,7 @@ impl SubagentRunner for AgentSubagentRunner {
         // 0 disables the budget; an overflowing deadline means "none".
         let mut deadline = (budget_secs > 0)
             .then(|| {
-                tokio::time::Instant::now()
-                    .checked_add(std::time::Duration::from_secs(budget_secs))
+                tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(budget_secs))
             })
             .flatten();
         let mut awaiting_permission_since: Option<tokio::time::Instant> = None;
@@ -1583,9 +1523,7 @@ impl SubagentRunner for AgentSubagentRunner {
         loop {
             let next = match (awaiting_permission_since, deadline) {
                 (None, Some(deadline)) => {
-                    match tokio::time::timeout_at(deadline, agent_rx.recv())
-                        .await
-                    {
+                    match tokio::time::timeout_at(deadline, agent_rx.recv()).await {
                         Ok(next) => next,
                         Err(_) => {
                             timed_out = true;
@@ -1601,28 +1539,21 @@ impl SubagentRunner for AgentSubagentRunner {
             // The first event after a prompt is normally `PermissionResolved`
             // (or `Cancelled`); give the waiting time back to the budget.
             if let Some(since) = awaiting_permission_since.take() {
-                deadline =
-                    deadline.and_then(|d| d.checked_add(since.elapsed()));
+                deadline = deadline.and_then(|d| d.checked_add(since.elapsed()));
             }
             match event {
                 // The user refused a prompt inside the subagent: stop the
                 // parent too, instead of letting it work around the refusal.
-                Ok(crate::agent::AgentEvent::NeedsContinuation {
-                    content: c,
-                    ..
-                }) if c == crate::agent::PERMISSION_DENIED_CONTENT => {
+                Ok(crate::agent::AgentEvent::NeedsContinuation { content: c, .. })
+                    if c == crate::agent::PERMISSION_DENIED_CONTENT =>
+                {
                     user_denied = true;
                     content = c;
                     break;
                 }
                 Ok(crate::agent::AgentEvent::Done { content: c, .. })
-                | Ok(crate::agent::AgentEvent::Cancelled {
-                    content: c, ..
-                })
-                | Ok(crate::agent::AgentEvent::NeedsContinuation {
-                    content: c,
-                    ..
-                }) => {
+                | Ok(crate::agent::AgentEvent::Cancelled { content: c, .. })
+                | Ok(crate::agent::AgentEvent::NeedsContinuation { content: c, .. }) => {
                     content = c;
                     break;
                 }
@@ -1664,10 +1595,7 @@ impl SubagentRunner for AgentSubagentRunner {
                     rollback_entries,
                 }) => {
                     let summary = if result.len() > 100 {
-                        format!(
-                            "{}...",
-                            crate::agent::safe_truncate(&result, 97)
-                        )
+                        format!("{}...", crate::agent::safe_truncate(&result, 97))
                     } else {
                         result.clone()
                     };
@@ -1698,23 +1626,14 @@ impl SubagentRunner for AgentSubagentRunner {
                 }
                 // Forward prompts to the parent's client unchanged; the
                 // answer comes back through the shared permission broker.
-                Ok(
-                    event @ crate::agent::AgentEvent::PermissionRequest {
-                        ..
-                    },
-                ) => {
+                Ok(event @ crate::agent::AgentEvent::PermissionRequest { .. }) => {
                     let _ = self.parent_events_tx.send(Ok(event));
-                    awaiting_permission_since =
-                        Some(tokio::time::Instant::now());
+                    awaiting_permission_since = Some(tokio::time::Instant::now());
                 }
                 // The user answered: only the waiting time was refunded above,
                 // not the approved tool's run time that follows. Forwarded so
                 // the parent run drops the prompt from its pending set.
-                Ok(
-                    event @ crate::agent::AgentEvent::PermissionResolved {
-                        ..
-                    },
-                ) => {
+                Ok(event @ crate::agent::AgentEvent::PermissionResolved { .. }) => {
                     let _ = self.parent_events_tx.send(Ok(event));
                 }
                 Ok(crate::agent::AgentEvent::TurnDone { .. }) => {
@@ -1736,8 +1655,7 @@ impl SubagentRunner for AgentSubagentRunner {
                         },
                     ));
                 }
-                Ok(crate::agent::AgentEvent::Failed { error: e, .. })
-                | Err(e) => {
+                Ok(crate::agent::AgentEvent::Failed { error: e, .. }) | Err(e) => {
                     content = format!("[Sub-agent error: {:#}]", e);
                     break;
                 }
@@ -1772,12 +1690,12 @@ impl SubagentRunner for AgentSubagentRunner {
         }
 
         // Signal that the subagent finished
-        let _ = self.parent_events_tx.send(Ok(
-            crate::agent::AgentEvent::SubagentDone {
+        let _ = self
+            .parent_events_tx
+            .send(Ok(crate::agent::AgentEvent::SubagentDone {
                 id: sub_id,
                 content: content.clone(),
-            },
-        ));
+            }));
 
         if user_denied {
             return Err(crate::agent::UserDeniedToolCall {
@@ -1952,12 +1870,10 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         let diff_lines = &result.changes[0].diff_lines;
         assert!(diff_lines.iter().any(|line| {
-            matches!(line.kind, DiffLineKind::Removed)
-                && line.content == "target line"
+            matches!(line.kind, DiffLineKind::Removed) && line.content == "target line"
         }));
         assert!(diff_lines.iter().any(|line| {
-            matches!(line.kind, DiffLineKind::Added)
-                && line.content == "replacement line"
+            matches!(line.kind, DiffLineKind::Added) && line.content == "replacement line"
         }));
     }
 
@@ -2002,19 +1918,14 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let pattern = outside.path().join("*.rs").to_string_lossy().to_string();
         let tool = GlobTool::new(ws);
-        let result =
-            tool.execute(serde_json::json!({"pattern": pattern})).await;
+        let result = tool.execute(serde_json::json!({"pattern": pattern})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_grep_matches() {
         let (_d, ws) = tmp_workspace();
-        std::fs::write(
-            ws.join("search.txt"),
-            "hello world\nfoo bar\nhello again\n",
-        )
-        .unwrap();
+        std::fs::write(ws.join("search.txt"), "hello world\nfoo bar\nhello again\n").unwrap();
 
         let tool = GrepTool::new(ws);
         let args = serde_json::json!({"pattern": "hello"});
@@ -2194,8 +2105,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_through_registry_keeps_exit_code_after_huge_output() {
         let (_d, ws) = tmp_workspace();
-        let registry =
-            crate::llm::ToolRegistry::new(vec![Box::new(BashTool::new(ws))]);
+        let registry = crate::llm::ToolRegistry::new(vec![Box::new(BashTool::new(ws))]);
         let r = registry
             .execute(
                 "bash",
@@ -2242,8 +2152,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // `writer` is still alive: the stream never closes.
-        let (text, complete) =
-            capture.finish(std::time::Duration::from_millis(100)).await;
+        let (text, complete) = capture.finish(std::time::Duration::from_millis(100)).await;
         assert_eq!(text, "partial output");
         assert!(!complete);
         drop(writer);
@@ -2255,7 +2164,9 @@ mod tests {
         std::fs::write(ws.join("f.txt"), "a x a x").unwrap();
         let tool = EditTool::new(ws.clone());
         let err = tool
-            .execute(serde_json::json!({"file_path": "f.txt", "old_string": "a", "new_string": "b"}))
+            .execute(
+                serde_json::json!({"file_path": "f.txt", "old_string": "a", "new_string": "b"}),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("matches 2 places"), "{err}");
@@ -2314,8 +2225,7 @@ mod tests {
         let dir = ws.join("dir");
         std::fs::create_dir_all(&dir).unwrap();
         let tool = DeleteTool::new(ws.clone());
-        let result =
-            tool.execute(serde_json::json!({"file_path": "dir"})).await;
+        let result = tool.execute(serde_json::json!({"file_path": "dir"})).await;
         assert!(result.is_err());
     }
 
@@ -2347,8 +2257,7 @@ mod tests {
     async fn test_subagent_tool_def() {
         let (_d, ws) = tmp_workspace();
         let runner = MockSubagentRunner;
-        let tool =
-            SubagentTool::new(ToolContext { workspace: ws }, Box::new(runner));
+        let tool = SubagentTool::new(ToolContext { workspace: ws }, Box::new(runner));
         let def = tool.def();
         assert_eq!(def.function.name, "subagent");
         assert!(def.function.description.contains("agent"));
@@ -2371,8 +2280,7 @@ mod tests {
     async fn test_subagent_tool_executes_runner() {
         let (_d, ws) = tmp_workspace();
         let runner = MockSubagentRunner;
-        let tool =
-            SubagentTool::new(ToolContext { workspace: ws }, Box::new(runner));
+        let tool = SubagentTool::new(ToolContext { workspace: ws }, Box::new(runner));
         let result = tool
             .execute(serde_json::json!({"agent": "review", "task": "check"}))
             .await

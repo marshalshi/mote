@@ -55,9 +55,9 @@ impl AudioCapture {
                     let buffer = Arc::clone(&buffer);
                     move |data: &[u16], _| {
                         append_i16_pcm(
-                            data.iter().step_by(channels).map(|s| {
-                                (*s as i32 - i16::MAX as i32 - 1) as i16
-                            }),
+                            data.iter()
+                                .step_by(channels)
+                                .map(|s| (*s as i32 - i16::MAX as i32 - 1) as i16),
                             source_sample_rate,
                             target_sample_rate,
                             &buffer,
@@ -73,9 +73,9 @@ impl AudioCapture {
                     let buffer = Arc::clone(&buffer);
                     move |data: &[f32], _| {
                         append_i16_pcm(
-                            data.iter().step_by(channels).map(|s| {
-                                (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-                            }),
+                            data.iter()
+                                .step_by(channels)
+                                .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16),
                             source_sample_rate,
                             target_sample_rate,
                             &buffer,
@@ -116,8 +116,7 @@ fn append_i16_pcm<I>(
     I: IntoIterator<Item = i16>,
 {
     let samples: Vec<i16> = samples.into_iter().collect();
-    let samples =
-        resample_nearest(&samples, source_sample_rate, target_sample_rate);
+    let samples = resample_nearest(&samples, source_sample_rate, target_sample_rate);
     let mut bytes = Vec::new();
     for sample in samples {
         bytes.extend_from_slice(&sample.to_le_bytes());
@@ -129,23 +128,19 @@ fn append_i16_pcm<I>(
     }
 }
 
-fn resample_nearest(
-    samples: &[i16],
-    source_sample_rate: u32,
-    target_sample_rate: u32,
-) -> Vec<i16> {
+fn resample_nearest(samples: &[i16], source_sample_rate: u32, target_sample_rate: u32) -> Vec<i16> {
     if source_sample_rate == 0
         || target_sample_rate == 0
         || source_sample_rate == target_sample_rate
     {
         return samples.to_vec();
     }
-    let out_len = (samples.len() as u64 * target_sample_rate as u64
-        / source_sample_rate as u64) as usize;
+    let out_len =
+        (samples.len() as u64 * target_sample_rate as u64 / source_sample_rate as u64) as usize;
     (0..out_len)
         .filter_map(|idx| {
-            let src_idx = (idx as u64 * source_sample_rate as u64
-                / target_sample_rate as u64) as usize;
+            let src_idx =
+                (idx as u64 * source_sample_rate as u64 / target_sample_rate as u64) as usize;
             samples.get(src_idx).copied()
         })
         .collect()

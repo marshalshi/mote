@@ -108,11 +108,7 @@ impl Keybindings {
     }
 
     /// Look up the action for a key event.
-    pub fn lookup(
-        &self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) -> Option<Action> {
+    pub fn lookup(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
         if let Some(&action) = self.map.get(&(code, modifiers)) {
             return Some(action);
         }
@@ -148,10 +144,7 @@ fn format_key_label(raw: &str) -> String {
             other => {
                 let mut chars = other.chars();
                 match chars.next() {
-                    Some(first) => {
-                        first.to_uppercase().collect::<String>()
-                            + chars.as_str()
-                    }
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
                     None => String::new(),
                 }
             }

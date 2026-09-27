@@ -2,9 +2,7 @@
 
 use super::*;
 
-pub(super) fn is_terminal_server_event(
-    event: &marshaling_protocol::ServerEvent,
-) -> bool {
+pub(super) fn is_terminal_server_event(event: &marshaling_protocol::ServerEvent) -> bool {
     matches!(
         event,
         marshaling_protocol::ServerEvent::Done { .. }
@@ -99,8 +97,7 @@ pub(super) fn handle_server_event(
             app.touch_response_render();
         }
         ServerEvent::SubagentTextDelta { id, data } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id) {
                 sv.stream_buffer.push_str(&data);
                 app.touch_response_render();
             } else {
@@ -108,8 +105,7 @@ pub(super) fn handle_server_event(
             }
         }
         ServerEvent::SubagentReasoningDelta { id, data } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id) {
                 sv.reasoning_buffer.push_str(&data);
                 app.touch_response_render();
             } else {
@@ -121,8 +117,7 @@ pub(super) fn handle_server_event(
             sub_id,
             tool_name,
         } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id) {
                 sv.tool_calls.push(marshaling_protocol::ToolCallDisplay {
                     id: sub_id,
                     name: tool_name,
@@ -140,11 +135,8 @@ pub(super) fn handle_server_event(
             changes,
             ..
         } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                if let Some(tc) =
-                    sv.tool_calls.iter_mut().find(|t| t.id == sub_id)
-                {
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id) {
+                if let Some(tc) = sv.tool_calls.iter_mut().find(|t| t.id == sub_id) {
                     tc.status = marshaling_protocol::ToolStatus::Success;
                     tc.changes = changes;
                     app.touch_response_render();
@@ -154,11 +146,8 @@ pub(super) fn handle_server_event(
             }
         }
         ServerEvent::SubagentToolFailed { id, sub_id, error } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                if let Some(tc) =
-                    sv.tool_calls.iter_mut().find(|t| t.id == sub_id)
-                {
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id) {
+                if let Some(tc) = sv.tool_calls.iter_mut().find(|t| t.id == sub_id) {
                     tc.status = marshaling_protocol::ToolStatus::Failed(error);
                     app.touch_response_render();
                 }
@@ -173,22 +162,19 @@ pub(super) fn handle_server_event(
         } => {
             // The pane has no turn boundaries to cut back to, so mark the
             // retry inline instead of silently showing text twice.
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id) {
                 let note = if discarded_output {
                     "the partial response above is discarded"
                 } else {
                     "retrying"
                 };
-                sv.stream_buffer.push_str(&format!(
-                    "\n[provider error: {reason}; {note}]\n"
-                ));
+                sv.stream_buffer
+                    .push_str(&format!("\n[provider error: {reason}; {note}]\n"));
                 app.touch_response_render();
             }
         }
         ServerEvent::SubagentDone { id, content } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
+            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id) {
                 sv.done = true;
                 sv.content = content;
                 // Flush any remaining stream buffer text
@@ -281,13 +267,7 @@ pub(super) fn handle_server_event(
             reason,
             discarded_output,
         } => {
-            app.agent_retrying(
-                attempt,
-                max_attempts,
-                delay_ms,
-                &reason,
-                discarded_output,
-            );
+            app.agent_retrying(attempt, max_attempts, delay_ms, &reason, discarded_output);
             app.touch_response_render();
         }
         ServerEvent::Error { message } => {

@@ -3,10 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
-    },
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::sync::OnceLock;
 
@@ -60,12 +57,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 Constraint::Length(input_lines),
             ])
             .split(chunks[1]);
-        render_queued_accent_area(
-            frame,
-            input_chunks[0],
-            app,
-            queue_lines as usize,
-        );
+        render_queued_accent_area(frame, input_chunks[0], app, queue_lines as usize);
         input_chunks[1]
     } else {
         chunks[1]
@@ -113,11 +105,8 @@ fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
         let available_rows = inner.height.saturating_sub(4) as usize;
         let visible_items = (available_rows / 2).max(1);
         let total_items = app.session_picker_items.len();
-        let (start, end) = session_picker_window(
-            total_items,
-            app.session_picker_index,
-            visible_items,
-        );
+        let (start, end) =
+            session_picker_window(total_items, app.session_picker_index, visible_items);
 
         for (i, s) in app.session_picker_items[start..end].iter().enumerate() {
             let i = start + i;
@@ -149,8 +138,7 @@ fn render_session_picker(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
-    let rect =
-        render_picker_popup(frame, area, app.input_accent, " Model Picker ");
+    let rect = render_picker_popup(frame, area, app.input_accent, " Model Picker ");
     let inner = inset(rect, 2, 1);
 
     let mut lines: Vec<Line> = vec![
@@ -211,8 +199,7 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_login_picker(frame: &mut Frame, area: Rect, app: &App) {
-    let rect =
-        render_picker_popup(frame, area, app.input_accent, " Login Provider ");
+    let rect = render_picker_popup(frame, area, app.input_accent, " Login Provider ");
     let inner = inset(rect, 2, 1);
 
     let mut lines: Vec<Line> = vec![
@@ -268,14 +255,8 @@ fn model_choice_label(choice: &super::state::ModelChoice) -> String {
     }
 }
 
-fn render_picker_popup(
-    frame: &mut Frame,
-    area: Rect,
-    accent: Color,
-    title: &'static str,
-) -> Rect {
-    let rect =
-        centered_rect(area, area.width.clamp(44, 92), area.height.clamp(9, 22));
+fn render_picker_popup(frame: &mut Frame, area: Rect, accent: Color, title: &'static str) -> Rect {
+    let rect = centered_rect(area, area.width.clamp(44, 92), area.height.clamp(9, 22));
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .title(title)
@@ -336,13 +317,10 @@ fn render_permission_popup(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
     ];
 
-    let mut args_lines =
-        json_to_yaml_lines_for_popup(&perm.args, content_width);
-    let max_args =
-        inner
-            .height
-            .saturating_sub(if perm.confirming_always { 8 } else { 7 })
-            as usize;
+    let mut args_lines = json_to_yaml_lines_for_popup(&perm.args, content_width);
+    let max_args = inner
+        .height
+        .saturating_sub(if perm.confirming_always { 8 } else { 7 }) as usize;
     if args_lines.len() > max_args {
         args_lines.truncate(max_args.saturating_sub(1));
         args_lines.push("... (args truncated)".into());
@@ -371,33 +349,18 @@ fn render_permission_popup(frame: &mut Frame, area: Rect, app: &App) {
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(
-                " Y ",
-                Style::default().fg(Color::Black).bg(Color::Green),
-            ),
+            Span::styled(" Y ", Style::default().fg(Color::Black).bg(Color::Green)),
             Span::raw(" Confirm   "),
-            Span::styled(
-                " N ",
-                Style::default().fg(Color::Black).bg(Color::Red),
-            ),
+            Span::styled(" N ", Style::default().fg(Color::Black).bg(Color::Red)),
             Span::raw(" Cancel"),
         ]));
     } else {
         lines.push(Line::from(vec![
-            Span::styled(
-                " Y ",
-                Style::default().fg(Color::Black).bg(Color::Green),
-            ),
+            Span::styled(" Y ", Style::default().fg(Color::Black).bg(Color::Green)),
             Span::raw(" Allow once   "),
-            Span::styled(
-                " A ",
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ),
+            Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Yellow)),
             Span::raw(" Allow always   "),
-            Span::styled(
-                " N ",
-                Style::default().fg(Color::Black).bg(Color::Red),
-            ),
+            Span::styled(" N ", Style::default().fg(Color::Black).bg(Color::Red)),
             Span::raw(" Deny"),
         ]));
     }
@@ -491,9 +454,7 @@ fn highlight_code(lang: &str, code: &str) -> Vec<Line<'static>> {
         let ranges = h.highlight_line(line, ss).unwrap_or_default();
         let spans: Vec<Span<'static>> = ranges
             .into_iter()
-            .map(|(style, text)| {
-                Span::styled(text.to_string(), syntect_style_to_ratatui(style))
-            })
+            .map(|(style, text)| Span::styled(text.to_string(), syntect_style_to_ratatui(style)))
             .collect();
         lines.push(Line::from(spans));
     }
@@ -548,13 +509,7 @@ fn render_markdown(
             }
             Event::End(TagEnd::Table) => {
                 if let Some(table) = table_state.take() {
-                    render_markdown_table(
-                        lines,
-                        table,
-                        accent_prefix,
-                        accent_style,
-                        max_width,
-                    );
+                    render_markdown_table(lines, table, accent_prefix, accent_style, max_width);
                     push_accent_blank_line(lines, accent_prefix, accent_style);
                 }
             }
@@ -634,8 +589,7 @@ fn render_markdown(
                     .first()
                     .map(|span| span.style)
                     .unwrap_or_default();
-                let wrapped =
-                    word_wrap_line(&format!("{bullet}{item_text}"), max_width);
+                let wrapped = word_wrap_line(&format!("{bullet}{item_text}"), max_width);
                 for (index, part) in wrapped.iter().enumerate() {
                     let content = if index == 0 {
                         part.clone()
@@ -661,20 +615,12 @@ fn render_markdown(
                 let code = code_buf.trim_matches('\n');
                 if !code.is_empty() {
                     if code_lang.eq_ignore_ascii_case("diff") {
-                        render_diff_code_block(
-                            lines,
-                            code,
-                            accent_prefix,
-                            accent_style,
-                            max_width,
-                        );
+                        render_diff_code_block(lines, code, accent_prefix, accent_style, max_width);
                     } else {
                         let highlighted = highlight_code(&code_lang, code);
                         for hl_line in highlighted {
-                            let mut spans = vec![Span::styled(
-                                accent_prefix.to_string(),
-                                accent_style,
-                            )];
+                            let mut spans =
+                                vec![Span::styled(accent_prefix.to_string(), accent_style)];
                             spans.extend(hl_line);
                             lines.push(Line::from(spans));
                         }
@@ -809,8 +755,7 @@ fn flush_wrapped_spans(
         return;
     }
 
-    let full_text: String =
-        spans.iter().map(|span| span.content.as_ref()).collect();
+    let full_text: String = spans.iter().map(|span| span.content.as_ref()).collect();
     let wrapped = word_wrap_line(&format!("{prefix}{full_text}"), max_width);
     let style = spans.first().map(|span| span.style).unwrap_or_default();
     let continuation_indent = " ".repeat(prefix.len());
@@ -837,8 +782,7 @@ fn push_heading_lines(
     accent_prefix: &str,
     accent_style: Style,
 ) {
-    let heading_text: String =
-        spans.iter().map(|span| span.content.as_ref()).collect();
+    let heading_text: String = spans.iter().map(|span| span.content.as_ref()).collect();
     for part in word_wrap_line(&heading_text, max_width) {
         lines.push(Line::from(vec![
             Span::styled(accent_prefix.to_string(), accent_style),
@@ -847,10 +791,7 @@ fn push_heading_lines(
     }
 }
 
-fn list_item_prefix(
-    list_depth: u32,
-    ordered_index: &mut Option<u64>,
-) -> String {
+fn list_item_prefix(list_depth: u32, ordered_index: &mut Option<u64>) -> String {
     let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
     if let Some(index) = ordered_index.as_mut() {
         let prefix = format!("{indent}{index}. ");
@@ -956,8 +897,7 @@ fn render_markdown_table(
     let mut widths = vec![0usize; col_count];
     for row in &table.rows {
         for (idx, cell) in row.cells.iter().enumerate() {
-            let cell_width =
-                cell.lines().map(UnicodeWidthStr::width).max().unwrap_or(0);
+            let cell_width = cell.lines().map(UnicodeWidthStr::width).max().unwrap_or(0);
             widths[idx] = widths[idx].max(cell_width);
         }
     }
@@ -996,8 +936,7 @@ fn render_markdown_table(
     };
 
     let border_line = |left: char, fill: char, junction: char, right: char| {
-        let mut spans =
-            vec![Span::styled(accent_prefix.to_string(), accent_style)];
+        let mut spans = vec![Span::styled(accent_prefix.to_string(), accent_style)];
         spans.push(Span::styled(left.to_string(), accent_style));
         for (idx, width) in widths.iter().enumerate() {
             spans.push(Span::styled(
@@ -1026,12 +965,10 @@ fn render_markdown_table(
             .enumerate()
             .map(|(idx, cell)| word_wrap_line(cell, widths[idx]))
             .collect();
-        let row_height =
-            cell_lines.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let row_height = cell_lines.iter().map(Vec::len).max().unwrap_or(1).max(1);
 
         for line_idx in 0..row_height {
-            let mut spans =
-                vec![Span::styled(accent_prefix.to_string(), accent_style)];
+            let mut spans = vec![Span::styled(accent_prefix.to_string(), accent_style)];
             spans.push(Span::styled("│".to_string(), accent_style));
             let row_style = if row.is_header {
                 Style::default().add_modifier(Modifier::BOLD)
@@ -1068,11 +1005,7 @@ fn render_markdown_table(
     }
 }
 
-fn pad_table_cell(
-    text: &str,
-    width: usize,
-    alignment: pulldown_cmark::Alignment,
-) -> String {
+fn pad_table_cell(text: &str, width: usize, alignment: pulldown_cmark::Alignment) -> String {
     use unicode_width::UnicodeWidthStr;
 
     let text_width = UnicodeWidthStr::width(text);
@@ -1178,10 +1111,7 @@ fn push_accent_lines(
     }
 }
 
-fn push_tool_changes(
-    lines: &mut Vec<Line<'static>>,
-    changes: &[marshaling_protocol::FileChange],
-) {
+fn push_tool_changes(lines: &mut Vec<Line<'static>>, changes: &[marshaling_protocol::FileChange]) {
     for ch in changes {
         match ch.kind {
             marshaling_protocol::FileChangeKind::Modified => {
@@ -1196,15 +1126,11 @@ fn push_tool_changes(
                     let (prefix, style) = match dl.kind {
                         marshaling_protocol::DiffLineKind::Added => (
                             "+",
-                            Style::default()
-                                .fg(Color::Green)
-                                .bg(Color::Rgb(19, 48, 35)),
+                            Style::default().fg(Color::Green).bg(Color::Rgb(19, 48, 35)),
                         ),
                         marshaling_protocol::DiffLineKind::Removed => (
                             "-",
-                            Style::default()
-                                .fg(Color::Red)
-                                .bg(Color::Rgb(58, 29, 33)),
+                            Style::default().fg(Color::Red).bg(Color::Rgb(58, 29, 33)),
                         ),
                         marshaling_protocol::DiffLineKind::Context => {
                             (" ", Style::default().fg(Color::DarkGray))
@@ -1212,19 +1138,13 @@ fn push_tool_changes(
                     };
                     lines.push(Line::from(vec![
                         Span::styled("    ", Style::default()),
-                        Span::styled(
-                            format!(" {}{}", prefix, dl.content),
-                            style,
-                        ),
+                        Span::styled(format!(" {}{}", prefix, dl.content), style),
                     ]));
                 }
                 if ch.truncated {
                     lines.push(Line::from(vec![
                         Span::styled("    ", Style::default()),
-                        Span::styled(
-                            " [diff truncated]",
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(" [diff truncated]", Style::default().fg(Color::DarkGray)),
                     ]));
                 }
             }
@@ -1273,8 +1193,7 @@ fn render_diff_code_block(
             Style::default().fg(Color::DarkGray)
         };
         let wrapped = word_wrap_line(raw_line, max_width);
-        let continuation_prefix =
-            format!("{}{}", " ".repeat(line_no_width), " | ");
+        let continuation_prefix = format!("{}{}", " ".repeat(line_no_width), " | ");
         for (part_idx, part) in wrapped.into_iter().enumerate() {
             let prefix = if part_idx == 0 {
                 vec![
@@ -1309,14 +1228,11 @@ fn centered_text(content: &str, width: usize) -> String {
 
 fn is_helper_context(content: &str) -> bool {
     let trimmed = content.trim_start();
-    trimmed.starts_with("<system-reminder>")
-        || trimmed.starts_with("<reminder>")
+    trimmed.starts_with("<system-reminder>") || trimmed.starts_with("<reminder>")
 }
 
 fn is_welcome_empty_state(app: &App) -> bool {
-    app.messages.is_empty()
-        && app.stream_buffer.is_empty()
-        && app.tool_calls.is_empty()
+    app.messages.is_empty() && app.stream_buffer.is_empty() && app.tool_calls.is_empty()
 }
 
 fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
@@ -1387,20 +1303,12 @@ fn render_welcome_screen(frame: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .fg(Color::Rgb(
-                            default_logo.0,
-                            default_logo.1,
-                            default_logo.2,
-                        ))
+                        .fg(Color::Rgb(default_logo.0, default_logo.1, default_logo.2))
                         .add_modifier(Modifier::BOLD)
                 }
             } else {
                 Style::default()
-                    .fg(Color::Rgb(
-                        default_logo.0,
-                        default_logo.1,
-                        default_logo.2,
-                    ))
+                    .fg(Color::Rgb(default_logo.0, default_logo.1, default_logo.2))
                     .add_modifier(Modifier::BOLD)
             };
             spans.push(Span::styled(ch.to_string(), style));
@@ -1456,23 +1364,19 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
         // Determine accent prefix and style based on role
         // User messages get a colored accent bar; assistant messages get blank indentation.
         let (accent_prefix, accent_style) = match msg.role {
-            crate::llm::Role::User => {
-                (" ▌  ", Style::default().fg(app.user_accent))
-            }
+            crate::llm::Role::User => (" ▌  ", Style::default().fg(app.user_accent)),
             crate::llm::Role::Assistant => ("    ", Style::default()),
         };
 
         // Override for error messages — always use colored accent bar
-        let content_style = if msg.source == super::state::MessageSource::Error
-        {
+        let content_style = if msg.source == super::state::MessageSource::Error {
             Style::default().fg(Color::Red)
         } else if is_helper_context(&msg.content) {
             grey_content
         } else {
             Style::default()
         };
-        let accent_prefix = if msg.source == super::state::MessageSource::Error
-        {
+        let accent_prefix = if msg.source == super::state::MessageSource::Error {
             " ▌  "
         } else {
             accent_prefix
@@ -1505,9 +1409,7 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
         }
 
         // Empty line between thinking and output if both are present
-        if msg.thinking.as_ref().is_some_and(|t| !t.is_empty())
-            && !msg.content.is_empty()
-        {
+        if msg.thinking.as_ref().is_some_and(|t| !t.is_empty()) && !msg.content.is_empty() {
             lines.push(Line::from(Span::styled(
                 accent_prefix.to_string(),
                 accent_style,
@@ -1582,9 +1484,7 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
 
     for tc in &app.tool_calls {
         let (symbol, color) = match &tc.status {
-            marshaling_protocol::ToolStatus::Running => {
-                (spinner_char, Color::Yellow)
-            }
+            marshaling_protocol::ToolStatus::Running => (spinner_char, Color::Yellow),
             marshaling_protocol::ToolStatus::Success => ("✓", Color::Green),
             marshaling_protocol::ToolStatus::Failed(_) => ("✗", Color::Red),
         };
@@ -1621,12 +1521,7 @@ fn render_response_area(frame: &mut Frame, area: Rect, app: &mut App) {
     {
         let lines = if let Some(idx) = subagent_index {
             if let Some(sv) = app.subagent_views.get(idx) {
-                build_subagent_lines(
-                    sv,
-                    content_width,
-                    idx,
-                    app.subagent_views.len(),
-                )
+                build_subagent_lines(sv, content_width, idx, app.subagent_views.len())
             } else {
                 build_lines(app, content_width)
             }
@@ -1739,9 +1634,7 @@ fn build_subagent_lines(
 
     for tc in &sv.tool_calls {
         let (symbol, color) = match &tc.status {
-            marshaling_protocol::ToolStatus::Running => {
-                (spinner_char, Color::Yellow)
-            }
+            marshaling_protocol::ToolStatus::Running => (spinner_char, Color::Yellow),
             marshaling_protocol::ToolStatus::Success => ("✓", Color::Green),
             marshaling_protocol::ToolStatus::Failed(_) => ("✗", Color::Red),
         };
@@ -1773,10 +1666,7 @@ fn build_subagent_lines(
 
 /// Convert a JSON args string into YAML-like display lines.
 /// Handles flat objects, simple values, and arrays of strings.
-pub(crate) fn json_to_yaml_lines_for_popup(
-    json_str: &str,
-    max_width: usize,
-) -> Vec<String> {
+pub(crate) fn json_to_yaml_lines_for_popup(json_str: &str, max_width: usize) -> Vec<String> {
     if json_str.is_empty() || json_str == "null" {
         return Vec::new();
     }
@@ -1795,8 +1685,7 @@ pub(crate) fn json_to_yaml_lines_for_popup(
                         other => other.to_string(),
                     };
                     // Truncate long values
-                    let display = if val_str.len() > max_width.saturating_sub(4)
-                    {
+                    let display = if val_str.len() > max_width.saturating_sub(4) {
                         let end = val_str
                             .char_indices()
                             .take(max_width.saturating_sub(7))
@@ -1855,8 +1744,7 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
     // 4 for accent bar + 2 for right padding
     let content_width = area.width.saturating_sub(INPUT_SIDE_PADDING) as usize;
     let render_state = input_render_state(app, area.width);
-    let visible_content_lines =
-        area.height.saturating_sub(INPUT_FRAME_CHROME_LINES) as usize;
+    let visible_content_lines = area.height.saturating_sub(INPUT_FRAME_CHROME_LINES) as usize;
     let max_scroll_offset = render_state
         .display_lines
         .len()
@@ -1866,8 +1754,7 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
         .display_lines
         .len()
         .saturating_sub(visible_content_lines + input_scroll_offset);
-    let visible_end = (visible_start + visible_content_lines)
-        .min(render_state.display_lines.len());
+    let visible_end = (visible_start + visible_content_lines).min(render_state.display_lines.len());
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1941,22 +1828,15 @@ fn render_input_area(frame: &mut Frame, area: Rect, app: &App, accent: Color) {
             return;
         }
         let visible_row = visual_row.saturating_sub(visible_start);
-        let cx =
-            area.x + input_cursor_screen_x(area.width, INPUT_PROMPT_WIDTH, col);
+        let cx = area.x + input_cursor_screen_x(area.width, INPUT_PROMPT_WIDTH, col);
         let cy = area.y + 2 + visible_row as u16; // +1 for spacer +1 for top accent padding
         frame.set_cursor_position(ratatui::prelude::Position::new(cx, cy));
     }
 }
 
-fn input_height(
-    area: Rect,
-    queue_lines: u16,
-    show_loading: bool,
-    app: &App,
-) -> u16 {
+fn input_height(area: Rect, queue_lines: u16, show_loading: bool, app: &App) -> u16 {
     let content_lines = input_render_state(app, area.width).display_lines.len();
-    let max_content_lines =
-        max_input_content_lines(area.height, queue_lines, show_loading);
+    let max_content_lines = max_input_content_lines(area.height, queue_lines, show_loading);
     let content_lines = content_lines.clamp(1, max_content_lines) as u16;
     content_lines + INPUT_FRAME_CHROME_LINES
 }
@@ -1967,17 +1847,15 @@ pub(crate) fn input_scroll_capacity(full_area: Rect, app: &App) -> usize {
     let queue_lines = app.input_queue.len().min(max_queue_lines) as u16;
     let show_loading = app.loading_progress.is_some();
     let total_lines = input_render_state(app, area.width).display_lines.len();
-    let max_content_lines =
-        max_input_content_lines(area.height, queue_lines, show_loading);
+    let max_content_lines = max_input_content_lines(area.height, queue_lines, show_loading);
     total_lines.saturating_sub(max_content_lines)
 }
 
 fn input_render_state(app: &App, area_width: u16) -> InputRenderState {
     let shell_mode = app.input.starts_with('!');
-    let (prompt, display_input, display_cursor) =
-        shell_input_display(&app.input, app.input_cursor);
-    let placeholder = display_input.is_empty()
-        && matches!(app.state, AppState::Idle | AppState::AgentRunning);
+    let (prompt, display_input, display_cursor) = shell_input_display(&app.input, app.input_cursor);
+    let placeholder =
+        display_input.is_empty() && matches!(app.state, AppState::Idle | AppState::AgentRunning);
     let display_text = if placeholder {
         "message · /command · !shell".to_string()
     } else {
@@ -1999,11 +1877,7 @@ fn input_render_state(app: &App, area_width: u16) -> InputRenderState {
     }
 }
 
-fn max_input_content_lines(
-    full_height: u16,
-    queue_lines: u16,
-    show_loading: bool,
-) -> usize {
+fn max_input_content_lines(full_height: u16, queue_lines: u16, show_loading: bool) -> usize {
     let loading_height = if show_loading { 1 } else { 0 };
     full_height
         .saturating_sub(
@@ -2032,38 +1906,23 @@ pub(crate) fn content_area_for_frame(full_area: Rect) -> Rect {
     }
 }
 
-fn render_queued_accent_area(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    max_rows: usize,
-) {
+fn render_queued_accent_area(frame: &mut Frame, area: Rect, app: &App, max_rows: usize) {
     let width = area.width.saturating_sub(6) as usize;
     let lines = queued_accent_lines(app, width, max_rows);
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-fn queued_accent_lines(
-    app: &App,
-    message_width: usize,
-    max_rows: usize,
-) -> Vec<Line<'static>> {
+fn queued_accent_lines(app: &App, message_width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let visible_count = app.input_queue.len().min(max_rows);
     app.input_queue
         .iter()
         .take(visible_count)
         .enumerate()
-        .map(|(idx, message)| {
-            queued_accent_line(idx + 1, message, message_width)
-        })
+        .map(|(idx, message)| queued_accent_line(idx + 1, message, message_width))
         .collect()
 }
 
-fn queued_accent_line(
-    sequence: usize,
-    message: &str,
-    message_width: usize,
-) -> Line<'static> {
+fn queued_accent_line(sequence: usize, message: &str, message_width: usize) -> Line<'static> {
     const QUEUED_ACCENT: Color = Color::Yellow;
     let message = single_line_preview(message, message_width);
     Line::from(vec![
@@ -2094,10 +1953,7 @@ fn single_line_preview(message: &str, max_chars: usize) -> String {
     preview
 }
 
-fn shell_input_display(
-    input: &str,
-    cursor: usize,
-) -> (&'static str, String, usize) {
+fn shell_input_display(input: &str, cursor: usize) -> (&'static str, String, usize) {
     if let Some(rest) = input.strip_prefix('!') {
         let trimmed = rest.strip_prefix(' ').unwrap_or(rest);
         let skipped = input.len() - trimmed.len();
@@ -2110,11 +1966,7 @@ fn shell_input_display(
 
 /// Compute cursor (col, visual_row) after word-wrapping the text up to `byte_offset`.
 /// `visual_row` counts wrapped lines (0 = first visual line).
-fn cursor_pos_after_wrap(
-    text: &str,
-    byte_offset: usize,
-    max_width: usize,
-) -> (usize, usize) {
+fn cursor_pos_after_wrap(text: &str, byte_offset: usize, max_width: usize) -> (usize, usize) {
     use unicode_width::UnicodeWidthStr;
     let text_before = if byte_offset <= text.len() {
         &text[..byte_offset]
@@ -2131,11 +1983,7 @@ fn cursor_pos_after_wrap(
     (col, visual_row)
 }
 
-fn input_cursor_screen_x(
-    area_width: u16,
-    prompt_width: usize,
-    col: usize,
-) -> u16 {
+fn input_cursor_screen_x(area_width: u16, prompt_width: usize, col: usize) -> u16 {
     let content_x = 4 + prompt_width + col;
     let max_cursor_x = area_width.saturating_sub(2) as usize;
     content_x.min(max_cursor_x) as u16
@@ -2173,8 +2021,9 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
     let server_status = match &app.server_health {
-        crate::tui::state::ServerHealth::Connected
-        | crate::tui::state::ServerHealth::Unknown => "".into(),
+        crate::tui::state::ServerHealth::Connected | crate::tui::state::ServerHealth::Unknown => {
+            "".into()
+        }
         crate::tui::state::ServerHealth::Disconnected(reason) => {
             format!(" (disconnected: {reason})")
         }
@@ -2204,12 +2053,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
                 app.tokens_output,
             )
         } else {
-            status_right_info(
-                &app.model_info,
-                None,
-                app.tokens_input,
-                app.tokens_output,
-            )
+            status_right_info(&app.model_info, None, app.tokens_input, app.tokens_output)
         }
     } else {
         let skill = app
@@ -2218,12 +2062,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
             .map(|s| format!("skill:{}", s))
             .unwrap_or_default();
         let extra = (!skill.is_empty()).then_some(skill.as_str());
-        status_right_info(
-            &app.model_info,
-            extra,
-            app.tokens_input,
-            app.tokens_output,
-        )
+        status_right_info(&app.model_info, extra, app.tokens_input, app.tokens_output)
     };
 
     let audio_hint = match &app.audio_state {
@@ -2239,8 +2078,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, app: &App) {
     };
     let audio_style = match &app.audio_state {
         super::state::AudioState::Idle => Style::default().fg(Color::DarkGray),
-        super::state::AudioState::Connecting
-        | super::state::AudioState::Transcribing => {
+        super::state::AudioState::Connecting | super::state::AudioState::Transcribing => {
             Style::default().fg(Color::Yellow)
         }
         super::state::AudioState::Recording => Style::default()
@@ -2311,9 +2149,7 @@ fn status_right_info(
     if extra.is_empty() {
         format!(" {model_info} | in:{tokens_input} out:{tokens_output} ")
     } else {
-        format!(
-            " {model_info} | {extra} | in:{tokens_input} out:{tokens_output} "
-        )
+        format!(" {model_info} | {extra} | in:{tokens_input} out:{tokens_output} ")
     }
 }
 
@@ -2392,9 +2228,7 @@ fn render_loading_bar(frame: &mut Frame, area: Rect, app: &App) {
     let context = app
         .tool_calls
         .iter()
-        .find(|tc| {
-            matches!(tc.status, marshaling_protocol::ToolStatus::Running)
-        })
+        .find(|tc| matches!(tc.status, marshaling_protocol::ToolStatus::Running))
         .map(|tc| format!("running {}", tc.name))
         .or_else(|| app.loading_label.clone())
         .unwrap_or_else(|| "thinking".into());
@@ -2411,15 +2245,8 @@ fn render_loading_bar(frame: &mut Frame, area: Rect, app: &App) {
 
 // ── Suggestions popup ───────────────────────────────────
 
-fn render_suggestions(
-    frame: &mut Frame,
-    input_area: Rect,
-    app: &App,
-    accent: Color,
-) {
-    if app.suggestions.is_empty()
-        || app.state != AppState::Idle
-        || app.pending_permission.is_some()
+fn render_suggestions(frame: &mut Frame, input_area: Rect, app: &App, accent: Color) {
+    if app.suggestions.is_empty() || app.state != AppState::Idle || app.pending_permission.is_some()
     {
         return;
     }
@@ -2451,10 +2278,7 @@ fn render_suggestions(
     let block = Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_style(Style::default().fg(accent));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(block),
-        popup_area,
-    );
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), popup_area);
 }
 
 #[cfg(test)]
@@ -2469,10 +2293,7 @@ mod tests {
             model_info: "deepseek/deepseek-chat".into(),
             agent_names: vec!["build".into()],
             subagent_names: vec![],
-            agent_model_info: HashMap::from([(
-                "build".into(),
-                "deepseek/deepseek-chat".into(),
-            )]),
+            agent_model_info: HashMap::from([("build".into(), "deepseek/deepseek-chat".into())]),
             default_agent: "build".into(),
             audio: marshaling_protocol::AudioUiConfig::default(),
         }
@@ -2828,8 +2649,7 @@ mod tests {
 
     #[test]
     fn test_markdown_table_renders_grid() {
-        let input =
-            "| Name | Score |\n| ---- | ----: |\n| Ada | 10 |\n| Grace | 42 |";
+        let input = "| Name | Score |\n| ---- | ----: |\n| Ada | 10 |\n| Grace | 42 |";
         let result = md_text(input);
         let joined: String = result.join("\n");
         assert!(joined.contains("┌"), "table output:\n{joined}");
@@ -2853,8 +2673,7 @@ mod tests {
     fn test_helper_context_renders_in_grey() {
         let cfg = test_ui_config();
         let mut app = App::new(&cfg, cfg.model_info.clone());
-        app.stream_buffer =
-            "<system-reminder>\nhelper\n</system-reminder>".into();
+        app.stream_buffer = "<system-reminder>\nhelper\n</system-reminder>".into();
 
         let lines = build_lines(&app, 80);
         let helper_span = lines

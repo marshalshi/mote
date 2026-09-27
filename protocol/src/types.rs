@@ -631,10 +631,9 @@ mod tests {
 
     #[test]
     fn chat_request_without_new_fields_still_parses() {
-        let req: ChatRequest = serde_json::from_str(
-            r#"{"message":"hi","agent":"build","model_override":null}"#,
-        )
-        .unwrap();
+        let req: ChatRequest =
+            serde_json::from_str(r#"{"message":"hi","agent":"build","model_override":null}"#)
+                .unwrap();
         assert_eq!(req.replay_from, None);
         assert_eq!(req.client_instance_id, None);
     }
@@ -647,14 +646,10 @@ mod tests {
         let json = serde_json::to_string(&evt).unwrap();
         assert!(json.contains(r#""type":"session_busy""#));
         let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
-        assert!(
-            matches!(parsed, ServerEvent::SessionBusy { ref run_id } if run_id == "run_1")
-        );
+        assert!(matches!(parsed, ServerEvent::SessionBusy { ref run_id } if run_id == "run_1"));
         assert!(!parsed.is_run_log_event());
         assert!(ServerEvent::TextDelta { data: "x".into() }.is_run_log_event());
-        assert!(
-            !ServerEvent::RunAttached { run_id: "r".into() }.is_run_log_event()
-        );
+        assert!(!ServerEvent::RunAttached { run_id: "r".into() }.is_run_log_event());
         assert!(
             !ServerEvent::PermissionPending {
                 id: "p".into(),

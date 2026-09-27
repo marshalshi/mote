@@ -83,9 +83,7 @@ impl ActiveRun {
     /// No client is attached while the run waits on a permission prompt, so
     /// nobody can answer it.
     pub(crate) fn is_detached_awaiting_permission(&self) -> bool {
-        !self.finished
-            && self.tx.receiver_count() == 0
-            && !self.pending_permission_tools.is_empty()
+        !self.finished && self.tx.receiver_count() == 0 && !self.pending_permission_tools.is_empty()
     }
 
     /// Register a new subscriber. Returns its live receiver, the log events
@@ -112,13 +110,13 @@ impl ActiveRun {
         let pending = self
             .pending_permission_tools
             .iter()
-            .map(|(id, pending)| {
-                marshaling_protocol::ServerEvent::PermissionPending {
+            .map(
+                |(id, pending)| marshaling_protocol::ServerEvent::PermissionPending {
                     id: id.clone(),
                     tool_name: pending.tool_name.clone(),
                     args: pending.args.clone(),
-                }
-            })
+                },
+            )
             .collect();
         (
             self.tx.subscribe(),
@@ -131,9 +129,7 @@ impl ActiveRun {
     /// generation, mark it armed and return that generation.
     pub(crate) fn arm_detached_permission_watchdog(&mut self) -> Option<u64> {
         let generation = self.attach_generation;
-        if !self.is_detached_awaiting_permission()
-            || self.watchdog_armed_for == Some(generation)
-        {
+        if !self.is_detached_awaiting_permission() || self.watchdog_armed_for == Some(generation) {
             return None;
         }
         self.watchdog_armed_for = Some(generation);
@@ -159,16 +155,16 @@ pub(crate) fn claim_run_slot(
     run: ActiveRun,
 ) -> std::result::Result<(), RunSlotConflict> {
     if let Some(instance) = run.client_instance_id.as_deref()
-        && let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
-            !r.finished && r.client_instance_id.as_deref() == Some(instance)
-        })
+        && let Some((busy_id, _)) = runs
+            .iter()
+            .find(|(_, r)| !r.finished && r.client_instance_id.as_deref() == Some(instance))
     {
         return Err(RunSlotConflict::SameClient(busy_id.clone()));
     }
     if let Some(path) = run.session_path.as_deref()
-        && let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
-            !r.finished && r.session_path.as_deref() == Some(path)
-        })
+        && let Some((busy_id, _)) = runs
+            .iter()
+            .find(|(_, r)| !r.finished && r.session_path.as_deref() == Some(path))
     {
         return Err(RunSlotConflict::SessionBusy(busy_id.clone()));
     }
@@ -183,9 +179,8 @@ pub(crate) fn spawn_detached_permission_watchdog(
     run_id: &str,
     generation: u64,
 ) {
-    let timeout = std::time::Duration::from_secs(
-        state.config.server.detached_permission_timeout_secs,
-    );
+    let timeout =
+        std::time::Duration::from_secs(state.config.server.detached_permission_timeout_secs);
     let state = Arc::clone(state);
     let run_id = run_id.to_string();
     tokio::spawn(async move {
@@ -197,9 +192,7 @@ pub(crate) fn spawn_detached_permission_watchdog(
         if run.watchdog_armed_for == Some(generation) {
             run.watchdog_armed_for = None;
         }
-        if run.attach_generation == generation
-            && run.is_detached_awaiting_permission()
-        {
+        if run.attach_generation == generation && run.is_detached_awaiting_permission() {
             tracing::warn!(
                 run_id = %run_id,
                 timeout_secs = timeout.as_secs(),
@@ -214,27 +207,19 @@ pub(crate) fn new_run_id() -> String {
     format!("run_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"))
 }
 
-pub(crate) fn terminal_status(
-    event: &marshaling_protocol::ServerEvent,
-) -> Option<RunStatus> {
+pub(crate) fn terminal_status(event: &marshaling_protocol::ServerEvent) -> Option<RunStatus> {
     match event {
         marshaling_protocol::ServerEvent::Done { .. } => Some(RunStatus::Done),
-        marshaling_protocol::ServerEvent::Cancelled { .. } => {
-            Some(RunStatus::Cancelled)
-        }
+        marshaling_protocol::ServerEvent::Cancelled { .. } => Some(RunStatus::Cancelled),
         marshaling_protocol::ServerEvent::NeedsContinuation { .. } => {
             Some(RunStatus::NeedsContinuation)
         }
-        marshaling_protocol::ServerEvent::Error { .. } => {
-            Some(RunStatus::Failed)
-        }
+        marshaling_protocol::ServerEvent::Error { .. } => Some(RunStatus::Failed),
         _ => None,
     }
 }
 
-pub(crate) fn is_terminal_event(
-    event: &marshaling_protocol::ServerEvent,
-) -> bool {
+pub(crate) fn is_terminal_event(event: &marshaling_protocol::ServerEvent) -> bool {
     terminal_status(event).is_some()
 }
 
@@ -333,11 +318,7 @@ impl RunPersistence {
     /// Write notes that arrived after the loop stopped taking them, and
     /// stop accepting more (later ones are appended directly). Holding the
     /// session lock across both closes the race with a concurrent rollback.
-    pub(crate) async fn flush_pending_notes(
-        &mut self,
-        state: &Arc<AppState>,
-        run_id: &str,
-    ) {
+    pub(crate) async fn flush_pending_notes(&mut self, state: &Arc<AppState>, run_id: &str) {
         let lock = Arc::clone(&self.session_lock);
         let _guard = lock.lock().await;
         let notes = {
@@ -391,19 +372,12 @@ impl RunPersistence {
         }
     }
 
-    pub(crate) async fn append_messages(
-        &mut self,
-        messages: Vec<llm::ChatMessage>,
-    ) {
+    pub(crate) async fn append_messages(&mut self, messages: Vec<llm::ChatMessage>) {
         self.write("messages", move |writer| writer.append_messages(&messages))
             .await;
     }
 
-    pub(crate) async fn record_run_end(
-        &mut self,
-        tokens_input: u64,
-        tokens_output: u64,
-    ) {
+    pub(crate) async fn record_run_end(&mut self, tokens_input: u64, tokens_output: u64) {
         let record = store::Record::RunEnd {
             ts: chrono::Utc::now(),
             tokens_input,
@@ -867,9 +841,7 @@ pub(crate) async fn handle_client_event_for_run(
     socket: &mut WebSocket,
     text: &str,
 ) {
-    let Ok(client_event) =
-        serde_json::from_str::<marshaling_protocol::ClientEvent>(text)
-    else {
+    let Ok(client_event) = serde_json::from_str::<marshaling_protocol::ClientEvent>(text) else {
         return;
     };
 
@@ -896,9 +868,7 @@ pub(crate) async fn handle_client_event_for_run(
                 && let Some(tool_name) = remembered_tool
             {
                 let mut sessions = state.runtime_states.lock().await;
-                let sess = sessions
-                    .entry(runtime_session_key.to_string())
-                    .or_default();
+                let sess = sessions.entry(runtime_session_key.to_string()).or_default();
                 sess.remember_allow_tools.insert(tool_name);
             }
             if !permission_broker.resolve(&id, allowed) {
@@ -918,8 +888,7 @@ pub(crate) async fn handle_client_event_for_run(
         marshaling_protocol::ClientEvent::RollbackLast {
             runtime_session_key: requested_key,
         } => {
-            let key = requested_key
-                .unwrap_or_else(|| runtime_session_key.to_string());
+            let key = requested_key.unwrap_or_else(|| runtime_session_key.to_string());
             let payload = apply_rollback_last(state, &key).await;
             let evt = marshaling_protocol::ServerEvent::RollbackResult {
                 success: payload.success,
@@ -940,13 +909,10 @@ pub(crate) fn agent_event_to_server_event(
 ) -> Option<marshaling_protocol::ServerEvent> {
     use agent::AgentEvent;
     let event = match event {
-        AgentEvent::PermissionResolved { .. }
-        | AgentEvent::MessagesCommitted(_) => return None,
-        AgentEvent::Failed { error, .. } => {
-            marshaling_protocol::ServerEvent::Error {
-                message: format!("{error:#}"),
-            }
-        }
+        AgentEvent::PermissionResolved { .. } | AgentEvent::MessagesCommitted(_) => return None,
+        AgentEvent::Failed { error, .. } => marshaling_protocol::ServerEvent::Error {
+            message: format!("{error:#}"),
+        },
         AgentEvent::SubagentRetrying {
             id,
             reason,
@@ -969,9 +935,7 @@ pub(crate) fn agent_event_to_server_event(
             reason,
             discarded_output,
         },
-        AgentEvent::TextDelta(text) => {
-            marshaling_protocol::ServerEvent::TextDelta { data: text }
-        }
+        AgentEvent::TextDelta(text) => marshaling_protocol::ServerEvent::TextDelta { data: text },
         AgentEvent::ReasoningDelta(text) => {
             marshaling_protocol::ServerEvent::ReasoningDelta { data: text }
         }
@@ -1013,10 +977,7 @@ pub(crate) fn agent_event_to_server_event(
             marshaling_protocol::ServerEvent::SubagentTextDelta { id, data }
         }
         AgentEvent::SubagentReasoningDelta { id, data } => {
-            marshaling_protocol::ServerEvent::SubagentReasoningDelta {
-                id,
-                data,
-            }
+            marshaling_protocol::ServerEvent::SubagentReasoningDelta { id, data }
         }
         AgentEvent::SubagentToolStarted {
             id,
@@ -1040,11 +1001,7 @@ pub(crate) fn agent_event_to_server_event(
             changes,
         },
         AgentEvent::SubagentToolFailed { id, sub_id, error } => {
-            marshaling_protocol::ServerEvent::SubagentToolFailed {
-                id,
-                sub_id,
-                error,
-            }
+            marshaling_protocol::ServerEvent::SubagentToolFailed { id, sub_id, error }
         }
         AgentEvent::SubagentDone { id, content } => {
             marshaling_protocol::ServerEvent::SubagentDone { id, content }

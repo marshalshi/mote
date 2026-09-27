@@ -421,36 +421,36 @@ pub enum AgentEvent {
         reason: String,
         discarded_output: bool,
     },
+    /// Messages appended to the conversation since the last commit, in
+    /// order. Emitted at the end of every step and right before the
+    /// terminal event, so persisting these as they arrive stores the whole
+    /// conversation; a step is committed only once it is complete, so every
+    /// committed tool call has its result.
+    MessagesCommitted(Vec<ChatMessage>),
     /// The run failed with an unrecoverable error (e.g. a provider error
-    /// that cannot be retried). Carries the history so far so it can be
-    /// saved.
+    /// that cannot be retried).
     Failed {
         error: anyhow::Error,
         tokens_input: u64,
         tokens_output: u64,
-        history: Vec<ChatMessage>,
     },
     /// The agent loop has finished.
     Done {
         content: String,
         tokens_input: u64,
         tokens_output: u64,
-        /// Full conversation history including system messages, tool results, etc.
-        history: Vec<ChatMessage>,
     },
     /// The agent was explicitly cancelled by the user.
     Cancelled {
         content: String,
         tokens_input: u64,
         tokens_output: u64,
-        history: Vec<ChatMessage>,
     },
     /// The loop stopped before an explicit finish_task completion.
     NeedsContinuation {
         content: String,
         tokens_input: u64,
         tokens_output: u64,
-        history: Vec<ChatMessage>,
     },
 }
 
@@ -482,8 +482,9 @@ pub struct RunChannels {
 ///
 /// Appends `user_message` to `history`, then alternates LLM turns and tool
 /// execution until the task finishes, is cancelled, fails, or runs out of
-/// steps. Streams `AgentEvent`s through `channels.events_tx`; the last event
-/// is always exactly one terminal event carrying the final history.
+/// steps. Streams `AgentEvent`s through `channels.events_tx`; new history is
+/// reported through `MessagesCommitted`, and the last event is always
+/// exactly one terminal event.
 pub async fn run_loop(
     config: RunConfig,
     channels: RunChannels,
@@ -571,6 +572,47 @@ async fn wait_for_cancel(
     }
 }
 
+/// Result recorded for a tool call that never ran to completion.
+const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
+
+/// Give every tool call of the last assistant tool-call message a result.
+///
+/// A run cancelled or failed mid-batch leaves calls without results;
+/// providers reject a history where a tool call is not followed by its
+/// result, so the next request in the conversation would fail.
+///
+/// Only messages from index `from` on are considered, so a run never
+/// "answers" calls that belong to earlier history.
+pub(crate) fn close_unanswered_tool_calls(
+    history: &mut Vec<ChatMessage>,
+    from: usize,
+) {
+    let Some(idx) = history
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+        .map(|i| i + from)
+    else {
+        return;
+    };
+    let answered: std::collections::HashSet<&str> = history[idx + 1..]
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    let missing: Vec<String> = history[idx]
+        .tool_calls
+        .iter()
+        .flatten()
+        .map(|call| call.id.as_str())
+        .filter(|id| !answered.contains(id))
+        .map(str::to_string)
+        .collect();
+    for id in missing {
+        history.push(ChatMessage::tool_result(id, INTERRUPTED_TOOL_RESULT));
+    }
+}
+
 /// Skill names advertised in the "Skills available:" system layer.
 fn skill_names(system_layers: &[String]) -> Vec<String> {
     system_layers
@@ -602,6 +644,11 @@ struct AgentRun {
     cancel_open: bool,
     /// Active role in role mode; stays 0 in single-role mode.
     current_role_idx: usize,
+    /// `history[..committed_len]` has been reported via
+    /// `MessagesCommitted` (or was passed in as prior history).
+    committed_len: usize,
+    /// Length of the prior history passed in; later messages are this run's.
+    initial_len: usize,
 }
 
 impl AgentRun {
@@ -618,6 +665,8 @@ impl AgentRun {
             events_tx: channels.events_tx,
             cancel_rx: channels.cancel_rx,
             permission_broker: channels.permission_broker,
+            committed_len: history.len(),
+            initial_len: history.len(),
             history,
             total_input: 0,
             total_output: 0,
@@ -634,48 +683,55 @@ impl AgentRun {
         *self.cancel_rx.borrow()
     }
 
-    /// The single exit path: send the terminal event with the final history.
-    fn finish(self, terminal: Terminal) {
-        let AgentRun {
-            events_tx,
-            history,
-            total_input: tokens_input,
-            total_output: tokens_output,
-            ..
-        } = self;
+    /// Report messages added since the last commit.
+    fn commit(&mut self) {
+        if self.history.len() > self.committed_len {
+            let new = self.history[self.committed_len..].to_vec();
+            self.committed_len = self.history.len();
+            self.emit(AgentEvent::MessagesCommitted(new));
+        }
+    }
+
+    /// The single exit path: close any tool calls left without a result,
+    /// commit the remaining history, and send the terminal event.
+    fn finish(mut self, terminal: Terminal) {
+        close_unanswered_tool_calls(&mut self.history, self.initial_len);
+        self.commit();
+        let tokens_input = self.total_input;
+        let tokens_output = self.total_output;
         let event = match terminal {
             Terminal::Done(content) => AgentEvent::Done {
                 content,
                 tokens_input,
                 tokens_output,
-                history,
             },
             Terminal::Cancelled => AgentEvent::Cancelled {
                 content: "(cancelled)".into(),
                 tokens_input,
                 tokens_output,
-                history,
             },
             Terminal::NeedsContinuation(content) => {
                 AgentEvent::NeedsContinuation {
                     content,
                     tokens_input,
                     tokens_output,
-                    history,
                 }
             }
             Terminal::Failed(error) => AgentEvent::Failed {
                 error,
                 tokens_input,
                 tokens_output,
-                history,
             },
         };
-        let _ = events_tx.send(Ok(event));
+        self.emit(event);
     }
 
     async fn run(mut self, user_message: String) {
         self.history.push(ChatMessage::user(&user_message));
+        // Persist the user's message right away: the first step can take
+        // minutes, and the session must exist even if the run never
+        // completes one.
+        self.commit();
 
         let skill_names = skill_names(&self.cfg.system_layers);
         if !skill_names.is_empty() {
@@ -725,6 +781,7 @@ impl AgentRun {
             {
                 return self.finish(terminal);
             }
+            self.commit();
         }
     }
 
@@ -1600,6 +1657,49 @@ mod tests {
         }
     }
 
+    /// History committed by a run (started from empty history), rebuilt
+    /// from its `MessagesCommitted` events.
+    fn committed_history(events: &[AgentEvent]) -> Vec<ChatMessage> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessagesCommitted(messages) => {
+                    Some(messages.clone())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn is_terminal(event: &AgentEvent) -> bool {
+        matches!(
+            event,
+            AgentEvent::Done { .. }
+                | AgentEvent::Cancelled { .. }
+                | AgentEvent::NeedsContinuation { .. }
+                | AgentEvent::Failed { .. }
+        )
+    }
+
+    /// Receive events up to and including the terminal one.
+    async fn events_until_terminal(
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+            Result<AgentEvent>,
+        >,
+    ) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = events_rx.recv().await {
+            let event = event.unwrap();
+            let done = is_terminal(&event);
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+
     struct PanickingTool;
 
     #[async_trait]
@@ -1740,14 +1840,9 @@ mod tests {
         )
         .await;
 
-        let mut done_history = None;
-        while let Some(event) = events_rx.recv().await {
-            if let AgentEvent::Done { history, .. } = event.unwrap() {
-                done_history = Some(history);
-                break;
-            }
-        }
-        let history = done_history.expect("Done event should be emitted");
+        let events = events_until_terminal(&mut events_rx).await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+        let history = committed_history(&events);
         assert!(matches!(history[0].role, Role::User));
         assert!(matches!(history.last().unwrap().role, Role::Assistant));
         assert_eq!(
@@ -1904,21 +1999,20 @@ mod tests {
             Vec::new(),
         )
         .await;
-        let mut last = None;
-        while let Ok(event) = events_rx.try_recv() {
-            last = Some(event.unwrap());
-        }
-        match last {
-            Some(AgentEvent::Failed { error, history, .. }) => {
+        let events = events_until_terminal(&mut events_rx).await;
+        match events.last() {
+            Some(AgentEvent::Failed { error, .. }) => {
                 assert!(format!("{error:#}").contains("invalid api key"));
-                // History up to the failure travels with it so it can be saved.
-                assert_eq!(
-                    history.last().and_then(|m| m.content.as_deref()),
-                    Some("hi")
-                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+        // The history up to the failure is committed before it, so it is
+        // saved.
+        let history = committed_history(&events);
+        assert_eq!(
+            history.last().and_then(|m| m.content.as_deref()),
+            Some("hi")
+        );
     }
 
     type AttemptScript =
@@ -2059,16 +2153,14 @@ mod tests {
             matches!(&events[retry + 1], AgentEvent::TextDelta(t) if t == "full answer")
         );
         match events.last() {
-            Some(AgentEvent::Done {
-                content, history, ..
-            }) => {
+            Some(AgentEvent::Done { content, .. }) => {
                 assert_eq!(content, "full answer");
-                assert!(!history.iter().any(|m| {
-                    m.content.as_deref().is_some_and(|c| c.contains("partial"))
-                }));
             }
             other => panic!("expected Done, got {other:?}"),
         }
+        assert!(!committed_history(&events).iter().any(|m| {
+            m.content.as_deref().is_some_and(|c| c.contains("partial"))
+        }));
     }
 
     #[tokio::test]
@@ -2711,15 +2803,9 @@ mod tests {
         )
         .await;
 
-        let mut done_history = None;
-        while let Some(event) = events_rx.recv().await {
-            if let AgentEvent::Done { history, .. } = event.unwrap() {
-                done_history = Some(history);
-                break;
-            }
-        }
-
-        let history = done_history.expect("Done event should include history");
+        let events = events_until_terminal(&mut events_rx).await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+        let history = committed_history(&events);
         let tool_call_message = history
             .iter()
             .find(|msg| msg.tool_calls.is_some())
@@ -2944,13 +3030,9 @@ mod tests {
         )
         .await;
 
-        let history = loop {
-            if let Ok(AgentEvent::Done { history, .. }) =
-                events_rx.recv().await.unwrap()
-            {
-                break history;
-            }
-        };
+        let events = events_until_terminal(&mut events_rx).await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+        let history = committed_history(&events);
         let tool_results: Vec<_> = history
             .iter()
             .filter(|message| matches!(message.role, Role::Tool))
@@ -3136,13 +3218,9 @@ mod tests {
         )
         .await;
 
-        let history = loop {
-            if let Ok(AgentEvent::Done { history, .. }) =
-                events_rx.recv().await.unwrap()
-            {
-                break history;
-            }
-        };
+        let events = events_until_terminal(&mut events_rx).await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+        let history = committed_history(&events);
         let role_task_idx = history
             .iter()
             .position(|message| message.internal_role_task)
@@ -3217,19 +3295,25 @@ mod tests {
             }
         }
         cancel_tx.send(true).unwrap();
-        let event = tokio::time::timeout(
+        let events = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            events_rx.recv(),
+            events_until_terminal(&mut events_rx),
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
-        assert!(matches!(event, AgentEvent::Cancelled { .. }));
+        assert!(matches!(events.last(), Some(AgentEvent::Cancelled { .. })));
         tokio::time::timeout(std::time::Duration::from_secs(1), loop_task)
             .await
             .unwrap()
             .unwrap();
+        // The interrupted call still gets a result, so the saved history
+        // stays valid for the next request.
+        let history = committed_history(&events);
+        let result = history
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("block"))
+            .expect("interrupted call has a result");
+        assert_eq!(result.content.as_deref(), Some(INTERRUPTED_TOOL_RESULT));
     }
 
     #[tokio::test]
@@ -3296,24 +3380,16 @@ mod tests {
         .await
         .expect("run_loop must finish after a tool panic");
 
-        let mut saw_failure = false;
-        let mut done_history = None;
-        while let Ok(event) = events_rx.try_recv() {
-            match event.unwrap() {
-                AgentEvent::ToolFailed { id, error } => {
-                    assert_eq!(id, "call_boom");
-                    assert!(error.contains("panicked"), "{error}");
-                    assert!(error.contains("tool exploded"), "{error}");
-                    saw_failure = true;
-                }
-                AgentEvent::Done { history, .. } => {
-                    done_history = Some(history)
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_failure);
-        let history = done_history.expect("loop should reach Done");
+        let events = events_until_terminal(&mut events_rx).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolFailed { id, error }
+                if id == "call_boom"
+                    && error.contains("panicked")
+                    && error.contains("tool exploded")
+        )));
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+        let history = committed_history(&events);
         assert!(history.iter().any(|m| {
             m.tool_call_id.as_deref() == Some("call_boom")
                 && m.content
@@ -3520,17 +3596,117 @@ mod tests {
             }
         };
         cancel_tx.send(true).unwrap();
-        let event = tokio::time::timeout(
+        let events = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            events_rx.recv(),
+            events_until_terminal(&mut events_rx),
         )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
-        assert!(matches!(event, AgentEvent::Cancelled { .. }));
+        assert!(matches!(events.last(), Some(AgentEvent::Cancelled { .. })));
         loop_task.await.unwrap();
         assert!(!broker.resolve(&perm_id, true));
+        assert!(committed_history(&events).iter().any(|m| {
+            m.tool_call_id.as_deref() == Some("call_0")
+                && m.content.as_deref() == Some(INTERRUPTED_TOOL_RESULT)
+        }));
+    }
+
+    #[test]
+    fn test_close_unanswered_tool_calls_fills_only_missing_results() {
+        let mut history = vec![
+            make_user("go"),
+            make_tool_call_msg(vec![
+                ("a", "read"),
+                ("b", "bash"),
+                ("c", "read"),
+            ]),
+            make_tool_result("a", "done"),
+        ];
+        close_unanswered_tool_calls(&mut history, 0);
+        let results: Vec<(&str, &str)> = history
+            .iter()
+            .filter_map(|m| {
+                Some((m.tool_call_id.as_deref()?, m.content.as_deref()?))
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                ("a", "done"),
+                ("b", INTERRUPTED_TOOL_RESULT),
+                ("c", INTERRUPTED_TOOL_RESULT),
+            ]
+        );
+        // Idempotent, and a no-op for complete or tool-free histories.
+        let before = history.len();
+        close_unanswered_tool_calls(&mut history, 0);
+        assert_eq!(history.len(), before);
+        let mut plain = vec![make_user("hi"), make_assistant("hello")];
+        close_unanswered_tool_calls(&mut plain, 0);
+        assert_eq!(plain.len(), 2);
+        // Calls before `from` belong to earlier history and are left alone.
+        let mut earlier =
+            vec![make_tool_call_msg(vec![("z", "read")]), make_user("new")];
+        close_unanswered_tool_calls(&mut earlier, 1);
+        assert_eq!(earlier.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_each_step_is_committed_before_the_next_starts() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let tools: Arc<ToolRegistry> =
+            Arc::new(ToolRegistry::new(vec![Box::new(NamedTool("guarded"))]));
+        let permissions = std::collections::HashMap::from([(
+            "guarded".to_string(),
+            crate::config::Permission::Allow,
+        )]);
+        run_loop(
+            RunConfig {
+                provider: single_tool_call_then_stop("guarded"),
+                tools,
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions,
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: PermissionBroker::default(),
+            },
+            "hi".into(),
+            vec![make_user("earlier"), make_assistant("reply")],
+        )
+        .await;
+        let events = events_until_terminal(&mut events_rx).await;
+        let commits: Vec<&Vec<ChatMessage>> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessagesCommitted(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        // The user message right away, then step 1 (tool call + result),
+        // then step 2 (final answer). Prior history is never re-committed.
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].len(), 1);
+        assert_eq!(commits[0][0].content.as_deref(), Some("hi"));
+        assert_eq!(commits[1].len(), 2);
+        assert_eq!(commits[1][1].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(commits[2].len(), 1);
+        assert_eq!(commits[2][0].content.as_deref(), Some("done"));
+        // Step 1 is committed right after its TurnDone, before step 2.
+        let first_turn_done = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnDone { .. }))
+            .unwrap();
+        assert!(matches!(
+            events[first_turn_done + 1],
+            AgentEvent::MessagesCommitted(_)
+        ));
     }
 
     #[test]

@@ -321,6 +321,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                                 });
                             }
                             app.compaction_state = session.compaction;
+                            app.server_context_chars = session.context_chars;
                             app.active_session_id = Some(id.clone());
                             app.scroll_to_bottom();
                             app.messages.push(
@@ -564,11 +565,21 @@ fn start_compaction(
     include_latest_user: bool,
     background_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
 ) {
-    let history = app.compact_history_messages(include_latest_user);
-    if history.is_empty() && app.compaction_state.is_none() {
+    // The server compacts its own transcript of the session; the local
+    // view only decides whether there is anything worth compacting.
+    let nothing_new =
+        app.compact_history_messages(include_latest_user).is_empty();
+    if app.active_session_id.is_none() || nothing_new {
+        // Don't ask again for this message; if it was an auto-compaction
+        // prompt, the message is still sent (`pending_auto_compact_send`).
+        app.suppress_auto_compact_for_latest_message();
         app.messages.push(self::state::DisplayMessage::command(
             crate::llm::Role::Assistant,
-            "Nothing new to compact.".into(),
+            if app.active_session_id.is_none() {
+                "Nothing to compact yet.".into()
+            } else {
+                "Nothing new to compact.".into()
+            },
         ));
         app.touch_response_render();
         return;
@@ -580,8 +591,8 @@ fn start_compaction(
         agent: app.request_agent().to_string(),
         model_override,
         provider_override,
-        history,
-        prior_compaction: app.compaction_state.clone(),
+        history: Vec::new(),
+        prior_compaction: None,
         session_id: app.active_session_id.clone(),
         workspace_root: Some(app.workspace_root.clone()),
         repo_agents_md: app.repo_agents_md.clone(),
@@ -734,22 +745,23 @@ fn build_chat_request(
 ) -> marshaling_protocol::ChatRequest {
     let (model_override, provider_override) =
         app.current_model_override_parts();
-    let history = app.compact_history_messages(false);
 
+    // Only the new message is sent: the server continues the session from
+    // its own transcript (full tool history included).
     marshaling_protocol::ChatRequest {
         message: user_msg,
         agent: app.request_agent().to_string(),
         model_override,
         provider_override,
         session_id: app.active_session_id.clone(),
-        history,
+        history: Vec::new(),
         workspace_root: Some(app.workspace_root.clone()),
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
         run_id: None,
         replay_from: None,
         client_instance_id: Some(app.client_instance_id.clone()),
-        compaction: app.compaction_state.clone(),
+        compaction: None,
     }
 }
 
@@ -784,9 +796,14 @@ fn handle_server_event(
 ) {
     use marshaling_protocol::ServerEvent;
     match event {
-        ServerEvent::RunStarted { run_id } => {
+        ServerEvent::RunStarted { run_id, session_id } => {
             app.lost_run = None;
             app.active_run_id = Some(run_id);
+            // The server owns the conversation; for a new one it reports the
+            // session id, which later requests must send to continue it.
+            if let Some(session_id) = session_id {
+                app.active_session_id = Some(session_id);
+            }
         }
         ServerEvent::RunAttached { run_id } => {
             app.active_run_id = Some(run_id);
@@ -1027,6 +1044,9 @@ fn handle_server_event(
                 },
             });
             app.touch_response_render();
+        }
+        ServerEvent::ContextSize { chars } => {
+            app.server_context_chars = Some(chars);
         }
         ServerEvent::Retrying {
             attempt,
@@ -2128,8 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_chat_request_includes_compaction_and_skips_compacted_history()
-    {
+    fn test_build_chat_request_sends_only_the_new_message() {
         let cfg = test_ui_config();
         let mut app = App::new_with_workspace(
             &cfg,
@@ -2150,6 +2169,7 @@ mod tests {
                 source: super::state::MessageSource::Conversation,
             });
         }
+        app.active_session_id = Some("chat-1".into());
         app.compaction_state = Some(marshaling_protocol::CompactionState {
             summary: "old summary".into(),
             compacted_message_count: 2,
@@ -2159,8 +2179,74 @@ mod tests {
 
         let req = build_chat_request(&app, "latest".into());
 
+        // The server continues the session from its own transcript.
+        assert_eq!(req.message, "latest");
+        assert_eq!(req.session_id.as_deref(), Some("chat-1"));
         assert!(req.history.is_empty());
-        assert_eq!(req.compaction.as_ref().unwrap().summary, "old summary");
+        assert!(req.compaction.is_none());
+    }
+
+    #[test]
+    fn test_run_started_adopts_server_session_id() {
+        let mut app = reattach_test_app();
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::RunStarted {
+                run_id: "run_1".into(),
+                session_id: Some("chat-new".into()),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.active_session_id.as_deref(), Some("chat-new"));
+        // An event without a session id (older server) keeps the current one.
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::RunStarted {
+                run_id: "run_2".into(),
+                session_id: None,
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.active_session_id.as_deref(), Some("chat-new"));
+    }
+
+    #[test]
+    fn test_apply_compaction_marks_local_position_before_pending_message() {
+        let mut app = reattach_test_app();
+        for (role, content) in [
+            (crate::llm::Role::User, "a"),
+            (crate::llm::Role::Assistant, "b"),
+            (crate::llm::Role::User, "unsent"),
+        ] {
+            app.messages.push(super::state::DisplayMessage {
+                role,
+                content: content.into(),
+                thinking: None,
+                source: super::state::MessageSource::Conversation,
+            });
+        }
+        app.apply_compaction(
+            "chat-1".into(),
+            marshaling_protocol::CompactionState {
+                summary: "s".into(),
+                // The server's transcript count; not meaningful locally.
+                compacted_message_count: 17,
+                model_provider: "p".into(),
+                model_id: "m".into(),
+            },
+        );
+        assert_eq!(
+            app.compaction_state
+                .as_ref()
+                .unwrap()
+                .compacted_message_count,
+            2
+        );
+        // Only the unsent message is outside the compacted range.
+        let rest = app.compact_history_messages(true);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].content, "unsent");
     }
 
     #[test]
@@ -2432,7 +2518,8 @@ mod tests {
         use marshaling_protocol::ServerEvent;
         let mut app = reattach_test_app();
         assert!(app.accept_run_log_event(&ServerEvent::RunStarted {
-            run_id: "run_1".into()
+            run_id: "run_1".into(),
+            session_id: None,
         }));
         assert!(app.accept_run_log_event(&text_delta("a")));
         assert!(app.accept_run_log_event(&ServerEvent::RunAttached {
@@ -2447,7 +2534,8 @@ mod tests {
 
         // A new run restarts the count.
         assert!(app.accept_run_log_event(&ServerEvent::RunStarted {
-            run_id: "run_2".into()
+            run_id: "run_2".into(),
+            session_id: None,
         }));
         assert_eq!(app.run_event_count, 1);
     }
@@ -2458,7 +2546,8 @@ mod tests {
         let mut app = reattach_test_app();
         app.skip_run_log_events = 2;
         assert!(!app.accept_run_log_event(&ServerEvent::RunStarted {
-            run_id: "run_1".into()
+            run_id: "run_1".into(),
+            session_id: None,
         }));
         assert!(!app.accept_run_log_event(&text_delta("a")));
         assert!(app.accept_run_log_event(&text_delta("b")));
@@ -2680,6 +2769,7 @@ mod tests {
             &mut app,
             marshaling_protocol::ServerEvent::RunStarted {
                 run_id: "run_2".into(),
+                session_id: None,
             },
             &mut chat_stream,
         );
@@ -2802,5 +2892,66 @@ mod tests {
         assert!(notice.contains("partial response discarded"), "{notice}");
         // Notices are not conversation, so they are never sent to the model.
         assert!(app.pending_user_message_content().is_none());
+    }
+
+    #[test]
+    fn test_server_context_size_drives_auto_compact_prompt() {
+        let mut app = reattach_test_app();
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "short question".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+        // The local text view is tiny...
+        assert!(!app.needs_auto_compact());
+        // ...but the server reports a large history (tool output).
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::ContextSize { chars: 500_000 },
+            &mut chat_stream,
+        );
+        assert!(app.needs_auto_compact());
+        // After compaction the figure is unknown until the next run.
+        app.apply_compaction(
+            "chat-1".into(),
+            marshaling_protocol::CompactionState {
+                summary: "s".into(),
+                compacted_message_count: 0,
+                model_provider: "p".into(),
+                model_id: "m".into(),
+            },
+        );
+        assert_eq!(app.server_context_chars, None);
+    }
+
+    #[test]
+    fn test_session_busy_replay_never_switches_session() {
+        let mut app = reattach_test_app();
+        app.active_session_id = Some("chat-mine".into());
+        app.start_agent();
+        // Busy with an earlier run from a conversation we left: discarded.
+        app.handle_session_busy("run_old".into());
+        assert!(app.discarding_run);
+        let replayed = marshaling_protocol::ServerEvent::RunStarted {
+            run_id: "run_old".into(),
+            session_id: Some("chat-other".into()),
+        };
+        // The event loop routes events to the discard path, never to
+        // handle_server_event, while discarding.
+        assert!(replayed.is_run_log_event());
+        assert_eq!(app.active_session_id.as_deref(), Some("chat-mine"));
+
+        // Busy with our own lost run: the replayed RunStarted is skipped.
+        let mut app = reattach_test_app();
+        app.active_session_id = Some("chat-mine".into());
+        app.lost_run = Some(("run_1".into(), 3));
+        app.handle_session_busy("run_1".into());
+        let replayed = marshaling_protocol::ServerEvent::RunStarted {
+            run_id: "run_1".into(),
+            session_id: Some("chat-mine".into()),
+        };
+        assert!(!app.accept_run_log_event(&replayed));
     }
 }

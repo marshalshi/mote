@@ -25,6 +25,7 @@ mod history;
 mod llm;
 mod prompt;
 mod session;
+mod store;
 mod tools;
 
 const COMPACTION_CONTEXT_MARKER: &str = "[mote compacted conversation context]";
@@ -44,6 +45,20 @@ struct AppState {
     runs: tokio::sync::Mutex<HashMap<String, ActiveRun>>,
     /// Terminal runs retained for short-lived reconnect/replay only.
     completed_run_ids: tokio::sync::Mutex<VecDeque<String>>,
+    /// Per-transcript locks serializing writes (runs, compaction,
+    /// legacy conversion) to the same session file.
+    session_locks:
+        tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AppState {
+    async fn session_lock(
+        &self,
+        path: &std::path::Path,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        Arc::clone(locks.entry(path.to_path_buf()).or_default())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +96,9 @@ struct ActiveRun {
     /// Client instance that started this run; at most one unfinished run is
     /// allowed per instance.
     client_instance_id: Option<String>,
+    /// Transcript this run appends to; at most one unfinished run per
+    /// session.
+    session_path: Option<PathBuf>,
     events: Vec<marshaling_protocol::ServerEvent>,
     tx: broadcast::Sender<marshaling_protocol::ServerEvent>,
     cancel_tx: watch::Sender<bool>,
@@ -107,6 +125,7 @@ impl ActiveRun {
     fn new(
         runtime_session_key: String,
         client_instance_id: Option<String>,
+        session_path: Option<PathBuf>,
         cancel_tx: watch::Sender<bool>,
         permission_broker: agent::PermissionBroker,
     ) -> Self {
@@ -114,6 +133,7 @@ impl ActiveRun {
         Self {
             runtime_session_key,
             client_instance_id,
+            session_path,
             events: Vec::new(),
             tx,
             cancel_tx,
@@ -186,19 +206,35 @@ impl ActiveRun {
     }
 }
 
-/// Insert `run` unless `client_instance_id` already owns an unfinished run.
-/// Check and insert happen under one lock so two concurrent requests from the
-/// same client cannot both start a run. Returns the busy run id on conflict.
+/// Why a new run could not start.
+#[derive(Debug, PartialEq)]
+enum RunSlotConflict {
+    /// The same client instance already has this unfinished run.
+    SameClient(String),
+    /// Another client has an unfinished run on the same session.
+    SessionBusy(String),
+}
+
+/// Insert `run` unless its client instance or its session already has an
+/// unfinished run. Check and insert happen under one lock so two concurrent
+/// requests cannot both start a run.
 fn claim_run_slot(
     runs: &mut HashMap<String, ActiveRun>,
     run_id: &str,
     run: ActiveRun,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), RunSlotConflict> {
     if let Some(instance) = run.client_instance_id.as_deref() {
         if let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
             !r.finished && r.client_instance_id.as_deref() == Some(instance)
         }) {
-            return Err(busy_id.clone());
+            return Err(RunSlotConflict::SameClient(busy_id.clone()));
+        }
+    }
+    if let Some(path) = run.session_path.as_deref() {
+        if let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
+            !r.finished && r.session_path.as_deref() == Some(path)
+        }) {
+            return Err(RunSlotConflict::SessionBusy(busy_id.clone()));
         }
     }
     runs.insert(run_id.to_string(), run);
@@ -299,6 +335,118 @@ async fn get_config(
     })
 }
 
+/// Sessions in `dir`, newest first: transcripts, plus legacy `.md` sessions
+/// that have not been converted yet.
+fn session_infos(
+    dir: &std::path::Path,
+) -> Vec<marshaling_protocol::SessionInfo> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(
+        std::time::SystemTime,
+        marshaling_protocol::SessionInfo,
+    )> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let info = match path.extension().and_then(|e| e.to_str()) {
+            Some("jsonl") => match store::load(&path) {
+                Ok(transcript) => marshaling_protocol::SessionInfo {
+                    id: transcript.id.clone(),
+                    created: transcript.created.to_rfc3339(),
+                    model: format!(
+                        "{}/{}",
+                        transcript.model_provider, transcript.model_id
+                    ),
+                    message_count: transcript.display_messages().len(),
+                    summary: transcript.summary(),
+                },
+                Err(e) => {
+                    tracing::warn!("Skipping unreadable session: {e:#}");
+                    continue;
+                }
+            },
+            Some("md") if !path.with_extension("jsonl").exists() => {
+                match history::parse_file(&path) {
+                    Ok((meta, messages)) => marshaling_protocol::SessionInfo {
+                        id: meta.id,
+                        created: meta.created.to_rfc3339(),
+                        model: format!(
+                            "{}/{}",
+                            meta.model_provider, meta.model_id
+                        ),
+                        message_count: messages.len(),
+                        summary: meta.summary,
+                    },
+                    Err(_) => continue,
+                }
+            }
+            _ => continue,
+        };
+        found.push((modified, info));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, info)| info).collect()
+}
+
+/// A session for display: from its transcript, or from a legacy `.md` file.
+fn load_session_data(
+    dir: &std::path::Path,
+    id: &str,
+) -> Option<marshaling_protocol::SessionData> {
+    let path = store::transcript_path(dir, id);
+    if path.exists() {
+        let transcript = store::load(&path)
+            .map_err(|e| tracing::warn!("Failed to load session {id}: {e:#}"))
+            .ok()?;
+        let messages = transcript
+            .display_messages()
+            .into_iter()
+            .filter_map(|(role, content)| {
+                Some(marshaling_protocol::HistoryMessage {
+                    role: protocol_role_for_session(role)?.into(),
+                    content,
+                })
+            })
+            .collect();
+        return Some(marshaling_protocol::SessionData {
+            id: transcript.id.clone(),
+            created: transcript.created.to_rfc3339(),
+            model: format!(
+                "{}/{}",
+                transcript.model_provider, transcript.model_id
+            ),
+            compaction: protocol_compaction(&transcript),
+            context_chars: Some(store::history_chars(&model_history(
+                &transcript,
+            ))),
+            messages,
+        });
+    }
+    let (meta, messages) =
+        history::parse_file(&dir.join(format!("{id}.md"))).ok()?;
+    Some(marshaling_protocol::SessionData {
+        id: meta.id,
+        created: meta.created.to_rfc3339(),
+        model: format!("{}/{}", meta.model_provider, meta.model_id),
+        messages: messages
+            .into_iter()
+            .filter_map(|m| {
+                Some(marshaling_protocol::HistoryMessage {
+                    role: protocol_role_for_session(m.role)?.into(),
+                    content: m.content,
+                })
+            })
+            .collect(),
+        compaction: meta.compaction,
+        context_chars: None,
+    })
+}
+
 /// GET /sessions
 async fn list_sessions(
     headers: HeaderMap,
@@ -312,33 +460,9 @@ async fn list_sessions(
         &state.config.history.dir,
         &runtime_session_key,
     );
-    let items = tokio::task::spawn_blocking(
-        move || -> Vec<marshaling_protocol::SessionInfo> {
-            match history::list_sessions(&hist_dir) {
-                Ok(sessions) => sessions
-                    .into_iter()
-                    .map(|(meta, path)| {
-                        let msg_count = history::parse_file(&path)
-                            .map(|(_, msgs)| msgs.len())
-                            .unwrap_or(0);
-                        marshaling_protocol::SessionInfo {
-                            id: meta.id,
-                            created: meta.created.to_rfc3339(),
-                            model: format!(
-                                "{}/{}",
-                                meta.model_provider, meta.model_id
-                            ),
-                            message_count: msg_count,
-                            summary: meta.summary,
-                        }
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
-        },
-    )
-    .await
-    .unwrap_or_default();
+    let items = tokio::task::spawn_blocking(move || session_infos(&hist_dir))
+        .await
+        .unwrap_or_default();
     Ok(Json(items))
 }
 
@@ -353,37 +477,15 @@ async fn load_session(
     }
     let runtime_session_key = runtime_session_key_from_headers(&headers)
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let path = history_dir_for_session(
+    let dir = history_dir_for_session(
         &state.config.history.dir,
         &runtime_session_key,
-    )
-    .join(format!("{id}.md"));
-    let result =
-        tokio::task::spawn_blocking(move || history::parse_file(&path))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match result {
-        Ok((meta, messages)) => {
-            let msgs: Vec<marshaling_protocol::HistoryMessage> = messages
-                .into_iter()
-                .filter_map(|m| {
-                    let role = protocol_role_for_session(m.role)?;
-                    Some(marshaling_protocol::HistoryMessage {
-                        role: role.into(),
-                        content: m.content,
-                    })
-                })
-                .collect();
-            Ok(Json(marshaling_protocol::SessionData {
-                id: meta.id,
-                created: meta.created.to_rfc3339(),
-                model: format!("{}/{}", meta.model_provider, meta.model_id),
-                messages: msgs,
-                compaction: meta.compaction,
-            }))
-        }
-        Err(_) => Err(StatusCode::NOT_FOUND),
-    }
+    );
+    tokio::task::spawn_blocking(move || load_session_data(&dir, &id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// DELETE /sessions/:id — delete a saved session.
@@ -399,17 +501,39 @@ async fn delete_session(
     else {
         return StatusCode::BAD_REQUEST;
     };
-    let path = history_dir_for_session(
+    let dir = history_dir_for_session(
         &state.config.history.dir,
         &runtime_session_key,
-    )
-    .join(format!("{id}.md"));
+    );
+    // Deleting under a running run would let its next append recreate a
+    // headerless (unreadable) transcript.
+    let transcript = store::transcript_path(&dir, &id);
+    // Hold the session lock so no run or compaction writes to (and no
+    // legacy conversion recreates) the files while they are removed.
+    let session_lock = state.session_lock(&transcript).await;
+    let _guard = session_lock.lock().await;
+    let busy = state.runs.lock().await.values().any(|run| {
+        !run.finished
+            && run.session_path.as_deref() == Some(transcript.as_path())
+    });
+    if busy {
+        return StatusCode::CONFLICT;
+    }
+    // Remove the transcript and any legacy `.md` copy of the session.
+    let paths = [
+        store::transcript_path(&dir, &id),
+        dir.join(format!("{id}.md")),
+    ];
     let result = tokio::task::spawn_blocking(move || {
-        if path.exists() {
-            match std::fs::remove_file(&path) {
-                Ok(_) => StatusCode::OK,
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        let mut found = false;
+        for path in paths.iter().filter(|p| p.exists()) {
+            found = true;
+            if std::fs::remove_file(path).is_err() {
+                return StatusCode::INTERNAL_SERVER_ERROR;
             }
+        }
+        if found {
+            StatusCode::OK
         } else {
             StatusCode::NOT_FOUND
         }
@@ -538,26 +662,62 @@ async fn compact_conversation(
     .await?;
     drop(auth_guard);
 
-    let prior_count = request
-        .prior_compaction
-        .as_ref()
-        .map(|c| c.compacted_message_count)
-        .unwrap_or(0);
-    let compacted_message_count = prior_count + request.history.len();
-    if compacted_message_count == 0 {
-        anyhow::bail!("Nothing to compact");
+    // Compaction works on the server-side transcript; the client's
+    // `history` / `prior_compaction` fields are ignored.
+    let Some(session_id) = request.session_id.clone() else {
+        anyhow::bail!("Nothing to compact yet");
+    };
+    let dir = history_dir_for_session(
+        &state.config.history.dir,
+        &req_ctx.runtime_session_key,
+    );
+    let path = store::transcript_path(&dir, &session_id);
+    let session_lock = state.session_lock(&path).await;
+    // Load under the lock but release it for the (slow) summarization, so
+    // a running run's appends are not held up; messages appended meanwhile
+    // are simply outside the compacted range.
+    let mut transcript = {
+        let _guard = session_lock.lock().await;
+        let dir = dir.clone();
+        let id = session_id.clone();
+        tokio::task::spawn_blocking(move || load_or_convert_session(&dir, &id))
+            .await
+            .map_err(|e| anyhow::anyhow!("session load task failed: {e}"))??
+    };
+    if transcript.messages.is_empty() {
+        anyhow::bail!("Nothing to compact yet");
     }
+    let compacted_upto = transcript.compaction.as_ref().map(|c| c.upto_seq);
+    let pending: Vec<&store::StoredMessage> = transcript
+        .messages
+        .iter()
+        .filter(|m| compacted_upto.is_none_or(|upto| m.seq > upto))
+        .collect();
+    if pending.is_empty() {
+        anyhow::bail!("Nothing new to compact");
+    }
+    let pending_messages: Vec<llm::ChatMessage> =
+        pending.iter().map(|m| m.message.clone()).collect();
+    let cut = compaction_cut(&pending_messages);
+    if cut < pending.len() {
+        tracing::info!(
+            "Compacting the oldest {cut} of {} messages to stay within the summarizer input limit",
+            pending.len()
+        );
+    }
+    let upto_seq = pending[cut - 1].seq;
+    let to_compact = &pending_messages[..cut];
 
-    let transcript = compact_transcript_text(
-        request.prior_compaction.as_ref(),
-        &request.history,
+    let transcript_text = compact_transcript_text(
+        transcript.compaction.as_ref().map(|c| c.summary.as_str()),
+        to_compact,
     );
     let messages = vec![
         llm::ChatMessage::system(
             "You compact chat history for an AI coding assistant. Preserve user goals, constraints, decisions, file paths, commands, test results, unresolved tasks, and important technical details. Do not invent facts. Keep it concise but complete enough for future turns.",
         ),
         llm::ChatMessage::user(format!(
-            "Compact the following conversation context for future continuation. Return only the compacted summary.\n\n{transcript}"
+            "Compact the following conversation context for future continuation. Return only the compacted summary.\n\n{transcript_text}"
         )),
     ];
     let mut opts = ctx.opts.clone();
@@ -570,22 +730,29 @@ async fn compact_conversation(
         anyhow::bail!("Compaction returned an empty summary");
     }
 
-    let compaction = marshaling_protocol::CompactionState {
-        summary,
-        compacted_message_count,
+    let record = store::Record::Compaction {
+        ts: chrono::Utc::now(),
+        upto_seq,
+        summary: summary.clone(),
         model_provider: ctx.eff_provider.clone(),
         model_id: ctx.eff_model_id.clone(),
     };
-    let session_id = persist_compacted_session(
-        &state.config.history.dir,
-        &req_ctx.runtime_session_key,
-        request.session_id.as_deref(),
-        &ctx.eff_provider,
-        &ctx.eff_model_id,
-        &request.history,
-        compaction.clone(),
-    )?;
-
+    {
+        let _guard = session_lock.lock().await;
+        tokio::task::spawn_blocking(move || {
+            store::append(&path, &[record], false)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("session write task failed: {e}"))??;
+    }
+    transcript.compaction = Some(store::StoredCompaction {
+        upto_seq,
+        summary,
+        model_provider: ctx.eff_provider.clone(),
+        model_id: ctx.eff_model_id.clone(),
+    });
+    let compaction = protocol_compaction(&transcript)
+        .context("compaction state missing after compacting")?;
     Ok(marshaling_protocol::CompactResponse {
         session_id,
         compaction,
@@ -613,78 +780,101 @@ fn resolve_compact_request_context(
     resolve_request_context(&chat_request)
 }
 
+/// Longest tool argument / result excerpt included in a compaction prompt.
+const COMPACT_TOOL_ARGS_CHARS: usize = 300;
+const COMPACT_TOOL_RESULT_CHARS: usize = 1500;
+/// Cap on the conversation part of a compaction prompt, so a long session
+/// cannot overflow the summarizer (see `compaction_cut`).
+const MAX_COMPACT_CONVERSATION_CHARS: usize = 150_000;
+
+/// A message rendered for the summarizer, including tool activity (file
+/// paths, commands, results) that a text-only transcript would lose.
+fn compact_part(message: &llm::ChatMessage) -> String {
+    let excerpt = |text: &str, max: usize| {
+        let cut = agent::safe_truncate(text.trim(), max);
+        if cut.len() < text.trim().len() {
+            format!("{cut}…")
+        } else {
+            cut.to_string()
+        }
+    };
+    let content = message.content.as_deref().unwrap_or("").trim();
+    let mut part = String::new();
+    match message.role {
+        llm::Role::User if message.internal_role_task => {
+            part.push_str(&format!("ROLE HANDOFF:\n{content}\n\n"));
+        }
+        llm::Role::User => {
+            part.push_str(&format!("USER:\n{content}\n\n"));
+        }
+        llm::Role::Assistant => {
+            if !content.is_empty() {
+                part.push_str(&format!("ASSISTANT:\n{content}\n\n"));
+            }
+            for call in message.tool_calls.iter().flatten() {
+                part.push_str(&format!(
+                    "ASSISTANT called {}({})\n\n",
+                    call.function.name,
+                    excerpt(&call.function.arguments, COMPACT_TOOL_ARGS_CHARS)
+                ));
+            }
+        }
+        llm::Role::Tool => {
+            part.push_str(&format!(
+                "TOOL RESULT:\n{}\n\n",
+                excerpt(content, COMPACT_TOOL_RESULT_CHARS)
+            ));
+        }
+        llm::Role::System => {}
+    }
+    part
+}
+
+/// How many of `messages` (oldest first) one compaction covers: the longest
+/// prefix whose rendering fits `MAX_COMPACT_CONVERSATION_CHARS` and that
+/// ends at a step boundary (the next message is user input), so a tool call
+/// is never separated from its results. If even the first step is larger,
+/// that step alone. Messages after the cut stay verbatim for the model.
+fn compaction_cut(messages: &[llm::ChatMessage]) -> usize {
+    let starts_step = |m: &llm::ChatMessage| {
+        m.role == llm::Role::User && m.tool_call_id.is_none()
+    };
+    let mut size = 0;
+    let mut best = None;
+    let mut first_boundary = None;
+    for (i, message) in messages.iter().enumerate() {
+        size += compact_part(message).len();
+        let boundary = messages.get(i + 1).is_none_or(starts_step);
+        if !boundary {
+            continue;
+        }
+        first_boundary.get_or_insert(i + 1);
+        if size <= MAX_COMPACT_CONVERSATION_CHARS {
+            best = Some(i + 1);
+        } else {
+            break;
+        }
+    }
+    best.or(first_boundary).unwrap_or(messages.len())
+}
+
+/// The summarizer's input: the previous summary, then `messages`.
 fn compact_transcript_text(
-    prior: Option<&marshaling_protocol::CompactionState>,
-    history: &[marshaling_protocol::HistoryMessage],
+    prior_summary: Option<&str>,
+    messages: &[llm::ChatMessage],
 ) -> String {
     let mut text = String::new();
-    if let Some(prior) = prior {
+    if let Some(prior) = prior_summary {
         text.push_str("<previous_compaction>\n");
-        text.push_str(prior.summary.trim());
+        text.push_str(prior.trim());
         text.push_str("\n</previous_compaction>\n\n");
     }
     text.push_str("<conversation>\n");
-    for msg in history {
-        text.push_str(&format!(
-            "{}:\n{}\n\n",
-            msg.role.to_uppercase(),
-            msg.content.trim()
-        ));
+    for message in messages {
+        text.push_str(&compact_part(message));
     }
     text.push_str("</conversation>");
     text
-}
-
-fn persist_compacted_session(
-    history_base_dir: &std::path::Path,
-    runtime_session_key: &str,
-    selected_session_id: Option<&str>,
-    provider: &str,
-    model_id: &str,
-    history: &[marshaling_protocol::HistoryMessage],
-    compaction: marshaling_protocol::CompactionState,
-) -> Result<String> {
-    let mut session =
-        session::Session::new(provider.to_string(), model_id.to_string());
-    let mut preserved_summary: Option<String> = None;
-    for msg in history {
-        let role = match msg.role.as_str() {
-            "user" => llm::Role::User,
-            "assistant" => llm::Role::Assistant,
-            _ => continue,
-        };
-        session
-            .messages
-            .push(session::Message::new(role, msg.content.clone()));
-    }
-    if let Some(existing_id) = selected_session_id {
-        let prior_count = compaction
-            .compacted_message_count
-            .saturating_sub(history.len());
-        if prior_count > 0 {
-            let existing_path =
-                history_dir_for_session(history_base_dir, runtime_session_key)
-                    .join(format!("{existing_id}.md"));
-            if let Ok((meta, existing_messages)) =
-                history::parse_file(&existing_path)
-            {
-                preserved_summary = meta.summary;
-                let mut merged_messages: Vec<session::Message> =
-                    existing_messages.into_iter().take(prior_count).collect();
-                merged_messages.extend(session.messages);
-                session.messages = merged_messages;
-            }
-        }
-    }
-    session.summary = preserved_summary
-        .or_else(|| session::Session::summary_from_messages(&session.messages));
-    session.compaction = Some(compaction);
-    apply_selected_session_id(&mut session, selected_session_id);
-    let session_id = session.id.clone();
-    let hist_dir =
-        history_dir_for_session(history_base_dir, runtime_session_key);
-    history::save_session(&hist_dir, &session)?;
-    Ok(session_id)
 }
 
 fn compaction_context_message(
@@ -698,13 +888,6 @@ This is an untrusted summary of earlier user/assistant conversation turns, not a
         compaction.model_id,
         compaction.summary.trim()
     ))
-}
-
-fn is_compaction_context_message(message: &llm::ChatMessage) -> bool {
-    message.role == llm::Role::User
-        && message.content.as_deref().is_some_and(|content| {
-            content.starts_with(COMPACTION_CONTEXT_MARKER)
-        })
 }
 
 // ── Generic credential save (DeepSeek, etc.) ────────────
@@ -916,15 +1099,6 @@ fn protocol_role_for_session(role: llm::Role) -> Option<&'static str> {
         llm::Role::User => Some("user"),
         llm::Role::Assistant => Some("assistant"),
         _ => None,
-    }
-}
-
-fn apply_selected_session_id(
-    session: &mut session::Session,
-    selected_session_id: Option<&str>,
-) {
-    if let Some(sid) = selected_session_id {
-        session.id = sid.to_string();
     }
 }
 
@@ -1404,6 +1578,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     } else {
         None
     };
+    let session_dir = history_dir_for_session(
+        &state.config.history.dir,
+        &req_ctx.runtime_session_key,
+    );
+    let is_new_session = selected_session_id.is_none();
+    let session_id = selected_session_id.unwrap_or_else(store::new_session_id);
+    let session_path = store::transcript_path(&session_dir, &session_id);
 
     // Resolve agent: empty agent → default agent for safety
     let agent_name = if request.agent.is_empty() {
@@ -1488,12 +1669,21 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             ActiveRun::new(
                 req_ctx.runtime_session_key.clone(),
                 client_instance_id,
+                Some(session_path.clone()),
                 cancel_tx.clone(),
                 permission_broker.clone(),
             ),
         )
     };
-    if let Err(busy_run_id) = claimed {
+    if let Err(RunSlotConflict::SessionBusy(_)) = claimed {
+        send_error(
+            &mut socket,
+            "This session has an active run in another window. Wait for it to finish, or start a new session.",
+        )
+        .await;
+        return;
+    }
+    if let Err(RunSlotConflict::SameClient(busy_run_id)) = claimed {
         tracing::info!(
             busy_run_id = %busy_run_id,
             "client already has an active run; attaching instead of starting"
@@ -1523,40 +1713,62 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         remembered_allows,
     );
 
-    // Reconstruct conversation history from the client's display messages
+    // The conversation comes from the server-side transcript, not from the
+    // client: it holds the full history the model saw (tool calls, results,
+    // reasoning). `request.history` / `request.compaction` are ignored.
     let user_msg = request.message.clone();
-    let mut history: Vec<llm::ChatMessage> = Vec::new();
-    if let Some(compaction) = &request.compaction {
-        history.push(compaction_context_message(compaction));
-    }
-    for hm in &request.history {
-        match hm.role.as_str() {
-            "user" => history.push(llm::ChatMessage::user(&hm.content)),
-            "assistant" => {
-                history.push(llm::ChatMessage::assistant_text(&hm.content))
-            }
-            _ => {}
+    let session_lock = state.session_lock(&session_path).await;
+    let opened = {
+        let _guard = session_lock.lock().await;
+        let dir = session_dir.clone();
+        let id = session_id.clone();
+        let path = session_path.clone();
+        let provider = ctx.eff_provider.clone();
+        let model_id = ctx.eff_model_id.clone();
+        tokio::task::spawn_blocking(move || {
+            open_run_session(dir, id, path, is_new_session, provider, model_id)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("session open task failed: {e}"))
+        .and_then(|result| result)
+    };
+    let (writer, history) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            // The run never started: release its slot.
+            state.runs.lock().await.remove(&run_id);
+            send_error(&mut socket, format!("{e:#}")).await;
+            return;
         }
-    }
+    };
 
     // Finalize options. `agent::run_loop` derives the advertised tool list from
     // the effective permissions so denied tools stay invisible to the model.
     let mut opts = ctx.opts;
     opts.tools = Vec::new();
 
-    let eff_model_id_save = ctx.eff_model_id.clone();
+    let eff_model_id = ctx.eff_model_id.clone();
     let eff_provider = ctx.eff_provider;
     let max_steps = state.config.server.max_steps;
     let augmented_tools_spawn = augmented_tools.clone();
     let prov_spawn = ctx.provider;
     let workspace_display = req_ctx.workspace_display.clone();
-    let compaction_for_save = request.compaction.clone();
+    let context_chars = store::history_chars(&history);
 
     record_run_event(
         &state,
         &run_id,
         marshaling_protocol::ServerEvent::RunStarted {
             run_id: run_id.clone(),
+            session_id: Some(session_id.clone()),
+        },
+    )
+    .await;
+    record_run_event(
+        &state,
+        &run_id,
+        marshaling_protocol::ServerEvent::ContextSize {
+            chars: context_chars,
         },
     )
     .await;
@@ -1588,14 +1800,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         .instrument(agent_span),
     );
 
-    let save_ctx = RunSaveContext {
-        model_id: eff_model_id_save,
-        provider: eff_provider,
-        agent_name,
-        selected_session_id,
-        history_dir: state.config.history.dir.clone(),
+    // In role mode, the model identity is the orchestrator's (roles[0]) —
+    // intentional canonical metadata for session lists.
+    let save_ctx = RunPersistence {
+        session_lock,
+        writer: Some(writer),
         runtime_session_key: req_ctx.runtime_session_key.clone(),
-        compaction: compaction_for_save,
+        model_provider: eff_provider,
+        model_id: eff_model_id,
+        context_chars,
     };
     tokio::spawn(supervise_forwarder(
         Arc::clone(&state),
@@ -1612,40 +1825,176 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     attach_socket_to_run(socket, state, run_id, 0).await;
 }
 
-/// Everything needed to persist a run's history when it reaches a terminal
-/// state.
-struct RunSaveContext {
+/// Open the transcript a run appends to, returning its writer and the
+/// history the model starts from. Blocking; run under the session lock.
+fn open_run_session(
+    dir: PathBuf,
+    session_id: String,
+    path: PathBuf,
+    is_new_session: bool,
+    model_provider: String,
     model_id: String,
-    provider: String,
-    agent_name: String,
-    selected_session_id: Option<String>,
-    history_dir: PathBuf,
-    runtime_session_key: String,
-    compaction: Option<marshaling_protocol::CompactionState>,
+) -> Result<(store::TranscriptWriter, Vec<llm::ChatMessage>)> {
+    if is_new_session {
+        let writer = store::TranscriptWriter::create(
+            path,
+            session_id,
+            model_provider,
+            model_id,
+        );
+        return Ok((writer, Vec::new()));
+    }
+    let transcript = load_or_convert_session(&dir, &session_id)?;
+    let history = model_history(&transcript);
+    Ok((store::TranscriptWriter::resume(path, &transcript), history))
 }
 
-impl RunSaveContext {
-    fn save(
-        &self,
-        history: Vec<llm::ChatMessage>,
-        tokens_input: u64,
-        tokens_output: u64,
+/// Load session `id`, converting a legacy text-only `.md` session into a
+/// transcript on first use (the `.md` file is left untouched). Blocking;
+/// run under the session lock.
+///
+/// Every loader that continues or compacts a session goes through here, so
+/// they all see the repaired transcript (see `repair_unanswered_calls`).
+fn load_or_convert_session(
+    dir: &std::path::Path,
+    id: &str,
+) -> Result<store::Transcript> {
+    let path = store::transcript_path(dir, id);
+    if !path.exists() {
+        let legacy = dir.join(format!("{id}.md"));
+        if !legacy.exists() {
+            anyhow::bail!("Unknown session: {id}");
+        }
+        let (meta, messages) = history::parse_file(&legacy)?;
+        store::append(
+            &path,
+            &store::legacy_records(id, &meta, &messages),
+            true,
+        )?;
+        tracing::info!("Converted legacy session {id} to {}", path.display());
+    }
+    repair_unanswered_calls(&path, store::load(&path)?)
+}
+
+/// A crash can cut a step short, leaving tool calls without results. Answer
+/// them on disk, right after that step, before anything else is appended or
+/// compacted: an in-memory fix would stop applying once later messages
+/// follow it, and a compaction covering the step would orphan a result
+/// added afterwards. Blocking; run under the session lock.
+fn repair_unanswered_calls(
+    path: &std::path::Path,
+    transcript: store::Transcript,
+) -> Result<store::Transcript> {
+    let mut messages: Vec<llm::ChatMessage> = transcript
+        .messages
+        .iter()
+        .map(|m| m.message.clone())
+        .collect();
+    let stored = messages.len();
+    agent::close_unanswered_tool_calls(&mut messages, 0);
+    if messages.len() == stored {
+        return Ok(transcript);
+    }
+    tracing::warn!(
+        "Answering {} tool call(s) left unanswered in {}",
+        messages.len() - stored,
+        path.display()
+    );
+    store::TranscriptWriter::resume(path.to_path_buf(), &transcript)
+        .append_messages(&messages[stored..])?;
+    store::load(path)
+}
+
+/// The history the model sees: the compaction summary (if any), then every
+/// message after the compacted range.
+fn model_history(transcript: &store::Transcript) -> Vec<llm::ChatMessage> {
+    let mut history = Vec::new();
+    if let Some(compaction) = protocol_compaction(transcript) {
+        history.push(compaction_context_message(&compaction));
+    }
+    history.extend(transcript.uncompacted_messages());
+    // Steps are written whole, but a crash mid-write can still lose the tail
+    // of one: answer any trailing unanswered tool calls so the history is
+    // valid for providers.
+    agent::close_unanswered_tool_calls(&mut history, 0);
+    history
+}
+
+/// The transcript's compaction as clients see it; the message count is in
+/// display messages.
+fn protocol_compaction(
+    transcript: &store::Transcript,
+) -> Option<marshaling_protocol::CompactionState> {
+    transcript.compaction.as_ref().map(|compaction| {
+        marshaling_protocol::CompactionState {
+            summary: compaction.summary.clone(),
+            compacted_message_count: transcript.compacted_display_count(),
+            model_provider: compaction.model_provider.clone(),
+            model_id: compaction.model_id.clone(),
+        }
+    })
+}
+
+/// Persists one run's conversation as the loop commits it.
+struct RunPersistence {
+    session_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Taken while a blocking write is in flight.
+    writer: Option<store::TranscriptWriter>,
+    runtime_session_key: String,
+    model_provider: String,
+    model_id: String,
+    /// Size of the conversation the model will see next (for clients'
+    /// compaction hints).
+    context_chars: u64,
+}
+
+impl RunPersistence {
+    /// Run a blocking transcript write under the session lock. Failures are
+    /// logged: the run itself continues.
+    async fn write(
+        &mut self,
+        what: &str,
+        f: impl FnOnce(&mut store::TranscriptWriter) -> Result<()> + Send + 'static,
     ) {
-        // In role mode, model_id and provider hold the orchestrator
-        // (roles[0]) identity — this is intentional canonical metadata for
-        // session lists.
-        save_run_session(
-            history,
-            self.model_id.clone(),
-            self.provider.clone(),
-            self.agent_name.clone(),
+        let _guard = self.session_lock.lock().await;
+        let Some(mut writer) = self.writer.take() else {
+            tracing::warn!("transcript writer unavailable; {what} not saved");
+            return;
+        };
+        match tokio::task::spawn_blocking(move || {
+            let result = f(&mut writer);
+            (writer, result)
+        })
+        .await
+        {
+            Ok((writer, result)) => {
+                if let Err(e) = result {
+                    tracing::warn!(
+                        "Failed to save {what} to {}: {e:#}",
+                        writer.path().display()
+                    );
+                }
+                self.writer = Some(writer);
+            }
+            Err(e) => tracing::warn!("transcript write task failed: {e}"),
+        }
+    }
+
+    async fn append_messages(&mut self, messages: Vec<llm::ChatMessage>) {
+        self.write("messages", move |writer| writer.append_messages(&messages))
+            .await;
+    }
+
+    async fn record_run_end(&mut self, tokens_input: u64, tokens_output: u64) {
+        let record = store::Record::RunEnd {
+            ts: chrono::Utc::now(),
             tokens_input,
             tokens_output,
-            self.selected_session_id.clone(),
-            self.history_dir.clone(),
-            self.runtime_session_key.clone(),
-            self.compaction.clone(),
-        );
+            model_provider: self.model_provider.clone(),
+            model_id: self.model_id.clone(),
+        };
+        self.write("run end", move |writer| writer.append_record(record))
+            .await;
     }
 }
 
@@ -1654,17 +2003,29 @@ impl RunSaveContext {
 async fn forward_agent_event(
     state: &Arc<AppState>,
     run_id: &str,
-    save_ctx: &RunSaveContext,
+    save_ctx: &mut RunPersistence,
     agent_event: Result<agent::AgentEvent>,
 ) -> bool {
     match agent_event {
+        Ok(agent::AgentEvent::MessagesCommitted(messages)) => {
+            save_ctx.context_chars += store::history_chars(&messages);
+            save_ctx.append_messages(messages).await;
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::ContextSize {
+                    chars: save_ctx.context_chars,
+                },
+            )
+            .await;
+            false
+        }
         Ok(agent::AgentEvent::Done {
             content,
             tokens_input,
             tokens_output,
-            history,
         }) => {
-            save_ctx.save(history, tokens_input, tokens_output);
+            save_ctx.record_run_end(tokens_input, tokens_output).await;
             record_run_event(
                 state,
                 run_id,
@@ -1681,9 +2042,8 @@ async fn forward_agent_event(
             content,
             tokens_input,
             tokens_output,
-            history,
         }) => {
-            save_ctx.save(history, tokens_input, tokens_output);
+            save_ctx.record_run_end(tokens_input, tokens_output).await;
             record_run_event(
                 state,
                 run_id,
@@ -1700,9 +2060,8 @@ async fn forward_agent_event(
             content,
             tokens_input,
             tokens_output,
-            history,
         }) => {
-            save_ctx.save(history, tokens_input, tokens_output);
+            save_ctx.record_run_end(tokens_input, tokens_output).await;
             record_run_event(
                 state,
                 run_id,
@@ -1759,11 +2118,9 @@ async fn forward_agent_event(
             error,
             tokens_input,
             tokens_output,
-            history,
         }) => {
-            // Keep the work done so far: a failure late in a long run must
-            // not lose every earlier turn.
-            save_ctx.save(history, tokens_input, tokens_output);
+            // The work done so far was already committed step by step.
+            save_ctx.record_run_end(tokens_input, tokens_output).await;
             tracing::error!(
                 run_id = %run_id,
                 error_kind = "agent_stream_error",
@@ -1815,14 +2172,14 @@ async fn forward_agent_events(
     run_id: String,
     mut agent_rx: mpsc::UnboundedReceiver<Result<agent::AgentEvent>>,
     mut run_handle: tokio::task::JoinHandle<()>,
-    save_ctx: RunSaveContext,
+    mut save_ctx: RunPersistence,
 ) {
     let join_result = loop {
         tokio::select! {
             agent_event = agent_rx.recv() => {
                 match agent_event {
                     Some(event) => {
-                        if forward_agent_event(&state, &run_id, &save_ctx, event).await {
+                        if forward_agent_event(&state, &run_id, &mut save_ctx, event).await {
                             return;
                         }
                     }
@@ -1836,7 +2193,7 @@ async fn forward_agent_events(
     // The loop task has finished. Events it sent before returning are still
     // buffered in the channel, so drain them before deciding it ended badly.
     while let Ok(event) = agent_rx.try_recv() {
-        if forward_agent_event(&state, &run_id, &save_ctx, event).await {
+        if forward_agent_event(&state, &run_id, &mut save_ctx, event).await {
             return;
         }
     }
@@ -1896,62 +2253,6 @@ async fn supervise_forwarder(
         )
         .await;
     }
-}
-
-fn save_run_session(
-    history: Vec<llm::ChatMessage>,
-    model_id: String,
-    provider: String,
-    agent_name: String,
-    tokens_input: u64,
-    tokens_output: u64,
-    selected_session_id: Option<String>,
-    history_base_dir: PathBuf,
-    runtime_session_key: String,
-    compaction: Option<marshaling_protocol::CompactionState>,
-) {
-    let chat_history: Vec<llm::ChatMessage> = history
-        .into_iter()
-        .filter(|message| !is_compaction_context_message(message))
-        .collect();
-    let mut session = session::Session::from_chat_history(
-        &model_id,
-        &provider,
-        &agent_name,
-        tokens_input,
-        tokens_output,
-        &chat_history,
-    );
-    let mut preserved_summary: Option<String> = None;
-    if let (Some(existing_id), Some(compaction_state)) =
-        (selected_session_id.as_deref(), compaction.as_ref())
-    {
-        let existing_path =
-            history_dir_for_session(&history_base_dir, &runtime_session_key)
-                .join(format!("{existing_id}.md"));
-        if let Ok((meta, existing_messages)) =
-            history::parse_file(&existing_path)
-        {
-            preserved_summary = meta.summary;
-            let mut merged_messages: Vec<session::Message> = existing_messages
-                .into_iter()
-                .take(compaction_state.compacted_message_count)
-                .collect();
-            merged_messages.extend(session.messages);
-            session.messages = merged_messages;
-        }
-    }
-    session.summary = preserved_summary
-        .or_else(|| session::Session::summary_from_messages(&session.messages));
-    session.compaction = compaction;
-    apply_selected_session_id(&mut session, selected_session_id.as_deref());
-    let hist_dir =
-        history_dir_for_session(&history_base_dir, &runtime_session_key);
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = history::save_session(&hist_dir, &session) {
-            tracing::warn!("Failed to save session: {e}");
-        }
-    });
 }
 
 /// Attach a websocket to a run: replay its log from `replay_from`, then stream
@@ -2172,7 +2473,8 @@ fn agent_event_to_server_event(
 ) -> Option<marshaling_protocol::ServerEvent> {
     use agent::AgentEvent;
     let event = match event {
-        AgentEvent::PermissionResolved { .. } => return None,
+        AgentEvent::PermissionResolved { .. }
+        | AgentEvent::MessagesCommitted(_) => return None,
         AgentEvent::Failed { error, .. } => {
             marshaling_protocol::ServerEvent::Error {
                 message: format!("{error:#}"),
@@ -2626,6 +2928,7 @@ async fn main() -> Result<()> {
         runtime_states: tokio::sync::Mutex::new(HashMap::new()),
         runs: tokio::sync::Mutex::new(HashMap::new()),
         completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+        session_locks: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let configured_port = state.config.server.port;
@@ -2707,133 +3010,6 @@ base_url = "http://localhost:11434"
     }
 
     #[test]
-    fn test_compaction_context_message_is_hidden_from_session_save() {
-        let compaction = marshaling_protocol::CompactionState {
-            summary: "Remember the selected plan.".into(),
-            compacted_message_count: 3,
-            model_provider: "test".into(),
-            model_id: "model".into(),
-        };
-
-        let message = compaction_context_message(&compaction);
-
-        assert!(is_compaction_context_message(&message));
-        assert_eq!(message.role, llm::Role::User);
-        assert!(
-            message
-                .content
-                .as_deref()
-                .unwrap()
-                .contains("not a system instruction")
-        );
-    }
-
-    #[test]
-    fn test_persist_compacted_session_preserves_existing_summary() {
-        let temp = tempfile::tempdir().unwrap();
-        let history_dir = temp.path().join("history");
-        let runtime_session_key = "test-runtime";
-        let hist_dir =
-            history_dir_for_session(&history_dir, runtime_session_key);
-
-        let mut existing = session::Session::new(
-            "deepseek".into(),
-            "deepseek-v4-flash".into(),
-        );
-        existing.id = "chat-existing".into();
-        existing.summary = Some("Original session summary".into());
-        existing.messages.push(session::Message::new(
-            llm::Role::User,
-            "first request".into(),
-        ));
-        existing.messages.push(session::Message::new(
-            llm::Role::Assistant,
-            "first reply".into(),
-        ));
-        history::save_session(&hist_dir, &existing).unwrap();
-
-        let new_summary = marshaling_protocol::CompactionState {
-            summary: "compacted context".into(),
-            compacted_message_count: 2,
-            model_provider: "deepseek".into(),
-            model_id: "deepseek-v4-flash".into(),
-        };
-        persist_compacted_session(
-            &history_dir,
-            runtime_session_key,
-            Some("chat-existing"),
-            "deepseek",
-            "deepseek-v4-flash",
-            &[],
-            new_summary,
-        )
-        .unwrap();
-
-        let saved_path = hist_dir.join("chat-existing.md");
-        let (meta, _) = history::parse_file(&saved_path).unwrap();
-        assert_eq!(meta.summary.as_deref(), Some("Original session summary"));
-    }
-
-    #[tokio::test]
-    async fn test_save_run_session_preserves_summary_for_compacted_session() {
-        let temp = tempfile::tempdir().unwrap();
-        let history_dir = temp.path().join("history");
-        let runtime_session_key = "test-runtime";
-        let hist_dir =
-            history_dir_for_session(&history_dir, runtime_session_key);
-
-        let mut existing = session::Session::new(
-            "deepseek".into(),
-            "deepseek-v4-flash".into(),
-        );
-        existing.id = "chat-existing".into();
-        existing.summary = Some("Original session summary".into());
-        existing.compaction = Some(marshaling_protocol::CompactionState {
-            summary: "old compacted context".into(),
-            compacted_message_count: 2,
-            model_provider: "deepseek".into(),
-            model_id: "deepseek-v4-flash".into(),
-        });
-        existing.messages.push(session::Message::new(
-            llm::Role::User,
-            "first request".into(),
-        ));
-        existing.messages.push(session::Message::new(
-            llm::Role::Assistant,
-            "first reply".into(),
-        ));
-        history::save_session(&hist_dir, &existing).unwrap();
-
-        save_run_session(
-            vec![
-                llm::ChatMessage::user("latest request"),
-                llm::ChatMessage::assistant_text("latest reply"),
-            ],
-            "deepseek-v4-flash".into(),
-            "deepseek".into(),
-            "build".into(),
-            1,
-            1,
-            Some("chat-existing".into()),
-            history_dir.clone(),
-            runtime_session_key.into(),
-            Some(marshaling_protocol::CompactionState {
-                summary: "new compacted context".into(),
-                compacted_message_count: 2,
-                model_provider: "deepseek".into(),
-                model_id: "deepseek-v4-flash".into(),
-            }),
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let saved_path = hist_dir.join("chat-existing.md");
-        let (meta, messages) = history::parse_file(&saved_path).unwrap();
-        assert_eq!(meta.summary.as_deref(), Some("Original session summary"));
-        assert_eq!(messages.len(), 4);
-    }
-
-    #[test]
     fn test_validate_runtime_session_key() {
         assert!(validate_runtime_session_key("abc-123_def:1"));
         assert!(!validate_runtime_session_key(""));
@@ -2893,18 +3069,6 @@ read = "allow"
         assert_eq!(protocol_role_for_session(llm::Role::Tool), None);
     }
 
-    #[test]
-    fn test_apply_selected_session_id_overrides_when_present() {
-        let mut sess = session::Session::new("p".to_string(), "m".to_string());
-        let original = sess.id.clone();
-        apply_selected_session_id(&mut sess, Some("sess-picked"));
-        assert_eq!(sess.id, "sess-picked");
-
-        apply_selected_session_id(&mut sess, None);
-        assert_eq!(sess.id, "sess-picked");
-        assert_ne!(sess.id, original);
-    }
-
     fn empty_test_state(dir: &std::path::Path) -> Arc<AppState> {
         Arc::new(AppState {
             config: test_config(dir.join("history")),
@@ -2913,18 +3077,26 @@ read = "allow"
             runtime_states: tokio::sync::Mutex::new(HashMap::new()),
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+            session_locks: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
-    fn test_save_ctx(dir: &std::path::Path) -> RunSaveContext {
-        RunSaveContext {
-            model_id: "m".into(),
-            provider: "p".into(),
-            agent_name: "build".into(),
-            selected_session_id: None,
-            history_dir: dir.join("history"),
+    fn test_save_ctx(dir: &std::path::Path) -> RunPersistence {
+        RunPersistence {
+            session_lock: Arc::default(),
+            writer: Some(store::TranscriptWriter::create(
+                store::transcript_path(
+                    &dir.join("history").join("sess"),
+                    "chat-test",
+                ),
+                "chat-test".into(),
+                "p".into(),
+                "m".into(),
+            )),
             runtime_session_key: "sess".into(),
-            compaction: None,
+            model_provider: "p".into(),
+            model_id: "m".into(),
+            context_chars: 0,
         }
     }
 
@@ -2936,6 +3108,7 @@ read = "allow"
             ActiveRun::new(
                 "sess".into(),
                 client_instance_id.map(str::to_string),
+                None,
                 cancel_tx,
                 agent::PermissionBroker::default(),
             ),
@@ -2961,7 +3134,7 @@ read = "allow"
         );
         assert_eq!(
             claim_run_slot(&mut runs, "run_2", test_run(Some("tui-a")).0),
-            Err("run_1".to_string())
+            Err(RunSlotConflict::SameClient("run_1".to_string()))
         );
         assert!(!runs.contains_key("run_2"));
         // Other instances and requests without an instance id are unaffected.
@@ -2971,6 +3144,432 @@ read = "allow"
         );
         assert!(claim_run_slot(&mut runs, "run_4", test_run(None).0).is_ok());
         assert!(claim_run_slot(&mut runs, "run_5", test_run(None).0).is_ok());
+    }
+
+    const LEGACY_MD: &str = "---\nid: chat-old\ncreated: 2026-05-25T23:36:58Z\nupdated: 2026-05-25T23:40:00Z\nmodel_provider: ollama\nmodel_id: qwen\ntokens_input: 10\ntokens_output: 5\nversion: 0.1.0\nsummary: What is 99-1?\n---\n\n## User — 23:36:58\nWhat is 99-1?\n\n## Assistant — 23:36:59\n98\n";
+
+    fn write_transcript(
+        dir: &std::path::Path,
+        id: &str,
+        messages: &[llm::ChatMessage],
+    ) {
+        let mut writer = store::TranscriptWriter::create(
+            store::transcript_path(dir, id),
+            id.into(),
+            "p".into(),
+            "m".into(),
+        );
+        writer.append_messages(messages).unwrap();
+    }
+
+    #[test]
+    fn test_claim_run_slot_rejects_second_run_on_same_session() {
+        let mut runs = HashMap::new();
+        let with_session = |instance: &str| {
+            let (mut run, _) = test_run(Some(instance));
+            run.session_path = Some(PathBuf::from("/h/k/chat-1.jsonl"));
+            run
+        };
+        claim_run_slot(&mut runs, "run_1", with_session("tui-a")).unwrap();
+        assert_eq!(
+            claim_run_slot(&mut runs, "run_2", with_session("tui-b")),
+            Err(RunSlotConflict::SessionBusy("run_1".into()))
+        );
+        runs.get_mut("run_1").unwrap().finished = true;
+        assert!(
+            claim_run_slot(&mut runs, "run_3", with_session("tui-b")).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_open_run_session_new_starts_empty_and_writes_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store::transcript_path(dir.path(), "chat-new");
+        let (writer, history) = open_run_session(
+            dir.path().to_path_buf(),
+            "chat-new".into(),
+            path.clone(),
+            true,
+            "p".into(),
+            "m".into(),
+        )
+        .unwrap();
+        assert!(history.is_empty());
+        assert_eq!(writer.path(), path.as_path());
+        assert!(!path.exists(), "nothing written before the first commit");
+    }
+
+    #[test]
+    fn test_open_run_session_unknown_id_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = open_run_session(
+            dir.path().to_path_buf(),
+            "chat-missing".into(),
+            store::transcript_path(dir.path(), "chat-missing"),
+            false,
+            "p".into(),
+            "m".into(),
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{err:#}").contains("Unknown session"));
+    }
+
+    #[test]
+    fn test_legacy_md_session_converts_once_and_keeps_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("chat-old.md");
+        std::fs::write(&md, LEGACY_MD).unwrap();
+        let (_writer, history) = open_run_session(
+            dir.path().to_path_buf(),
+            "chat-old".into(),
+            store::transcript_path(dir.path(), "chat-old"),
+            false,
+            "p".into(),
+            "m".into(),
+        )
+        .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].content.as_deref(), Some("98"));
+        assert!(store::transcript_path(dir.path(), "chat-old").exists());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), LEGACY_MD);
+        // Loading again uses the transcript, not a second conversion.
+        let transcript =
+            load_or_convert_session(dir.path(), "chat-old").unwrap();
+        assert_eq!(transcript.messages.len(), 2);
+        assert_eq!(transcript.tokens_input, 10);
+        // The session is listed once, from the transcript.
+        let infos = session_infos(dir.path());
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, "chat-old");
+        assert_eq!(infos[0].message_count, 2);
+    }
+
+    #[test]
+    fn test_session_listing_and_loading_cover_transcripts_and_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-old.md"), LEGACY_MD).unwrap();
+        write_transcript(
+            dir.path(),
+            "chat-new",
+            &[
+                llm::ChatMessage::user("add a test"),
+                llm::ChatMessage::assistant_tool_calls_with_content(
+                    vec![llm::ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: llm::ToolFunction {
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    None,
+                ),
+                llm::ChatMessage::tool_result("c1", "contents"),
+                llm::ChatMessage::assistant_text("Added."),
+            ],
+        );
+        let mut ids: Vec<String> = session_infos(dir.path())
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["chat-new", "chat-old"]);
+
+        let data = load_session_data(dir.path(), "chat-new").unwrap();
+        let shown: Vec<(&str, &str)> = data
+            .messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(shown, [("user", "add a test"), ("assistant", "Added.")]);
+        assert!(data.compaction.is_none());
+
+        let legacy = load_session_data(dir.path(), "chat-old").unwrap();
+        assert_eq!(legacy.messages.len(), 2);
+        assert!(load_session_data(dir.path(), "chat-none").is_none());
+    }
+
+    #[test]
+    fn test_model_history_replaces_compacted_range_with_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        write_transcript(
+            dir.path(),
+            "chat-1",
+            &[
+                llm::ChatMessage::user("first"),
+                llm::ChatMessage::assistant_text("one"),
+                llm::ChatMessage::user("second"),
+                llm::ChatMessage::assistant_text("two"),
+            ],
+        );
+        let path = store::transcript_path(dir.path(), "chat-1");
+        store::append(
+            &path,
+            &[store::Record::Compaction {
+                ts: chrono::Utc::now(),
+                upto_seq: 1,
+                summary: "they said first/one".into(),
+                model_provider: "p".into(),
+                model_id: "m".into(),
+            }],
+            false,
+        )
+        .unwrap();
+        let transcript = store::load(&path).unwrap();
+        let history = model_history(&transcript);
+        assert_eq!(history.len(), 3);
+        let summary = history[0].content.as_deref().unwrap();
+        assert!(summary.starts_with(COMPACTION_CONTEXT_MARKER));
+        assert!(summary.contains("they said first/one"));
+        assert_eq!(history[1].content.as_deref(), Some("second"));
+        assert_eq!(
+            protocol_compaction(&transcript)
+                .unwrap()
+                .compacted_message_count,
+            2
+        );
+    }
+
+    #[test]
+    fn test_model_history_answers_calls_lost_to_a_truncated_step() {
+        let dir = tempfile::tempdir().unwrap();
+        // A step whose tool result never reached the disk.
+        write_transcript(
+            dir.path(),
+            "chat-1",
+            &[
+                llm::ChatMessage::user("go"),
+                llm::ChatMessage::assistant_tool_calls_with_content(
+                    vec![llm::ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: llm::ToolFunction {
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    None,
+                ),
+            ],
+        );
+        let transcript =
+            store::load(&store::transcript_path(dir.path(), "chat-1")).unwrap();
+        let history = model_history(&transcript);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn test_compaction_cut_stops_at_step_boundary_within_cap() {
+        let big = "y".repeat(MAX_COMPACT_CONVERSATION_CHARS / 2);
+        let call = |id: &str| {
+            llm::ChatMessage::assistant_tool_calls_with_content(
+                vec![llm::ToolCall {
+                    id: id.into(),
+                    call_type: "function".into(),
+                    function: llm::ToolFunction {
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                None,
+            )
+        };
+        let messages = [
+            llm::ChatMessage::user("first"),
+            call("a"),
+            llm::ChatMessage::tool_result("a", "ok"),
+            llm::ChatMessage::user(format!("second {big}")),
+            call("b"),
+            llm::ChatMessage::tool_result("b", "ok"),
+            llm::ChatMessage::user(format!("third {big}")),
+            llm::ChatMessage::assistant_text("done"),
+        ];
+        // Steps 1-2 fit; step 3 would exceed the cap, so it stays verbatim.
+        assert_eq!(compaction_cut(&messages), 6);
+        // Everything fits: compact it all.
+        assert_eq!(compaction_cut(&messages[..3]), 3);
+        // A single oversized step is still compacted, but never split.
+        let huge = [
+            llm::ChatMessage::user(
+                "x".repeat(MAX_COMPACT_CONVERSATION_CHARS * 2),
+            ),
+            call("c"),
+            llm::ChatMessage::tool_result("c", "ok"),
+            llm::ChatMessage::user("next"),
+        ];
+        assert_eq!(compaction_cut(&huge), 3);
+    }
+
+    #[test]
+    fn test_repair_happens_before_compaction_can_cover_the_step() {
+        let dir = tempfile::tempdir().unwrap();
+        write_transcript(
+            dir.path(),
+            "chat-1",
+            &[
+                llm::ChatMessage::user("go"),
+                llm::ChatMessage::assistant_tool_calls_with_content(
+                    vec![llm::ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: llm::ToolFunction {
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                    None,
+                ),
+            ],
+        );
+        // Compaction loads the session first: the repair lands then, so the
+        // compacted range includes the call *and* its result.
+        let transcript = load_or_convert_session(dir.path(), "chat-1").unwrap();
+        let last = transcript.messages.last().unwrap();
+        assert_eq!(last.message.tool_call_id.as_deref(), Some("c1"));
+        store::append(
+            &store::transcript_path(dir.path(), "chat-1"),
+            &[store::Record::Compaction {
+                ts: chrono::Utc::now(),
+                upto_seq: last.seq,
+                summary: "s".into(),
+                model_provider: "p".into(),
+                model_id: "m".into(),
+            }],
+            false,
+        )
+        .unwrap();
+        // The next run sees only the summary: no orphaned tool result.
+        let (_writer, history) = open_run_session(
+            dir.path().to_path_buf(),
+            "chat-1".into(),
+            store::transcript_path(dir.path(), "chat-1"),
+            false,
+            "p".into(),
+            "m".into(),
+        )
+        .unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_open_run_session_persists_repair_of_truncated_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = llm::ChatMessage::assistant_tool_calls_with_content(
+            vec![
+                llm::ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: llm::ToolFunction {
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                llm::ToolCall {
+                    id: "c2".into(),
+                    call_type: "function".into(),
+                    function: llm::ToolFunction {
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            ],
+            None,
+        );
+        // c2's result never reached the disk.
+        write_transcript(
+            dir.path(),
+            "chat-1",
+            &[
+                llm::ChatMessage::user("go"),
+                call,
+                llm::ChatMessage::tool_result("c1", "ok"),
+            ],
+        );
+        let path = store::transcript_path(dir.path(), "chat-1");
+        let (mut writer, history) = open_run_session(
+            dir.path().to_path_buf(),
+            "chat-1".into(),
+            path.clone(),
+            false,
+            "p".into(),
+            "m".into(),
+        )
+        .unwrap();
+        assert_eq!(history.last().unwrap().tool_call_id.as_deref(), Some("c2"));
+        // A later run appends more steps; the repair is already on disk, in
+        // the right place, so the history stays valid on every later load.
+        writer
+            .append_messages(&[
+                llm::ChatMessage::user("more"),
+                llm::ChatMessage::assistant_text("sure"),
+            ])
+            .unwrap();
+        let transcript = store::load(&path).unwrap();
+        let ids: Vec<Option<&str>> = transcript
+            .messages
+            .iter()
+            .map(|m| m.message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(ids, [None, None, Some("c1"), Some("c2"), None, None]);
+    }
+
+    #[tokio::test]
+    async fn test_forwarder_reports_context_size_after_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+        let mut save_ctx = test_save_ctx(dir.path());
+        save_ctx.context_chars = 100;
+        forward_agent_event(
+            &state,
+            "run_1",
+            &mut save_ctx,
+            Ok(agent::AgentEvent::MessagesCommitted(vec![
+                llm::ChatMessage::user("12345"),
+            ])),
+        )
+        .await;
+        let runs = state.runs.lock().await;
+        assert!(matches!(
+            runs["run_1"].events.last(),
+            Some(marshaling_protocol::ServerEvent::ContextSize { chars: 105 })
+        ));
+    }
+
+    #[test]
+    fn test_compact_transcript_text_includes_tool_activity() {
+        let long_result = "x".repeat(COMPACT_TOOL_RESULT_CHARS + 100);
+        let messages = [
+            llm::ChatMessage::user("fix main.rs"),
+            llm::ChatMessage::assistant_tool_calls_with_content(
+                vec![llm::ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: llm::ToolFunction {
+                        name: "read".into(),
+                        arguments: r#"{"file_path":"src/main.rs"}"#.into(),
+                    },
+                }],
+                Some("Reading it.".into()),
+            ),
+            llm::ChatMessage::tool_result("c1", long_result.clone()),
+            llm::ChatMessage::role_task("review it"),
+        ];
+        let text = compact_transcript_text(Some("earlier summary"), &messages);
+        assert!(text.contains("<previous_compaction>\nearlier summary"));
+        assert!(text.contains("USER:\nfix main.rs"));
+        assert!(text.contains("ASSISTANT:\nReading it."));
+        assert!(
+            text.contains(
+                r#"ASSISTANT called read({"file_path":"src/main.rs"})"#
+            )
+        );
+        assert!(text.contains("TOOL RESULT:\n"));
+        assert!(!text.contains(&long_result), "tool results are excerpted");
+        assert!(text.contains("ROLE HANDOFF:\nreview it"));
     }
 
     #[test]
@@ -3035,6 +3634,7 @@ read = "allow"
             runtime_states: tokio::sync::Mutex::new(HashMap::new()),
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+            session_locks: tokio::sync::Mutex::new(HashMap::new()),
         });
         let mut cancel_rx = insert_test_run(&state, "run_1").await;
         record_run_event(
@@ -3074,6 +3674,7 @@ read = "allow"
         for event in [
             marshaling_protocol::ServerEvent::RunStarted {
                 run_id: "run_1".into(),
+                session_id: None,
             },
             marshaling_protocol::ServerEvent::TextDelta { data: "a".into() },
             permission_request("perm_0_c"),
@@ -3127,22 +3728,31 @@ read = "allow"
     }
 
     #[tokio::test]
-    async fn test_forwarder_records_failed_run_as_terminal_error() {
+    async fn test_forwarder_persists_commits_and_records_failure() {
         let dir = tempfile::tempdir().unwrap();
         let state = empty_test_state(dir.path());
         let _cancel_rx = insert_test_run(&state, "run_1").await;
+        let mut save_ctx = test_save_ctx(dir.path());
+        let path = save_ctx.writer.as_ref().unwrap().path().to_path_buf();
+        let committed = forward_agent_event(
+            &state,
+            "run_1",
+            &mut save_ctx,
+            Ok(agent::AgentEvent::MessagesCommitted(vec![
+                llm::ChatMessage::user("do the thing"),
+                llm::ChatMessage::assistant_text("working on it"),
+            ])),
+        )
+        .await;
+        assert!(!committed);
         let terminal = forward_agent_event(
             &state,
             "run_1",
-            &test_save_ctx(dir.path()),
+            &mut save_ctx,
             Ok(agent::AgentEvent::Failed {
                 error: anyhow::anyhow!("provider API error (401)"),
                 tokens_input: 3,
                 tokens_output: 4,
-                history: vec![
-                    llm::ChatMessage::user("do the thing"),
-                    llm::ChatMessage::assistant_text("working on it"),
-                ],
             }),
         )
         .await;
@@ -3156,24 +3766,14 @@ read = "allow"
                     if message.contains("401")
             ));
         }
-        // The work done before the failure is saved (written in the
-        // background, so poll briefly).
-        let session_dir =
-            history_dir_for_session(&dir.path().join("history"), "sess");
-        let mut saved = false;
-        for _ in 0..50 {
-            saved = std::fs::read_dir(&session_dir).is_ok_and(|entries| {
-                entries.flatten().any(|e| {
-                    std::fs::read_to_string(e.path())
-                        .is_ok_and(|text| text.contains("working on it"))
-                })
-            });
-            if saved {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(saved, "failed run's history should be saved");
+        // Writes are awaited, so the transcript is complete right away.
+        let transcript = store::load(&path).unwrap();
+        assert_eq!(transcript.messages.len(), 2);
+        assert_eq!(
+            transcript.messages[1].message.content.as_deref(),
+            Some("working on it")
+        );
+        assert_eq!((transcript.tokens_input, transcript.tokens_output), (3, 4));
     }
 
     #[tokio::test]
@@ -3183,11 +3783,11 @@ read = "allow"
         let _cancel_rx = insert_test_run(&state, "run_1").await;
         let _sub = state.runs.lock().await["run_1"].tx.subscribe();
         record_run_event(&state, "run_1", permission_request("perm_0_c")).await;
-        let save_ctx = test_save_ctx(dir.path());
+        let mut save_ctx = test_save_ctx(dir.path());
         let terminal = forward_agent_event(
             &state,
             "run_1",
-            &save_ctx,
+            &mut save_ctx,
             Ok(agent::AgentEvent::PermissionResolved {
                 id: "perm_0_c".into(),
             }),
@@ -3248,6 +3848,7 @@ read = "allow"
             runtime_states: tokio::sync::Mutex::new(HashMap::new()),
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+            session_locks: tokio::sync::Mutex::new(HashMap::new()),
         });
         let cancel_rx = insert_test_run(&state, "run_1").await;
         {
@@ -3324,7 +3925,6 @@ read = "allow"
                 content: "(cancelled)".into(),
                 tokens_input: 0,
                 tokens_output: 0,
-                history: Vec::new(),
             }));
         });
         // Let the task finish before the forwarder polls, so the handle can
@@ -3380,6 +3980,7 @@ read = "allow"
             )])),
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
+            session_locks: tokio::sync::Mutex::new(HashMap::new()),
         });
 
         let result = apply_rollback_last(&state, "sess").await;

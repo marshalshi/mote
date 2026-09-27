@@ -92,6 +92,7 @@ fn is_conversation_heading_line(line: &str) -> bool {
     matches!(parse_message_heading(line), Some(Some(_)))
 }
 
+#[cfg(test)]
 fn escape_message_line(line: &str) -> String {
     if is_conversation_heading_line(line)
         || line.starts_with("\\## User — ")
@@ -147,7 +148,10 @@ impl ParsedMessage {
     }
 }
 
-/// Serialize a session to a markdown string with YAML frontmatter.
+/// Serialize a session to a markdown string with YAML frontmatter. Sessions
+/// are written as JSONL transcripts now (see `store`); this remains to build
+/// legacy-format fixtures in tests.
+#[cfg(test)]
 pub fn serialize(meta: &SessionMeta, messages: &[Message]) -> Result<String> {
     let yaml = serde_yaml::to_string(meta)
         .context("Failed to serialize session metadata")?;
@@ -169,48 +173,6 @@ pub fn serialize(meta: &SessionMeta, messages: &[Message]) -> Result<String> {
     }
 
     Ok(format!("---\n{}---\n\n{}", yaml, body.trim()))
-}
-
-/// Save a session to disk. Creates `{hist_dir}/{id}.md`.
-pub fn save_session(
-    hist_dir: &Path,
-    session: &crate::session::Session,
-) -> Result<()> {
-    let meta = session.meta();
-    let content = serialize(&meta, &session.messages)?;
-    std::fs::create_dir_all(hist_dir)?;
-    let path = hist_dir.join(format!("{}.md", session.id));
-    std::fs::write(&path, content)?;
-    tracing::info!("Session saved: {}", path.display());
-    Ok(())
-}
-
-/// List sessions from a history directory, returning metadata for each.
-/// Entries are sorted by modification time, newest first.
-pub fn list_sessions(
-    hist_dir: &Path,
-) -> Result<Vec<(SessionMeta, std::path::PathBuf)>> {
-    if !hist_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut entries: Vec<_> = std::fs::read_dir(hist_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
-        .collect();
-    entries.sort_by_key(|e| {
-        e.path().metadata().ok().and_then(|m| m.modified().ok())
-    });
-
-    let mut sessions = Vec::new();
-    for entry in entries {
-        let path = entry.path();
-        if let Ok((meta, _msgs)) = parse_file(&path) {
-            sessions.push((meta, path));
-        }
-    }
-    sessions.reverse(); // newest first
-    Ok(sessions)
 }
 
 #[cfg(test)]

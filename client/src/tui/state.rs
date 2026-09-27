@@ -190,6 +190,11 @@ pub struct App {
     /// websocket is reconnecting): stop waiting for the connection.
     pub stop_reattach_requested: bool,
 
+    /// Size of the conversation the model sees, as last reported by the
+    /// server (`ServerEvent::ContextSize`). It includes tool calls and
+    /// results, which the local view does not show.
+    pub server_context_chars: Option<u64>,
+
     /// Answers (allowed, remember) this client already sent in the current
     /// run, by permission id. When the server re-announces one of these as
     /// `PermissionPending`, the answer either raced with the attach snapshot
@@ -473,6 +478,7 @@ impl App {
             discarding_run: false,
             stop_reattach_requested: false,
             answered_permissions: std::collections::HashMap::new(),
+            server_context_chars: None,
             session_picker_open: false,
             session_picker_items: Vec::new(),
             session_picker_index: 0,
@@ -868,10 +874,21 @@ impl App {
     pub fn apply_compaction(
         &mut self,
         session_id: String,
-        compaction: marshaling_protocol::CompactionState,
+        mut compaction: marshaling_protocol::CompactionState,
     ) {
+        // The server counts compacted messages in its transcript; locally
+        // the count only marks where compaction happened in this view (for
+        // the context-size heuristic), so use the local position: every
+        // conversation message except a still-unsent user message.
+        let pending =
+            usize::from(self.pending_user_message_content().is_some());
+        compaction.compacted_message_count =
+            self.conversation_message_count().saturating_sub(pending);
         self.active_session_id = Some(session_id);
         self.compaction_state = Some(compaction);
+        // Unknown until the next run reports it; the compacted history is
+        // far smaller than before.
+        self.server_context_chars = None;
         self.pending_compact_confirmation = false;
         self.compact_declined_for_message = None;
         self.push_command_message(
@@ -890,7 +907,15 @@ impl App {
         if self.compact_declined_for_message.as_deref() == Some(last_content) {
             return false;
         }
-        self.uncompacted_context_chars(false) > AUTO_COMPACT_CHAR_THRESHOLD
+        // The server's figure covers tool output the local view lacks; the
+        // unsent message is not in it yet.
+        let server = self.server_context_chars.map_or(0, |chars| {
+            usize::try_from(chars)
+                .unwrap_or(usize::MAX)
+                .saturating_add(last_content.len())
+        });
+        self.uncompacted_context_chars(false).max(server)
+            > AUTO_COMPACT_CHAR_THRESHOLD
     }
 
     pub fn request_auto_compact_confirmation(&mut self) {
@@ -2184,6 +2209,7 @@ impl App {
         self.tokens_output = 0;
         self.active_run_id = None;
         self.lost_run = None;
+        self.server_context_chars = None;
         self.compaction_state = None;
         self.pending_compact_confirmation = false;
         self.pending_auto_compact_send = false;
@@ -2221,6 +2247,7 @@ impl App {
         self.active_session_id = None;
         self.active_run_id = None;
         self.lost_run = None;
+        self.server_context_chars = None;
         self.compaction_state = None;
         self.pending_compact_confirmation = false;
         self.pending_auto_compact_send = false;

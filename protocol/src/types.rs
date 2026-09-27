@@ -166,7 +166,13 @@ pub enum AudioServerEvent {
 #[serde(tag = "type")]
 pub enum ServerEvent {
     #[serde(rename = "run_started")]
-    RunStarted { run_id: String },
+    RunStarted {
+        run_id: String,
+        /// Session the run belongs to; for a new conversation this is the id
+        /// the server just created, which the client sends on later requests.
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     #[serde(rename = "run_attached")]
     RunAttached { run_id: String },
     #[serde(rename = "run_detached")]
@@ -271,6 +277,12 @@ pub enum ServerEvent {
         tokens_input: u64,
         tokens_output: u64,
     },
+    /// Approximate size (characters) of the conversation the model will see
+    /// on the next request: sent when a run starts and after every committed
+    /// step. Includes tool calls and results, which the client's own view
+    /// omits; clients use it to decide when to suggest compaction.
+    #[serde(rename = "context_size")]
+    ContextSize { chars: u64 },
     /// A provider request failed and is retried after `delay_ms`. When
     /// `discarded_output` is set, the text streamed so far for the current
     /// turn is void and must be discarded: the retry regenerates the turn.
@@ -471,6 +483,10 @@ pub struct SessionData {
     pub messages: Vec<HistoryMessage>,
     #[serde(default)]
     pub compaction: Option<CompactionState>,
+    /// Approximate size of the conversation the model sees when this
+    /// session continues (see `ServerEvent::ContextSize`).
+    #[serde(default)]
+    pub context_chars: Option<u64>,
 }
 
 // ── Health check ─────────────────────────────────────────

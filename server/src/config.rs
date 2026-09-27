@@ -260,6 +260,14 @@ pub struct ServerConfig {
     /// is retried before the budget runs out; 0 disables).
     #[serde(default = "default_subagent_timeout_secs")]
     pub subagent_timeout_secs: u64,
+    /// Put the per-turn `<system-reminder>` after the conversation instead
+    /// of before it (default: false). At the end, the prompt prefix stays
+    /// identical between steps, so providers can reuse their prompt cache —
+    /// much cheaper and faster on long runs. Off by default because some
+    /// models' chat templates only honor a system message at the start;
+    /// enable it after checking your provider handles it.
+    #[serde(default)]
+    pub system_reminder_at_end: bool,
 }
 
 fn default_server_port() -> u16 {
@@ -295,6 +303,7 @@ impl Default for ServerConfig {
             first_response_timeout_secs: default_first_response_timeout_secs(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             subagent_timeout_secs: default_subagent_timeout_secs(),
+            system_reminder_at_end: false,
         }
     }
 }

@@ -1560,7 +1560,10 @@ impl App {
         // Sentinel values from the agent loop — don't display as assistant messages
         if matches!(
             content,
-            "(cancelled)" | "(max steps reached)" | "(interrupted)"
+            "(cancelled)"
+                | "(max steps reached)"
+                | "(interrupted)"
+                | "(permission denied)"
         ) {
             if thinking.is_some() {
                 self.messages.push(DisplayMessage {

@@ -2954,4 +2954,14 @@ mod tests {
         };
         assert!(!app.accept_run_log_event(&replayed));
     }
+
+    #[test]
+    fn test_permission_denied_end_is_a_status_not_a_message() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        let before = app.messages.len();
+        app.agent_done("(permission denied)");
+        assert_eq!(app.messages.len(), before);
+        assert_eq!(app.state, AppState::Idle);
+    }
 }

@@ -113,6 +113,7 @@ impl ChatMessage {
         }
     }
 
+    #[cfg(test)]
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
         Self::assistant_tool_calls_with_content(calls, None)
     }
@@ -311,10 +312,17 @@ impl ToolRegistry {
 
 /// Largest tool output passed to the model, in bytes and in lines.
 const MAX_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
-const MAX_TOOL_OUTPUT_LINES: usize = 2000;
+const MAX_TOOL_OUTPUT_LINES: usize = 2500;
+/// How much of an over-long output is kept from its start; the rest of the
+/// budget comes from its end, where commands report status and errors.
+const TOOL_OUTPUT_HEAD_BYTES: usize = 30 * 1024;
+const TOOL_OUTPUT_HEAD_LINES: usize = 1500;
+const TOOL_OUTPUT_TAIL_BYTES: usize = 20 * 1024;
+const TOOL_OUTPUT_TAIL_LINES: usize = 1000;
 
 /// Cap a tool's output so one call cannot flood the context window. Keeps
-/// the head and tells the model how to narrow the request.
+/// the head and the tail (exit codes, final errors, trailing notes) and says
+/// how to narrow the request.
 fn limit_tool_output(output: String) -> String {
     let total_lines = output.lines().count();
     if output.len() <= MAX_TOOL_OUTPUT_BYTES
@@ -322,16 +330,36 @@ fn limit_tool_output(output: String) -> String {
     {
         return output;
     }
-    let line_end = output
+    let head_end = output
         .match_indices('\n')
-        .nth(MAX_TOOL_OUTPUT_LINES - 1)
-        .map_or(output.len(), |(i, _)| i);
-    let head =
-        crate::agent::safe_truncate(&output[..line_end], MAX_TOOL_OUTPUT_BYTES);
+        .nth(TOOL_OUTPUT_HEAD_LINES - 1)
+        .map_or(output.len(), |(i, _)| i + 1);
+    let head = crate::agent::safe_truncate(
+        &output[..head_end],
+        TOOL_OUTPUT_HEAD_BYTES,
+    );
+    let rest = &output[head.len()..];
+    let tail_start = rest
+        .trim_end_matches('\n')
+        .rmatch_indices('\n')
+        .nth(TOOL_OUTPUT_TAIL_LINES - 1)
+        .map_or(0, |(i, _)| i + 1);
+    let mut tail = &rest[tail_start..];
+    if tail.len() > TOOL_OUTPUT_TAIL_BYTES {
+        let mut cut = tail.len() - TOOL_OUTPUT_TAIL_BYTES;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail = &tail[cut..];
+    }
+    let omitted_bytes = output.len() - head.len() - tail.len();
+    let omitted_lines = total_lines
+        .saturating_sub(head.lines().count())
+        .saturating_sub(tail.lines().count());
+    // A head cut at a line break already ends with one.
+    let gap = if head.ends_with('\n') { "" } else { "\n" };
     format!(
-        "{head}\n\n[output truncated: showing {} of {total_lines} lines ({} of {} bytes). Narrow the request: read with offset/limit, use a more specific grep/glob pattern, or pipe command output through head, tail, or grep.]",
-        head.lines().count(),
-        head.len(),
+        "{head}{gap}[... output truncated: {omitted_bytes} bytes (~{omitted_lines} lines) omitted from the middle of {} bytes / {total_lines} lines. Narrow the request: read with offset/limit, use a more specific grep/glob pattern, or pipe command output through head, tail, or grep. ...]\n{tail}",
         output.len()
     )
 }
@@ -633,31 +661,46 @@ mod tests {
     }
 
     #[test]
-    fn test_limit_tool_output_caps_bytes_and_lines() {
-        let long = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1000);
+    fn test_limit_tool_output_keeps_head_and_tail() {
+        let long = format!(
+            "{}{}",
+            "x".repeat(MAX_TOOL_OUTPUT_BYTES),
+            "z".repeat(1000)
+        );
         let out = limit_tool_output(long.clone());
-        assert!(out.starts_with(&"x".repeat(MAX_TOOL_OUTPUT_BYTES)));
-        assert!(out.contains(&format!(
-            "({MAX_TOOL_OUTPUT_BYTES} of {} bytes)",
-            long.len()
-        )));
+        assert!(out.starts_with(&"x".repeat(TOOL_OUTPUT_HEAD_BYTES)));
+        assert!(out.ends_with(&"z".repeat(1000)));
+        assert!(out.contains("output truncated"));
+        assert!(out.len() < MAX_TOOL_OUTPUT_BYTES + 500);
 
         let many: Vec<String> = (1..=MAX_TOOL_OUTPUT_LINES + 10)
             .map(|n| n.to_string())
             .collect();
         let out = limit_tool_output(many.join("\n"));
-        assert!(out.contains(&format!(
-            "\n{MAX_TOOL_OUTPUT_LINES}\n\n[output truncated"
-        )));
-        assert!(out.contains(&format!(
-            "showing {MAX_TOOL_OUTPUT_LINES} of {} lines",
-            MAX_TOOL_OUTPUT_LINES + 10
-        )));
+        assert!(out.starts_with("1\n2\n"));
+        assert!(out.contains(&format!("\n{TOOL_OUTPUT_HEAD_LINES}\n[...")));
+        assert!(out.ends_with(&format!("\n{}", MAX_TOOL_OUTPUT_LINES + 10)));
+        assert!(
+            out.lines().count()
+                <= TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 1
+        );
 
         // Multi-byte characters are never split.
         let wide = "é".repeat(MAX_TOOL_OUTPUT_BYTES);
         let out = limit_tool_output(wide);
-        assert!(out.contains("[output truncated"));
+        assert!(out.contains("output truncated"));
+    }
+
+    #[test]
+    fn test_limit_tool_output_never_drops_the_final_status_line() {
+        let noisy =
+            format!("{}\n[exit code: 101]", "compiling crate\n".repeat(10_000));
+        let out = limit_tool_output(noisy);
+        assert!(
+            out.ends_with("[exit code: 101]"),
+            "{}",
+            &out[out.len() - 60..]
+        );
     }
 
     #[tokio::test]

@@ -969,11 +969,13 @@ async fn auth_save(
 
 /// Helper: send an error event over WebSocket.
 async fn send_error(socket: &mut WebSocket, msg: impl Into<String>) {
-    let json =
+    let Ok(json) =
         serde_json::to_string(&marshaling_protocol::ServerEvent::Error {
             message: msg.into(),
         })
-        .unwrap();
+    else {
+        return;
+    };
     let _ = socket.send(Message::Text(json.into())).await;
 }
 
@@ -1167,7 +1169,6 @@ pub(crate) struct AgentContext {
     pub(crate) eff_model_id: String,
     /// Optional role-loop configuration. When present, the agent loop
     /// enters role-switching mode. The first role is the orchestrator.
-    #[allow(dead_code)]
     pub(crate) role_loop_config: Option<agent::RoleLoopConfig>,
 }
 
@@ -1349,14 +1350,15 @@ pub(crate) async fn resolve_agent_context(
     let agent_model = agent_cfg.and_then(|a| a.model.as_deref());
 
     // ── Role-aware mode ──────────────────────────────────
-    if let Some(roles) = agent_cfg.and_then(|a| a.roles.as_ref()) {
-        // Safe: agent_cfg is Some because roles came from it
+    if let Some((agent, roles)) =
+        agent_cfg.and_then(|a| a.roles.as_ref().map(|roles| (a, roles)))
+    {
         return resolve_role_aware_context(
             config,
             auth,
             merged_agents,
             req_ctx,
-            agent_cfg.unwrap(),
+            agent,
             roles,
             agent_model,
             model_override,
@@ -1773,6 +1775,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     )
     .await;
 
+    let reminder_at_end = state.config.server.system_reminder_at_end;
     let agent_span = tracing::info_span!("agent_run", run_id = %run_id);
     let run_handle = tokio::spawn(
         async move {
@@ -1786,6 +1789,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     max_steps,
                     working_directory: workspace_display,
                     role_config: ctx.role_loop_config,
+                    reminder_at_end,
                 },
                 agent::RunChannels {
                     events_tx: agent_tx,
@@ -2098,6 +2102,40 @@ async fn forward_agent_event(
                 run_id,
                 marshaling_protocol::ServerEvent::ToolCompleted {
                     id,
+                    result,
+                    changes,
+                },
+            )
+            .await;
+            false
+        }
+        Ok(agent::AgentEvent::SubagentToolCompleted {
+            id,
+            sub_id,
+            tool_name,
+            result,
+            changes,
+            rollback_entries,
+        }) => {
+            // Subagent edits are undoable like the parent's own.
+            if !rollback_entries.is_empty() {
+                let mut sessions = state.runtime_states.lock().await;
+                let session_state = sessions
+                    .entry(save_ctx.runtime_session_key.clone())
+                    .or_default();
+                session_state.rollback_journal.push(RollbackChangeSet {
+                    id: sub_id.clone(),
+                    tool_name,
+                    entries: rollback_entries,
+                    display_changes: changes.clone(),
+                });
+            }
+            record_run_event(
+                state,
+                run_id,
+                marshaling_protocol::ServerEvent::SubagentToolCompleted {
+                    id,
+                    sub_id,
                     result,
                     changes,
                 },
@@ -2565,6 +2603,7 @@ fn agent_event_to_server_event(
             sub_id,
             result,
             changes,
+            ..
         } => marshaling_protocol::ServerEvent::SubagentToolCompleted {
             id,
             sub_id,
@@ -2881,16 +2920,17 @@ async fn main() -> Result<()> {
         let log_dir = config.logging.dir.clone();
         std::fs::create_dir_all(&log_dir).ok();
         let log_path = log_dir.join("mote.log");
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .unwrap_or_else(|_| {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open("/dev/null")
-                    .unwrap()
-            });
+        // If the log file cannot be opened, discard logs rather than fail
+        // to start.
+        let log_file: Box<dyn std::io::Write + Send> =
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                Ok(file) => Box::new(file),
+                Err(_) => Box::new(std::io::sink()),
+            };
         let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -3774,6 +3814,43 @@ read = "allow"
             Some("working on it")
         );
         assert_eq!((transcript.tokens_input, transcript.tokens_output), (3, 4));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_edits_are_journaled_for_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let _cancel_rx = insert_test_run(&state, "run_1").await;
+        let mut save_ctx = test_save_ctx(dir.path());
+        forward_agent_event(
+            &state,
+            "run_1",
+            &mut save_ctx,
+            Ok(agent::AgentEvent::SubagentToolCompleted {
+                id: "sub_1".into(),
+                sub_id: "call_9".into(),
+                tool_name: "edit".into(),
+                result: "Edited a.txt".into(),
+                changes: Vec::new(),
+                rollback_entries: vec![llm::RollbackEntry {
+                    path: dir.path().join("a.txt"),
+                    kind: llm::RollbackKind::Modified,
+                    before_content: Some("before".into()),
+                    expected_after_hash: Some(hash64("after")),
+                }],
+            }),
+        )
+        .await;
+        let sessions = state.runtime_states.lock().await;
+        let journal = &sessions["sess"].rollback_journal;
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].tool_name, "edit");
+        assert!(matches!(
+            state.runs.lock().await["run_1"].events.last(),
+            Some(
+                marshaling_protocol::ServerEvent::SubagentToolCompleted { .. }
+            )
+        ));
     }
 
     #[tokio::test]

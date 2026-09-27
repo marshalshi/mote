@@ -20,7 +20,6 @@ const MAX_STREAM_RETRIES: usize = 5;
 /// A fully resolved role ready for use in the agent loop.
 /// Owns all data needed to switch the active role per turn.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct ResolvedRole {
     pub name: String,
     pub instructions: String,
@@ -34,12 +33,10 @@ pub struct ResolvedRole {
 /// When present in `run_loop`, the loop enters role-switching mode.
 /// The first role is the orchestrator.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct RoleLoopConfig {
     pub roles: Vec<ResolvedRole>,
 }
 
-#[allow(dead_code)]
 impl RoleLoopConfig {
     /// Find a role by name, returning its index.
     pub fn find_role(&self, name: &str) -> Option<usize> {
@@ -393,8 +390,11 @@ pub enum AgentEvent {
     SubagentToolCompleted {
         id: String,
         sub_id: String,
+        tool_name: String,
         result: String,
         changes: Vec<FileChange>,
+        /// Lets the parent run journal subagent edits for rollback.
+        rollback_entries: Vec<crate::llm::RollbackEntry>,
     },
     /// A tool failed inside a subagent.
     SubagentToolFailed {
@@ -469,6 +469,9 @@ pub struct RunConfig {
     pub working_directory: String,
     /// Role-aware loop config. When None, runs in single-role mode.
     pub role_config: Option<RoleLoopConfig>,
+    /// Send the per-turn system reminder after the conversation rather than
+    /// before it (`server.system_reminder_at_end`).
+    pub reminder_at_end: bool,
 }
 
 /// Channels connecting a run to whoever owns it.
@@ -523,6 +526,8 @@ struct ToolOutcome {
     failed: bool,
     finish_answer: Option<String>,
     role_switch: Option<(usize, String)>,
+    /// The user denied this call's permission prompt.
+    user_denied: bool,
 }
 
 impl ToolOutcome {
@@ -537,6 +542,7 @@ impl ToolOutcome {
             failed: false,
             finish_answer: None,
             role_switch: None,
+            user_denied: false,
         }
     }
 }
@@ -551,7 +557,53 @@ struct ToolBatch {
     finish_answer: Option<String>,
     /// The last valid `switch_role` request in the batch.
     role_switch: Option<(usize, String)>,
+    /// The user denied a permission prompt; the run stops after this batch.
+    user_denied: bool,
 }
+
+/// A tool call refused before it ran.
+struct Denial {
+    message: String,
+    /// Refused by the user at a prompt (the run stops), rather than by the
+    /// agent's configured permissions (the model can adapt).
+    by_user: bool,
+}
+
+/// Content of the terminal event when a run stops because the user denied a
+/// tool call; clients treat it as a status, not assistant text.
+pub const PERMISSION_DENIED_CONTENT: &str = "(permission denied)";
+const SKIPPED_AFTER_DENIAL: &str =
+    "Skipped: the user denied an earlier tool call in this step.";
+
+/// A call is refused instead of run when it would be the Nth identical call
+/// (same tool, same arguments) in a row and the previous ones all returned
+/// the same result: the model is stuck. Calls whose results change (polling
+/// a build, a health check) keep running.
+const DOOM_LOOP_REPEATS: usize = 3;
+
+/// Error from a tool whose own run was stopped by the user denying a
+/// permission prompt (a subagent), so the calling run stops as well instead
+/// of working around the refusal.
+#[derive(Debug)]
+pub struct UserDeniedToolCall {
+    /// What the tool did before it stopped (e.g. the subagent's tool log),
+    /// so the model still sees work that really happened.
+    pub summary: String,
+}
+
+impl std::fmt::Display for UserDeniedToolCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "The user denied a tool call inside the subagent, so it stopped.",
+        )?;
+        if !self.summary.is_empty() {
+            write!(f, " Work done before that: {}", self.summary)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UserDeniedToolCall {}
 
 /// Wait until cancellation is requested. Never resolves once the cancel
 /// sender is gone (`changed()` would then resolve immediately forever, so it
@@ -649,6 +701,10 @@ struct AgentRun {
     committed_len: usize,
     /// Length of the prior history passed in; later messages are this run's.
     initial_len: usize,
+    /// The most recent executed registry tool calls as
+    /// (`name\0canonical-args`, hash of the result), for detecting a model
+    /// stuck repeating itself.
+    recent_calls: std::collections::VecDeque<(String, u64)>,
 }
 
 impl AgentRun {
@@ -667,6 +723,7 @@ impl AgentRun {
             permission_broker: channels.permission_broker,
             committed_len: history.len(),
             initial_len: history.len(),
+            recent_calls: std::collections::VecDeque::new(),
             history,
             total_input: 0,
             total_output: 0,
@@ -860,11 +917,18 @@ impl AgentRun {
             last_user_message: extract_last_user_message(&self.history),
         };
         let reminder = crate::prompt::build_system_reminder(&reminder_ctx);
-        messages.push(ChatMessage::system(&reminder));
+        // At the end, everything before it is identical from step to step,
+        // so providers can reuse their prompt cache for the whole history.
+        if !self.cfg.reminder_at_end {
+            messages.push(ChatMessage::system(&reminder));
+        }
 
         messages.extend(self.history.iter().cloned());
         if final_text_only_step {
             messages.push(ChatMessage::assistant_text(MAX_STEPS_PROMPT));
+        }
+        if self.cfg.reminder_at_end {
+            messages.push(ChatMessage::system(&reminder));
         }
 
         let base = &self.cfg.options;
@@ -1149,6 +1213,18 @@ impl AgentRun {
             return Some(Terminal::Done(final_answer));
         }
 
+        if batch.user_denied {
+            // The user said no: stop and let them decide what happens next,
+            // instead of letting the model try to work around the refusal.
+            self.emit(AgentEvent::TurnDone {
+                text: turn_text,
+                tool_calls: batch.displays,
+            });
+            return Some(Terminal::NeedsContinuation(
+                PERMISSION_DENIED_CONTENT.into(),
+            ));
+        }
+
         if let Some((role_idx, task_msg)) = batch.role_switch {
             self.current_role_idx = role_idx;
             self.history.push(ChatMessage::role_task(task_msg));
@@ -1173,12 +1249,27 @@ impl AgentRun {
             if self.cancel_requested() {
                 return Err(Terminal::Cancelled);
             }
-            let outcome = match tc.function.name.as_str() {
-                "finish_task" => self.finish_task_call(tc, content),
-                "switch_role" => self.switch_role_call(tc),
-                _ => self.regular_tool_call(tc).await?,
+            let outcome = if batch.user_denied {
+                // Honor the denial: run nothing else the model asked for in
+                // this step, but give every call a result.
+                self.emit(AgentEvent::ToolStarted {
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                });
+                self.record_tool_failure(
+                    tc,
+                    SKIPPED_AFTER_DENIAL.into(),
+                    format!("Error: {SKIPPED_AFTER_DENIAL}"),
+                )
+            } else {
+                match tc.function.name.as_str() {
+                    "finish_task" => self.finish_task_call(tc, content),
+                    "switch_role" => self.switch_role_call(tc),
+                    _ => self.regular_tool_call(tc).await?,
+                }
             };
             batch.failed |= outcome.failed;
+            batch.user_denied |= outcome.user_denied;
             if let Some(answer) = outcome.finish_answer {
                 batch.finish_answer.get_or_insert(answer);
             }
@@ -1216,6 +1307,7 @@ impl AgentRun {
             failed: true,
             finish_answer: None,
             role_switch: None,
+            user_denied: false,
         }
     }
 
@@ -1362,12 +1454,27 @@ impl AgentRun {
                 }
             };
 
-        if let Some(err) = self.check_permission(tc, &args).await? {
+        // `Value`'s map is ordered by key, so this is canonical.
+        let call_key = format!("{name}\0{args}");
+        if self.is_stuck_repeating(&call_key) {
+            let err = format!(
+                "Refused: this would be the {DOOM_LOOP_REPEATS}th identical '{name}' call in a row, and the previous ones returned the same result. Change your approach: use different arguments, another tool, or explain to the user what is blocking you."
+            );
             return Ok(self.record_tool_failure(
                 tc,
                 err.clone(),
                 format!("Error: {}", err),
             ));
+        }
+
+        if let Some(denial) = self.check_permission(tc, &args).await? {
+            let mut outcome = self.record_tool_failure(
+                tc,
+                denial.message.clone(),
+                format!("Error: {}", denial.message),
+            );
+            outcome.user_denied = denial.by_user;
+            return Ok(outcome);
         }
 
         let tools = Arc::clone(&self.cfg.tools);
@@ -1377,6 +1484,13 @@ impl AgentRun {
                 return Err(Terminal::Cancelled);
             }
         };
+        // Errors are compared by their text: two different failures are
+        // different results.
+        let result_text = match &execution {
+            Ok(output) => output.output.clone(),
+            Err(e) => format!("{e:#}"),
+        };
+        self.record_call(call_key, &result_text);
         match execution {
             Ok(output) => {
                 self.emit(AgentEvent::ToolCompleted {
@@ -1391,23 +1505,48 @@ impl AgentRun {
                 Ok(ToolOutcome::succeeded(tc, name, output.changes))
             }
             Err(e) => {
+                let user_denied =
+                    e.downcast_ref::<UserDeniedToolCall>().is_some();
                 let err = format!("{:#}", e);
-                Ok(self.record_tool_failure(
+                let mut outcome = self.record_tool_failure(
                     tc,
                     err.clone(),
                     format!("Error: {}", err),
-                ))
+                );
+                outcome.user_denied = user_denied;
+                Ok(outcome)
             }
         }
     }
 
-    /// Apply the tool's permission, asking the user when needed. Returns the
-    /// denial message if the call may not run.
+    /// Whether running `call_key` now would repeat the previous identical
+    /// calls, which all returned the same result.
+    fn is_stuck_repeating(&self, call_key: &str) -> bool {
+        self.recent_calls.len() == DOOM_LOOP_REPEATS - 1
+            && self.recent_calls.iter().all(|(key, _)| key == call_key)
+            && self.recent_calls.iter().all(|(_, result)| {
+                Some(result) == self.recent_calls.front().map(|(_, r)| r)
+            })
+    }
+
+    /// Remember an executed call and a digest of its result.
+    fn record_call(&mut self, call_key: String, result: &str) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        result.hash(&mut hasher);
+        self.recent_calls.push_back((call_key, hasher.finish()));
+        if self.recent_calls.len() > DOOM_LOOP_REPEATS - 1 {
+            self.recent_calls.pop_front();
+        }
+    }
+
+    /// Apply the tool's permission, asking the user when needed. Returns why
+    /// the call may not run, if it may not.
     async fn check_permission(
         &mut self,
         tc: &ToolCall,
         args: &serde_json::Value,
-    ) -> std::result::Result<Option<String>, Terminal> {
+    ) -> std::result::Result<Option<Denial>, Terminal> {
         let name = &tc.function.name;
         let perm = self
             .cfg
@@ -1417,10 +1556,13 @@ impl AgentRun {
             .unwrap_or(Permission::Ask);
         match perm {
             Permission::Allow => Ok(None),
-            Permission::Deny => Ok(Some(format!(
-                "Permission denied: '{}' is not allowed for this agent",
-                name
-            ))),
+            Permission::Deny => Ok(Some(Denial {
+                message: format!(
+                    "Permission denied: '{}' is not allowed for this agent",
+                    name
+                ),
+                by_user: false,
+            })),
             Permission::Ask => {
                 let (perm_id, response_rx) =
                     self.permission_broker.register(&tc.id);
@@ -1430,18 +1572,32 @@ impl AgentRun {
                     args: args.clone(),
                 });
                 // A dropped responder (broker entry replaced or cleared)
-                // counts as a denial.
-                let allowed = tokio::select! {
-                    response = response_rx => response.unwrap_or(false),
+                // counts as a denial, but not as the user's decision.
+                let answer = tokio::select! {
+                    response = response_rx => response.ok(),
                     _ = wait_for_cancel(&mut self.cancel_rx, &mut self.cancel_open) => {
                         self.permission_broker.forget(&perm_id);
                         return Err(Terminal::Cancelled);
                     }
                 };
                 self.emit(AgentEvent::PermissionResolved { id: perm_id });
-                Ok((!allowed).then(|| {
-                    format!("Permission denied by user for tool '{}'", name)
-                }))
+                Ok(match answer {
+                    Some(true) => None,
+                    Some(false) => Some(Denial {
+                        message: format!(
+                            "Permission denied by user for tool '{}'",
+                            name
+                        ),
+                        by_user: true,
+                    }),
+                    None => Some(Denial {
+                        message: format!(
+                            "Permission request for tool '{}' was not answered",
+                            name
+                        ),
+                        by_user: false,
+                    }),
+                })
             }
         }
     }
@@ -1486,7 +1642,7 @@ fn extract_last_turn_results(
                 } else {
                     content.to_string()
                 };
-                let success = !content.trim_start().starts_with("Error:");
+                let success = tool_result_succeeded(content);
                 results.push(ToolResultSummary {
                     tool_name: tool_name.to_string(),
                     success,
@@ -1504,6 +1660,16 @@ fn extract_last_turn_results(
     }
     results.reverse();
     results
+}
+
+/// Whether a tool result reads as a success: not an error, and not a bash
+/// command that failed or timed out.
+fn tool_result_succeeded(content: &str) -> bool {
+    let last_line = content.trim_end().lines().last().unwrap_or("");
+    !content.trim_start().starts_with("Error:")
+        && !last_line.starts_with("[exit code:")
+        && !(last_line.starts_with("[command timed out")
+            && last_line.ends_with(']'))
 }
 
 /// Extract the most recent user message for context.
@@ -1829,6 +1995,7 @@ mod tests {
                 max_steps: 2,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -1937,6 +2104,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -1989,6 +2157,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -2091,6 +2260,7 @@ mod tests {
                     max_steps: 5,
                     working_directory: "/tmp".into(),
                     role_config: None,
+                    reminder_at_end: false,
                 },
                 RunChannels {
                     events_tx,
@@ -2489,6 +2659,7 @@ mod tests {
                 max_steps: 2,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -2559,6 +2730,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -2611,6 +2783,7 @@ mod tests {
                     max_steps: 2,
                     working_directory: "/tmp".into(),
                     role_config: None,
+                    reminder_at_end: false,
                 },
                 RunChannels {
                     events_tx,
@@ -2706,6 +2879,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -2792,6 +2966,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -2879,6 +3054,7 @@ mod tests {
                 max_steps: 1,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -2939,6 +3115,7 @@ mod tests {
                 max_steps,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3019,6 +3196,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3106,6 +3284,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3207,6 +3386,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: Some(role_config),
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3276,6 +3456,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3367,6 +3548,7 @@ mod tests {
                     max_steps: 10,
                     working_directory: "/tmp".into(),
                     role_config: None,
+                    reminder_at_end: false,
                 },
                 RunChannels {
                     events_tx,
@@ -3484,6 +3666,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3579,6 +3762,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3671,6 +3855,7 @@ mod tests {
                 max_steps: 10,
                 working_directory: "/tmp".into(),
                 role_config: None,
+                reminder_at_end: false,
             },
             RunChannels {
                 events_tx,
@@ -3707,6 +3892,535 @@ mod tests {
             events[first_turn_done + 1],
             AgentEvent::MessagesCommitted(_)
         ));
+    }
+
+    fn call_response(calls: &[(&str, &str, &str)]) -> ChatResult {
+        ChatResult {
+            content: None,
+            tool_calls: calls
+                .iter()
+                .map(|(id, name, args)| ToolCall {
+                    id: (*id).into(),
+                    call_type: "function".into(),
+                    function: ToolFunction {
+                        name: (*name).into(),
+                        arguments: (*args).into(),
+                    },
+                })
+                .collect(),
+            usage: Usage::default(),
+            finish_reason: Some("tool_calls".into()),
+            reasoning_content: None,
+        }
+    }
+
+    fn stop_response(text: &str) -> ChatResult {
+        ChatResult {
+            content: Some(text.into()),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            finish_reason: Some("stop".into()),
+            reasoning_content: None,
+        }
+    }
+
+    struct CountingTool {
+        name: &'static str,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: self.name.into(),
+                    description: "counting test tool".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolExecutionResult {
+                output: "same result".into(),
+                changes: Vec::new(),
+                rollback_entries: Vec::new(),
+            })
+        }
+    }
+
+    /// Run a loop over `responses` with the given tools and permissions,
+    /// answering permission prompts with `answer`; returns all events.
+    async fn run_scripted_tools(
+        responses: Vec<ChatResult>,
+        tools: Vec<Box<dyn Tool>>,
+        permissions: &[(&str, crate::config::Permission)],
+        answer: bool,
+    ) -> Vec<AgentEvent> {
+        let broker = PermissionBroker::default();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_loop(
+            RunConfig {
+                provider: Arc::new(ScriptedProvider {
+                    calls: Arc::new(Mutex::new(0)),
+                    responses: Arc::new(Mutex::new(responses.into())),
+                }),
+                tools: Arc::new(ToolRegistry::new(tools)),
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions: permissions
+                    .iter()
+                    .map(|(name, perm)| ((*name).to_string(), *perm))
+                    .collect(),
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+                reminder_at_end: false,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: broker.clone(),
+            },
+            "hi".into(),
+            Vec::new(),
+        ));
+        let mut events = Vec::new();
+        while let Some(event) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            events_rx.recv(),
+        )
+        .await
+        .expect("loop stalled")
+        {
+            let event = event.unwrap();
+            if let AgentEvent::PermissionRequest { id, .. } = &event {
+                broker.resolve(id, answer);
+            }
+            let done = is_terminal(&event);
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        loop_task.await.unwrap();
+        events
+    }
+
+    #[tokio::test]
+    async fn test_third_identical_call_in_a_row_is_refused() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let args = r#"{"cmd":"cargo test"}"#;
+        let events = run_scripted_tools(
+            vec![
+                call_response(&[("c1", "check", args)]),
+                call_response(&[("c2", "check", args)]),
+                call_response(&[("c3", "check", args)]),
+                stop_response("giving up"),
+            ],
+            vec![Box::new(CountingTool {
+                name: "check",
+                runs: Arc::clone(&runs),
+            })],
+            &[("check", crate::config::Permission::Allow)],
+            true,
+        )
+        .await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolFailed { id, error } if id == "c3" && error.contains("Refused")
+        )));
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_different_arguments_are_not_a_loop() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run_scripted_tools(
+            vec![
+                call_response(&[("c1", "check", r#"{"n":1}"#)]),
+                call_response(&[("c2", "check", r#"{"n":2}"#)]),
+                call_response(&[("c3", "check", r#"{"n":1}"#)]),
+                stop_response("done"),
+            ],
+            vec![Box::new(CountingTool {
+                name: "check",
+                runs: Arc::clone(&runs),
+            })],
+            &[("check", crate::config::Permission::Allow)],
+            true,
+        )
+        .await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Returns a different result on every call, like polling a build.
+    struct PollingTool {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for PollingTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: "poll".into(),
+                    description: "polling test tool".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            let n = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolExecutionResult {
+                output: format!("status check #{n}"),
+                changes: Vec::new(),
+                rollback_entries: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repeated_calls_with_changing_results_keep_running() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run_scripted_tools(
+            (1..=4)
+                .map(|i| call_response(&[(&format!("c{i}"), "poll", "{}")]))
+                .chain([stop_response("done")])
+                .collect(),
+            vec![Box::new(PollingTool {
+                runs: Arc::clone(&runs),
+            })],
+            &[("poll", crate::config::Permission::Allow)],
+            true,
+        )
+        .await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// A tool whose own run was stopped by a user denial (like a subagent).
+    struct DeniedInsideTool;
+
+    #[async_trait]
+    impl Tool for DeniedInsideTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: "subagent".into(),
+                    description: "test".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            Err(UserDeniedToolCall {
+                summary: "[Tools used: edit a.txt]".into(),
+            }
+            .into())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_denial_inside_a_subagent_stops_the_parent() {
+        let events = run_scripted_tools(
+            vec![
+                call_response(&[("c1", "subagent", "{}")]),
+                stop_response("should never be requested"),
+            ],
+            vec![Box::new(DeniedInsideTool)],
+            &[("subagent", crate::config::Permission::Allow)],
+            true,
+        )
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::NeedsContinuation { content, .. })
+                if content == PERMISSION_DENIED_CONTENT
+        ));
+        // What the subagent did before stopping stays visible to the model.
+        assert!(committed_history(&events).iter().any(|m| {
+            m.tool_call_id.as_deref() == Some("c1")
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("[Tools used: edit a.txt]"))
+        }));
+    }
+
+    /// Fails with a different error each time.
+    struct FlakyTool {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for FlakyTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: "flaky".into(),
+                    description: "test".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            let n = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("failure #{n}")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_different_errors_are_different_results() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run_scripted_tools(
+            (1..=3)
+                .map(|i| call_response(&[(&format!("c{i}"), "flaky", "{}")]))
+                .chain([stop_response("done")])
+                .collect(),
+            vec![Box::new(FlakyTool {
+                runs: Arc::clone(&runs),
+            })],
+            &[("flaky", crate::config::Permission::Allow)],
+            true,
+        )
+        .await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_unanswered_prompt_is_not_treated_as_user_denial() {
+        let broker = PermissionBroker::default();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let loop_task = tokio::spawn(run_loop(
+            RunConfig {
+                provider: Arc::new(ScriptedProvider {
+                    calls: Arc::new(Mutex::new(0)),
+                    responses: Arc::new(Mutex::new(
+                        vec![
+                            call_response(&[("c1", "guarded", "{}")]),
+                            stop_response("carried on"),
+                        ]
+                        .into(),
+                    )),
+                }),
+                tools: Arc::new(ToolRegistry::new(vec![Box::new(NamedTool(
+                    "guarded",
+                ))])),
+                system_layers: Vec::new(),
+                options: ChatOptions::default(),
+                permissions: std::collections::HashMap::from([(
+                    "guarded".to_string(),
+                    crate::config::Permission::Ask,
+                )]),
+                max_steps: 10,
+                working_directory: "/tmp".into(),
+                role_config: None,
+                reminder_at_end: false,
+            },
+            RunChannels {
+                events_tx,
+                cancel_rx,
+                permission_broker: broker.clone(),
+            },
+            "hi".into(),
+            Vec::new(),
+        ));
+        let mut last = None;
+        while let Some(event) = events_rx.recv().await {
+            let event = event.unwrap();
+            if let AgentEvent::PermissionRequest { id, .. } = &event {
+                // The responder disappears without an answer.
+                broker.forget(id);
+            }
+            let done = is_terminal(&event);
+            last = Some(event);
+            if done {
+                break;
+            }
+        }
+        loop_task.await.unwrap();
+        assert!(matches!(
+            last,
+            Some(AgentEvent::Done { content, .. }) if content == "carried on"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_user_denial_stops_run_and_skips_rest_of_step() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let events = run_scripted_tools(
+            vec![
+                call_response(&[("c1", "guarded", "{}"), ("c2", "free", "{}")]),
+                stop_response("should never be requested"),
+            ],
+            vec![
+                Box::new(NamedTool("guarded")),
+                Box::new(CountingTool {
+                    name: "free",
+                    runs: Arc::clone(&runs),
+                }),
+            ],
+            &[
+                ("guarded", crate::config::Permission::Ask),
+                ("free", crate::config::Permission::Allow),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        match events.last() {
+            Some(AgentEvent::NeedsContinuation { content, .. }) => {
+                assert_eq!(content, PERMISSION_DENIED_CONTENT);
+            }
+            other => panic!("expected NeedsContinuation, got {other:?}"),
+        }
+        // Every call still has a result, so the history stays valid.
+        let history = committed_history(&events);
+        let results: Vec<(&str, &str)> = history
+            .iter()
+            .filter_map(|m| {
+                Some((m.tool_call_id.as_deref()?, m.content.as_deref()?))
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.contains("Permission denied by user"));
+        assert!(results[1].1.contains("Skipped"));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnDone { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_denial_does_not_stop_run() {
+        let events = run_scripted_tools(
+            vec![
+                call_response(&[("c1", "blocked", "{}")]),
+                stop_response("worked around it"),
+            ],
+            vec![Box::new(NamedTool("blocked"))],
+            &[("blocked", crate::config::Permission::Deny)],
+            true,
+        )
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done { content, .. }) if content == "worked around it"
+        ));
+    }
+
+    struct CapturingProvider {
+        seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _options: &ChatOptions,
+        ) -> Result<ChatResult> {
+            unreachable!("run_loop uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[ChatMessage],
+            _options: &ChatOptions,
+            sender: tokio::sync::mpsc::UnboundedSender<Result<StreamEvent>>,
+        ) {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            let _ = sender.send(Ok(StreamEvent::Done(stop_response("ok"))));
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reminder_position_follows_config() {
+        for at_end in [false, true] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (events_tx, _events_rx) =
+                tokio::sync::mpsc::unbounded_channel();
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            run_loop(
+                RunConfig {
+                    provider: Arc::new(CapturingProvider {
+                        seen: Arc::clone(&seen),
+                    }),
+                    tools: Arc::new(ToolRegistry::new(Vec::new())),
+                    system_layers: vec!["base prompt".into()],
+                    options: ChatOptions::default(),
+                    permissions: std::collections::HashMap::new(),
+                    max_steps: 10,
+                    working_directory: "/tmp".into(),
+                    role_config: None,
+                    reminder_at_end: at_end,
+                },
+                RunChannels {
+                    events_tx,
+                    cancel_rx,
+                    permission_broker: PermissionBroker::default(),
+                },
+                "hi".into(),
+                vec![make_user("earlier"), make_assistant("reply")],
+            )
+            .await;
+            let messages = seen.lock().unwrap()[0].clone();
+            let is_reminder = |m: &ChatMessage| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("<system-reminder>"))
+            };
+            let idx = messages.iter().position(is_reminder).unwrap();
+            if at_end {
+                assert_eq!(idx, messages.len() - 1);
+            } else {
+                assert_eq!(idx, 1, "right after the system prompt");
+                assert_eq!(
+                    messages.last().unwrap().content.as_deref(),
+                    Some("hi")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_tool_result_succeeded_recognizes_bash_failures() {
+        assert!(tool_result_succeeded("hello"));
+        assert!(!tool_result_succeeded("Error: boom"));
+        assert!(!tool_result_succeeded("compiling...\n[exit code: 101]"));
+        assert!(!tool_result_succeeded(
+            "partial\n[command timed out after 5s and was terminated]"
+        ));
+        // Mentions in the middle of output are not failures.
+        assert!(tool_result_succeeded("[exit code: 1] appears in docs\nok"));
     }
 
     #[test]

@@ -362,8 +362,19 @@ where
     }
 }
 
-fn preferred_grep_backend() -> GrepBackend {
-    preferred_grep_backend_with(command_available)
+/// Detected once per process: probing spawns a process, and blocking.
+async fn preferred_grep_backend() -> GrepBackend {
+    static BACKEND: tokio::sync::OnceCell<GrepBackend> =
+        tokio::sync::OnceCell::const_new();
+    *BACKEND
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(|| {
+                preferred_grep_backend_with(command_available)
+            })
+            .await
+            .unwrap_or(GrepBackend::Grep)
+        })
+        .await
 }
 
 impl GrepTool {
@@ -426,7 +437,7 @@ impl Tool for GrepTool {
 
         let include = args.get("include").and_then(|v| v.as_str());
 
-        let output = match preferred_grep_backend() {
+        let output = match preferred_grep_backend().await {
             GrepBackend::Ripgrep => {
                 // Use ripgrep (preferred)
                 let mut cmd = tokio::process::Command::new("rg");
@@ -455,11 +466,25 @@ impl Tool for GrepTool {
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // Exit codes: 0 matches, 1 no matches, anything else an error (bad
+        // pattern, unreadable files) — which may come with partial matches.
+        let failed = !matches!(output.status.code(), Some(0 | 1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let problem = stderr.lines().next().unwrap_or("search failed").trim();
+        if failed && stdout.is_empty() {
+            anyhow::bail!("Search failed: {problem}");
+        }
         if stdout.is_empty() {
             return Ok(result_no_changes("No matches found.".into()));
         }
+        let mut result = stdout;
+        if failed {
+            result.push_str(&format!(
+                "\n[some files could not be searched: {problem}]"
+            ));
+        }
         // Output size is limited centrally by `ToolRegistry::execute`.
-        Ok(result_no_changes(stdout))
+        Ok(result_no_changes(result))
     }
 }
 
@@ -622,7 +647,7 @@ impl Tool for EditTool {
             def_type: "function".into(),
             function: ToolFunctionDef {
                 name: "edit".into(),
-                description: "Perform a search-and-replace edit on a file. Replaces the first occurrence of old_string with new_string.".into(),
+                description: "Perform a search-and-replace edit on a file. old_string must match exactly one place in the file (include surrounding lines to make it unique), unless replace_all is true.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -637,6 +662,11 @@ impl Tool for EditTool {
                         "new_string": {
                             "type": "string",
                             "description": "The replacement text"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every occurrence instead of requiring exactly one (default: false)",
+                            "default": false
                         }
                     },
                     "required": ["file_path", "old_string", "new_string"]
@@ -658,6 +688,15 @@ impl Tool for EditTool {
             .get("new_string")
             .and_then(|v| v.as_str())
             .context("Missing new_string")?;
+        let replace_all = args
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if old.is_empty() {
+            anyhow::bail!(
+                "old_string must not be empty; use the write tool to create or overwrite a file"
+            );
+        }
         let resolved = if PathBuf::from(path).is_absolute() {
             PathBuf::from(path)
         } else {
@@ -670,13 +709,17 @@ impl Tool for EditTool {
                 .with_context(|| {
                     format!("Failed to read {}", resolved.display())
                 })?;
-        if !content.contains(old) {
-            return Err(anyhow::anyhow!(
-                "old_string not found in {}",
+        let new_content = match content.matches(old).count() {
+            0 => {
+                anyhow::bail!("old_string not found in {}", resolved.display())
+            }
+            1 => content.replacen(old, new, 1),
+            _ if replace_all => content.replace(old, new),
+            n => anyhow::bail!(
+                "old_string matches {n} places in {}; include more surrounding text to make it unique, or set replace_all to true",
                 resolved.display()
-            ));
-        }
-        let new_content = content.replacen(old, new, 1);
+            ),
+        };
         tokio::fs::write(&resolved, &new_content)
             .await
             .with_context(|| {
@@ -809,7 +852,7 @@ impl Tool for BashTool {
             def_type: "function".into(),
             function: ToolFunctionDef {
                 name: "bash".into(),
-                description: "Execute a shell command. Use with caution."
+                description: "Execute a shell command. Output keeps the start and end of very long results. Background processes started by the command are terminated when it finishes; the timeout is capped at 600 seconds."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -825,7 +868,7 @@ impl Tool for BashTool {
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Timeout in seconds (default: 120)",
+                            "description": "Timeout in seconds (default: 120, max: 600)",
                             "default": 120
                         }
                     },
@@ -840,61 +883,255 @@ impl Tool for BashTool {
             .get("command")
             .and_then(|v| v.as_str())
             .context("Missing command")?;
-        let timeout_secs =
-            args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
+        let timeout_secs = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
+            .clamp(1, MAX_BASH_TIMEOUT_SECS);
 
-        // Use sh -c for portable shell execution, with a timeout guard.
-        // `kill_on_drop(true)` ensures a timed-out command does not keep
-        // running in the background after the future is dropped.
-        let child = tokio::process::Command::new("sh")
+        let mut command = tokio::process::Command::new("sh");
+        command
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.ctx.workspace)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("Failed to execute command")?;
+            .kill_on_drop(true);
+        // Own process group, so the whole tree (including background jobs)
+        // can be signalled at once.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().context("Failed to execute command")?;
+        // Kills the group when dropped: covers cancellation of this future.
+        let mut group = ProcessGroup::new(child.id());
 
-        let output = match tokio::time::timeout(
+        let stdout = child.stdout.take().map(Capture::start);
+        let stderr = child.stderr.take().map(Capture::start);
+
+        let status = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
+            child.wait(),
         )
         .await
         {
-            Ok(result) => result.context("Failed to execute command")?,
-            Err(_) => {
-                return Ok(result_no_changes(format!(
-                    "[command timed out after {}s]",
-                    timeout_secs
-                )));
-            }
+            Ok(status) => Some(status.context("Failed to execute command")?),
+            Err(_) => None,
         };
+        // The shell has exited (or timed out). Anything it left running still
+        // holds the output pipes, and the readers would wait for them
+        // forever; end the whole group so they reach EOF.
+        group.kill();
+        if status.is_none() {
+            // Without process groups (non-unix) only this kills the shell.
+            let _ = child.start_kill();
+            let _ =
+                tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await;
+        }
 
         let mut result = String::new();
-        if !output.stdout.is_empty() {
-            result.push_str(&String::from_utf8_lossy(&output.stdout));
+        // Drain both streams at once, so a held-open pipe costs one wait.
+        let finish = |capture: Option<Capture>| async move {
+            match capture {
+                Some(capture) => {
+                    Some(capture.finish(OUTPUT_DRAIN_TIMEOUT).await)
+                }
+                None => None,
+            }
+        };
+        let (stdout, stderr) = tokio::join!(finish(stdout), finish(stderr));
+        let mut still_open = false;
+        for (i, (text, complete)) in
+            [stdout, stderr].into_iter().flatten().enumerate()
+        {
+            still_open |= !complete;
+            if text.is_empty() {
+                continue;
+            }
+            if !result.is_empty() && i > 0 {
+                result.push('\n');
+            }
+            result.push_str(&text);
         }
-        if !output.stderr.is_empty() {
+        if still_open {
             if !result.is_empty() {
                 result.push('\n');
             }
-            result.push_str(&String::from_utf8_lossy(&output.stderr));
+            result.push_str(
+                "[output may be incomplete: a process that left the command's process group still holds its output open]",
+            );
         }
-        if !output.status.success() {
-            if !result.is_empty() {
-                result.push('\n');
+        match status {
+            None => {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&format!(
+                    "[command timed out after {timeout_secs}s and was terminated]"
+                ));
             }
-            result.push_str(&format!(
-                "[exit code: {}]",
-                output.status.code().unwrap_or(-1)
-            ));
+            Some(status) if !status.success() => {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&format!(
+                    "[exit code: {}]",
+                    status.code().unwrap_or(-1)
+                ));
+            }
+            Some(_) => {}
         }
         if result.is_empty() {
             result = "(no output)".into();
         }
         // Output size is limited centrally by `ToolRegistry::execute`.
         Ok(result_no_changes(result))
+    }
+}
+
+/// Default and maximum run time for one bash command.
+const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
+const MAX_BASH_TIMEOUT_SECS: u64 = 600;
+/// How long to wait for remaining output after the process group is gone.
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+/// Bytes of each output stream kept from its start and from its end; the
+/// middle of very long output (e.g. a verbose build) is dropped. Both
+/// streams together stay under the registry's output cap.
+const CAPTURE_HEAD_BYTES: usize = 12 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 10 * 1024;
+
+/// A command output stream being read in the background, keeping only its
+/// head and tail so a command that prints without end cannot exhaust
+/// memory. What was read so far stays available even if the stream never
+/// closes.
+struct Capture {
+    buffer: Arc<std::sync::Mutex<CaptureBuffer>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct CaptureBuffer {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: usize,
+}
+
+impl Capture {
+    fn start(
+        mut stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    ) -> Self {
+        let buffer = Arc::new(std::sync::Mutex::new(CaptureBuffer::default()));
+        let shared = Arc::clone(&buffer);
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(&chunk[..n]),
+                }
+            }
+        });
+        Self { buffer, reader }
+    }
+
+    /// Wait up to `limit` for the stream to close, then return what was
+    /// captured and whether the stream was read to the end. A stream still
+    /// open after `limit` is abandoned (its reader stopped) rather than
+    /// discarded.
+    async fn finish(mut self, limit: std::time::Duration) -> (String, bool) {
+        let complete =
+            tokio::time::timeout(limit, &mut self.reader).await.is_ok();
+        if !complete {
+            self.reader.abort();
+        }
+        let text = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .render();
+        (text, complete)
+    }
+}
+
+impl CaptureBuffer {
+    fn push(&mut self, mut chunk: &[u8]) {
+        if self.head.len() < CAPTURE_HEAD_BYTES {
+            let take = chunk.len().min(CAPTURE_HEAD_BYTES - self.head.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        self.tail.extend(chunk);
+        if self.tail.len() > CAPTURE_TAIL_BYTES {
+            let excess = self.tail.len() - CAPTURE_TAIL_BYTES;
+            self.tail.drain(..excess);
+            self.dropped += excess;
+        }
+    }
+
+    fn render(&mut self) -> String {
+        let tail = self.tail.make_contiguous();
+        if self.dropped == 0 {
+            // Nothing was cut: decode as one, so a character spanning the
+            // head/tail seam stays intact.
+            let mut all = self.head.clone();
+            all.extend_from_slice(tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        // Cut points can fall inside a multi-byte character; drop the
+        // partial bytes on either side instead of showing U+FFFD.
+        let head_end = match std::str::from_utf8(&self.head) {
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            _ => self.head.len(),
+        };
+        let tail_start = tail
+            .iter()
+            .take(3)
+            .take_while(|&&b| b & 0xC0 == 0x80)
+            .count();
+        format!(
+            "{}\n[... {} bytes of output omitted ...]\n{}",
+            String::from_utf8_lossy(&self.head[..head_end]),
+            self.dropped,
+            String::from_utf8_lossy(&tail[tail_start..])
+        )
+    }
+}
+
+/// The process group of a spawned command. Killing it ends the command and
+/// everything it started; dropping it kills too, so a cancelled tool call
+/// leaves nothing running.
+struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    fn new(pgid: Option<u32>) -> Self {
+        Self(pgid)
+    }
+
+    fn kill(&mut self) {
+        let Some(pgid) = self.0.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Ok(pgid) = libc::pid_t::try_from(pgid) {
+            // SAFETY: killpg only sends a signal; no memory is shared. ESRCH
+            // (the group already exited) is expected and ignored.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pgid; // Without process groups, `kill_on_drop` stops the shell.
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -1220,6 +1457,7 @@ impl SubagentRunner for AgentSubagentRunner {
         let workspace_display = workspace.display().to_string();
 
         let role_config = context.role_loop_config;
+        let reminder_at_end = self.config.server.system_reminder_at_end;
 
         tokio::spawn(async move {
             crate::agent::run_loop(
@@ -1232,6 +1470,7 @@ impl SubagentRunner for AgentSubagentRunner {
                     max_steps: crate::agent::DEFAULT_MAX_STEPS,
                     working_directory: workspace_display,
                     role_config,
+                    reminder_at_end,
                 },
                 crate::agent::RunChannels {
                     events_tx: agent_tx,
@@ -1272,6 +1511,7 @@ impl SubagentRunner for AgentSubagentRunner {
             .flatten();
         let mut awaiting_permission_since: Option<tokio::time::Instant> = None;
         let mut timed_out = false;
+        let mut user_denied = false;
         // Length of `content` when the current turn started, so a retry that
         // discards partial output can drop just this turn's text.
         let mut turn_start = 0;
@@ -1301,6 +1541,16 @@ impl SubagentRunner for AgentSubagentRunner {
                     deadline.and_then(|d| d.checked_add(since.elapsed()));
             }
             match event {
+                // The user refused a prompt inside the subagent: stop the
+                // parent too, instead of letting it work around the refusal.
+                Ok(crate::agent::AgentEvent::NeedsContinuation {
+                    content: c,
+                    ..
+                }) if c == crate::agent::PERMISSION_DENIED_CONTENT => {
+                    user_denied = true;
+                    content = c;
+                    break;
+                }
                 Ok(crate::agent::AgentEvent::Done { content: c, .. })
                 | Ok(crate::agent::AgentEvent::Cancelled {
                     content: c, ..
@@ -1344,9 +1594,10 @@ impl SubagentRunner for AgentSubagentRunner {
                 }
                 Ok(crate::agent::AgentEvent::ToolCompleted {
                     id: tool_call_id,
+                    name,
                     result,
                     changes,
-                    ..
+                    rollback_entries,
                 }) => {
                     let summary = if result.len() > 100 {
                         format!(
@@ -1361,8 +1612,10 @@ impl SubagentRunner for AgentSubagentRunner {
                         crate::agent::AgentEvent::SubagentToolCompleted {
                             id: sub_id.clone(),
                             sub_id: tool_call_id,
+                            tool_name: name,
                             result,
                             changes,
+                            rollback_entries,
                         },
                     ));
                 }
@@ -1462,6 +1715,12 @@ impl SubagentRunner for AgentSubagentRunner {
             },
         ));
 
+        if user_denied {
+            return Err(crate::agent::UserDeniedToolCall {
+                summary: tool_log.trim().to_string(),
+            }
+            .into());
+        }
         Ok(result)
     }
 }
@@ -1722,6 +1981,175 @@ mod tests {
         let args = serde_json::json!({"command": "exit 42"});
         let result = tool.execute(args).await.unwrap();
         assert!(result.output.contains("exit code: 42"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_background_job_does_not_block_and_is_terminated() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws.clone());
+        let started = std::time::Instant::now();
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "sleep 30 & echo $! > bg.pid; echo started"
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(r.output.contains("started"), "{}", r.output);
+        #[cfg(unix)]
+        {
+            let pid: libc::pid_t = std::fs::read_to_string(ws.join("bg.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // Give the kernel a moment to deliver SIGKILL.
+            let mut alive = true;
+            for _ in 0..50 {
+                // SAFETY: signal 0 only checks that the process exists.
+                alive = unsafe { libc::kill(pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(!alive, "background job should be terminated");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bash_timeout_terminates_and_keeps_partial_output() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws);
+        let started = std::time::Instant::now();
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "echo before; sleep 30",
+                "timeout": 1
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(r.output.contains("before"), "{}", r.output);
+        assert!(r.output.contains("timed out after 1s"), "{}", r.output);
+    }
+
+    #[tokio::test]
+    async fn test_bash_huge_output_keeps_head_and_tail() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws);
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "echo FIRST; yes filler | head -n 100000; echo LAST"
+            }))
+            .await
+            .unwrap();
+        assert!(r.output.starts_with("FIRST"), "{}", &r.output[..40]);
+        assert!(r.output.trim_end().ends_with("LAST"));
+        assert!(r.output.contains("bytes of output omitted"));
+        assert!(r.output.len() < CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES + 200);
+    }
+
+    #[tokio::test]
+    async fn test_bash_through_registry_keeps_exit_code_after_huge_output() {
+        let (_d, ws) = tmp_workspace();
+        let registry =
+            crate::llm::ToolRegistry::new(vec![Box::new(BashTool::new(ws))]);
+        let r = registry
+            .execute(
+                "bash",
+                serde_json::json!({
+                    "command": "yes filler | head -n 100000; yes err | head -n 100000 >&2; exit 3"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(r.output.starts_with("filler"), "{}", &r.output[..40]);
+        assert!(
+            r.output.trim_end().ends_with("[exit code: 3]"),
+            "{}",
+            &r.output[r.output.len() - 80..]
+        );
+        assert!(r.output.len() < 50 * 1024 + 1024);
+    }
+
+    #[test]
+    fn test_capture_keeps_multibyte_characters_intact() {
+        // Nothing dropped: a character spanning the head/tail seam survives.
+        let mut buffer = CaptureBuffer::default();
+        let mut text = "a".repeat(CAPTURE_HEAD_BYTES - 1);
+        text.push('é');
+        text.push_str("tail");
+        buffer.push(text.as_bytes());
+        assert_eq!(buffer.render(), text);
+
+        // Dropped middle: partial characters at the cuts are trimmed.
+        let mut buffer = CaptureBuffer::default();
+        let long = "é".repeat(CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES);
+        buffer.push(long.as_bytes());
+        let rendered = buffer.render();
+        assert!(!rendered.contains('\u{FFFD}'));
+        assert!(rendered.contains("bytes of output omitted"));
+    }
+
+    #[tokio::test]
+    async fn test_capture_returns_partial_output_when_stream_stays_open() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = Capture::start(reader);
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"partial output")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // `writer` is still alive: the stream never closes.
+        let (text, complete) =
+            capture.finish(std::time::Duration::from_millis(100)).await;
+        assert_eq!(text, "partial output");
+        assert!(!complete);
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn test_edit_requires_unique_match_unless_replace_all() {
+        let (_d, ws) = tmp_workspace();
+        std::fs::write(ws.join("f.txt"), "a x a x").unwrap();
+        let tool = EditTool::new(ws.clone());
+        let err = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "old_string": "a", "new_string": "b"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("matches 2 places"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("f.txt")).unwrap(),
+            "a x a x"
+        );
+
+        tool.execute(serde_json::json!({
+            "file_path": "f.txt", "old_string": "a", "new_string": "b", "replace_all": true
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("f.txt")).unwrap(),
+            "b x b x"
+        );
+
+        let err = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "old_string": "", "new_string": "z"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_grep_invalid_pattern_is_an_error_not_no_matches() {
+        let (_d, ws) = tmp_workspace();
+        std::fs::write(ws.join("f.txt"), "hello").unwrap();
+        let tool = GrepTool::new(ws);
+        let err = tool
+            .execute(serde_json::json!({"pattern": "(unclosed"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("Search failed"), "{err}");
     }
 
     #[tokio::test]

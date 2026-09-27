@@ -369,7 +369,9 @@ pub struct ReminderContext<'a> {
 
 /// Build the dynamic `<system-reminder>` block for the current turn.
 pub fn build_system_reminder(ctx: &ReminderContext) -> String {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    // Minute resolution: the reminder should change as little as possible
+    // between steps (it is part of every request).
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
 
     let tool_list: Vec<String> = ctx
         .tool_defs
@@ -552,7 +554,7 @@ default = "/nonexistent/prompts/system/mote.md"
     }
 
     #[test]
-    fn test_agent_can_disable_system_prompt_layer() {
+    fn test_agent_can_disble_system_prompt_layer() {
         let dir = tempfile::tempdir().unwrap();
         let prompt_path = dir.path().join("mote.md");
         std::fs::write(&prompt_path, "SHARED SYSTEM PROMPT").unwrap();

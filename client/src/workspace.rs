@@ -8,9 +8,7 @@ pub struct WorkspaceContext {
     pub runtime_session_key: String,
 }
 
-pub fn resolve_workspace_context(
-    session_key_override: Option<&str>,
-) -> Result<WorkspaceContext> {
+pub fn resolve_workspace_context(session_key_override: Option<&str>) -> Result<WorkspaceContext> {
     let root = std::env::current_dir().context("Failed to resolve CWD")?;
     let repo_agents_md = read_repo_agents_md(&root)?;
     let runtime_session_key = if let Some(k) = session_key_override {
@@ -49,9 +47,7 @@ fn validate_session_key(key: &str) -> Result<()> {
         .chars()
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':')
     {
-        anyhow::bail!(
-            "Invalid session key: only letters, numbers, '-', '_' and ':' are allowed"
-        );
+        anyhow::bail!("Invalid session key: only letters, numbers, '-', '_' and ':' are allowed");
     }
     Ok(())
 }
@@ -74,8 +70,7 @@ fn load_or_create_persistent_client_key() -> Result<String> {
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    std::fs::write(&path, &key)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    std::fs::write(&path, &key).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(key)
 }
 

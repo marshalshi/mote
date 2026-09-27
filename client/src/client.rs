@@ -2,17 +2,14 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use marshaling_protocol::{
-    AudioClientEvent, AudioServerEvent, AudioStartConfig, ChatRequest,
-    CompactRequest, CompactResponse, ModelInfo, RollbackResultPayload,
-    ServerEvent, SessionInfo, UiConfig,
+    AudioClientEvent, AudioServerEvent, AudioStartConfig, ChatRequest, CompactRequest,
+    CompactResponse, ModelInfo, RollbackResultPayload, ServerEvent, SessionInfo, UiConfig,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 type WsWriter = futures::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 
@@ -42,10 +39,7 @@ impl AudioTranscriptionStream {
 
 impl ChatStream {
     /// Send a client event (e.g., permission response) over the WebSocket.
-    pub async fn send(
-        &mut self,
-        event: marshaling_protocol::ClientEvent,
-    ) -> Result<()> {
+    pub async fn send(&mut self, event: marshaling_protocol::ClientEvent) -> Result<()> {
         let json = serde_json::to_string(&event)?;
         self._write.send(Message::Text(json)).await?;
         Ok(())
@@ -53,8 +47,8 @@ impl ChatStream {
 }
 
 fn websocket_url_from_base(base_url: &str) -> Result<String> {
-    let url = reqwest::Url::parse(base_url)
-        .with_context(|| format!("Invalid server URL: {base_url}"))?;
+    let url =
+        reqwest::Url::parse(base_url).with_context(|| format!("Invalid server URL: {base_url}"))?;
     if url.scheme() != "http" {
         anyhow::bail!(
             "Only http:// server URLs are supported (got: {})",
@@ -66,12 +60,9 @@ fn websocket_url_from_base(base_url: &str) -> Result<String> {
     Ok(ws)
 }
 
-fn websocket_url_from_base_with_path(
-    base_url: &str,
-    path: &str,
-) -> Result<String> {
-    let url = reqwest::Url::parse(base_url)
-        .with_context(|| format!("Invalid server URL: {base_url}"))?;
+fn websocket_url_from_base_with_path(base_url: &str, path: &str) -> Result<String> {
+    let url =
+        reqwest::Url::parse(base_url).with_context(|| format!("Invalid server URL: {base_url}"))?;
     if url.scheme() != "http" {
         anyhow::bail!(
             "Only http:// server URLs are supported (got: {})",
@@ -131,10 +122,7 @@ impl MoteClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn list_sessions(
-        &self,
-        runtime_session_key: &str,
-    ) -> Result<Vec<SessionInfo>> {
+    pub async fn list_sessions(&self, runtime_session_key: &str) -> Result<Vec<SessionInfo>> {
         let resp = self
             .http
             .get(format!("{}/sessions", self.base_url))
@@ -163,10 +151,7 @@ impl MoteClient {
     }
 
     /// Roll back the most recent tracked file mutation set.
-    pub async fn rollback_last(
-        &self,
-        runtime_session_key: &str,
-    ) -> Result<RollbackResultPayload> {
+    pub async fn rollback_last(&self, runtime_session_key: &str) -> Result<RollbackResultPayload> {
         let resp = self
             .http
             .post(format!("{}/rollback/last", self.base_url))
@@ -181,10 +166,7 @@ impl MoteClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn compact(
-        &self,
-        request: &CompactRequest,
-    ) -> Result<CompactResponse> {
+    pub async fn compact(&self, request: &CompactRequest) -> Result<CompactResponse> {
         let resp = self
             .http
             .post(format!("{}/compact", self.base_url))
@@ -202,12 +184,7 @@ impl MoteClient {
     // ── Credential save ───────────────────────────────────
 
     /// Save a credential (api_key, token) to the server's auth.json.
-    pub async fn save_credential(
-        &self,
-        provider: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<()> {
+    pub async fn save_credential(&self, provider: &str, key: &str, value: &str) -> Result<()> {
         let body = serde_json::json!({
             "provider": provider,
             key: value,
@@ -235,10 +212,7 @@ impl MoteClient {
     /// Sends the initial [`ChatRequest`], then returns a [`ChatStream`]
     /// whose `rx` field yields [`ServerEvent`] messages as they arrive.
     /// The stream stays open until dropped.
-    pub async fn chat_stream(
-        &self,
-        request: ChatRequest,
-    ) -> Result<ChatStream> {
+    pub async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
         let ws_url = websocket_url_from_base(&self.base_url)?;
 
         let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
@@ -248,8 +222,8 @@ impl MoteClient {
         let (write, mut read) = ws_stream.split();
 
         // Send the initial request
-        let req_json = serde_json::to_string(&request)
-            .context("Failed to serialize ChatRequest")?;
+        let req_json =
+            serde_json::to_string(&request).context("Failed to serialize ChatRequest")?;
         let mut write = write;
         if let Err(e) = write.send(Message::Text(req_json)).await {
             anyhow::bail!("Failed to send chat request: {e}");
@@ -258,8 +232,13 @@ impl MoteClient {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Spawn a task to read events from the WebSocket and forward to the channel
+        //
+        // Transport loss before a terminal event is deliberately not turned
+        // into an error: dropping `tx` closes the channel, which the TUI
+        // treats as "detached" and reattaches to the still-running server
+        // run. Callers that cannot reattach must treat a closed channel
+        // without a terminal event as a failure.
         tokio::spawn(async move {
-            let mut saw_terminal = false;
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(msg) => match msg {
@@ -277,7 +256,6 @@ impl MoteClient {
                                         break;
                                     }
                                     if is_terminal {
-                                        saw_terminal = true;
                                         break;
                                     }
                                 }
@@ -289,47 +267,18 @@ impl MoteClient {
                                     let _ = tx.send(ServerEvent::Error {
                                         message: format!("Protocol error: {e}"),
                                     });
-                                    saw_terminal = true;
                                     break;
                                 }
                             }
                         }
-                        Message::Close(frame) => {
-                            if !saw_terminal {
-                                let reason = frame
-                                    .map(|f| {
-                                        format!(
-                                            "code={} reason={}",
-                                            f.code, f.reason
-                                        )
-                                    })
-                                    .unwrap_or_else(|| "no close frame".into());
-                                let _ = tx.send(ServerEvent::Error {
-                                message: format!("Chat websocket closed before completion ({reason})"),
-                            });
-                                saw_terminal = true;
-                            }
-                            break;
-                        }
+                        Message::Close(_) => break,
                         _ => {}
                     },
                     Err(e) => {
-                        if !saw_terminal {
-                            let _ = tx.send(ServerEvent::Error {
-                                message: format!(
-                                    "Chat websocket read error: {e}"
-                                ),
-                            });
-                            saw_terminal = true;
-                        }
+                        tracing::warn!("Chat websocket read error: {e}");
                         break;
                     }
                 }
-            }
-            if !saw_terminal {
-                let _ = tx.send(ServerEvent::Error {
-                    message: "Chat websocket ended before completion".into(),
-                });
             }
         });
 
@@ -340,10 +289,7 @@ impl MoteClient {
         &self,
         config: AudioStartConfig,
     ) -> Result<AudioTranscriptionStream> {
-        let ws_url = websocket_url_from_base_with_path(
-            &self.base_url,
-            "/audio/transcribe",
-        )?;
+        let ws_url = websocket_url_from_base_with_path(&self.base_url, "/audio/transcribe")?;
         let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .context("Failed to connect to audio transcription WebSocket")?;
@@ -354,8 +300,7 @@ impl MoteClient {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (control_tx, mut control_rx) =
-            mpsc::unbounded_channel::<AudioClientEvent>();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<AudioClientEvent>();
 
         tokio::spawn(async move {
             loop {
@@ -399,35 +344,26 @@ impl MoteClient {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<AudioServerEvent>(&text) {
                             Ok(event) => {
-                                tracing::debug!(
-                                    ?event,
-                                    "received audio server event"
-                                );
+                                tracing::debug!(?event, "received audio server event");
                                 let terminal = matches!(
                                     event,
-                                    AudioServerEvent::Stopped
-                                        | AudioServerEvent::Error { .. }
+                                    AudioServerEvent::Stopped | AudioServerEvent::Error { .. }
                                 );
                                 if event_tx.send(event).is_err() || terminal {
                                     break;
                                 }
                             }
                             Err(e) => {
-                                let _ =
-                                    event_tx.send(AudioServerEvent::Error {
-                                        message: format!(
-                                            "Audio protocol error: {e}"
-                                        ),
-                                    });
+                                let _ = event_tx.send(AudioServerEvent::Error {
+                                    message: format!("Audio protocol error: {e}"),
+                                });
                                 break;
                             }
                         }
                     }
                     Ok(Message::Close(frame)) => {
                         let reason = frame
-                            .map(|f| {
-                                format!("code={} reason={}", f.code, f.reason)
-                            })
+                            .map(|f| format!("code={} reason={}", f.code, f.reason))
                             .unwrap_or_else(|| "no close frame".into());
                         tracing::warn!(%reason, "audio websocket closed by server");
                         let _ = event_tx.send(AudioServerEvent::Error {

@@ -241,6 +241,33 @@ pub struct ServerConfig {
     /// Agent name used when no agent is specified (default: "build").
     #[serde(default = "default_agent_name")]
     pub default_agent: String,
+    /// Cancel a run whose permission prompt stays unanswered with no client
+    /// attached for this long (default: 600 seconds).
+    #[serde(default = "default_detached_permission_timeout_secs")]
+    pub detached_permission_timeout_secs: u64,
+    /// Fail (and retry) a provider request when its first streamed data
+    /// takes longer than this: queueing, model loading, prompt evaluation
+    /// (default: 600 seconds; 0 disables).
+    #[serde(default = "default_first_response_timeout_secs")]
+    pub first_response_timeout_secs: u64,
+    /// Fail (and retry) a provider stream when no data arrives for this long
+    /// between chunks (default: 180 seconds; 0 disables).
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    /// Time budget for one subagent run, excluding time spent waiting for
+    /// the user to answer its permission prompts (default: 900 seconds,
+    /// longer than `first_response_timeout_secs` so a slow first response
+    /// is retried before the budget runs out; 0 disables).
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub subagent_timeout_secs: u64,
+    /// Put the per-turn `<system-reminder>` after the conversation instead
+    /// of before it (default: false). At the end, the prompt prefix stays
+    /// identical between steps, so providers can reuse their prompt cache —
+    /// much cheaper and faster on long runs. Off by default because some
+    /// models' chat templates only honor a system message at the start;
+    /// enable it after checking your provider handles it.
+    #[serde(default)]
+    pub system_reminder_at_end: bool,
 }
 
 fn default_server_port() -> u16 {
@@ -252,6 +279,18 @@ fn default_max_steps() -> usize {
 fn default_agent_name() -> String {
     marshaling_protocol::DEFAULT_AGENT_NAME.into()
 }
+fn default_detached_permission_timeout_secs() -> u64 {
+    600
+}
+fn default_first_response_timeout_secs() -> u64 {
+    600
+}
+fn default_stream_idle_timeout_secs() -> u64 {
+    180
+}
+fn default_subagent_timeout_secs() -> u64 {
+    900
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -259,6 +298,11 @@ impl Default for ServerConfig {
             port: default_server_port(),
             max_steps: default_max_steps(),
             default_agent: default_agent_name(),
+            detached_permission_timeout_secs: default_detached_permission_timeout_secs(),
+            first_response_timeout_secs: default_first_response_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            subagent_timeout_secs: default_subagent_timeout_secs(),
+            system_reminder_at_end: false,
         }
     }
 }
@@ -326,10 +370,10 @@ pub struct AgentConfig {
     pub disable_user_agents_md: bool,
     /// If true, omit the shared system prompt layer for this agent.
     ///
-    /// The field name intentionally matches the current agent-definition
-    /// contract spelling. `disable_system_prompt` is accepted as an alias.
-    #[serde(default, alias = "disable_system_prompt")]
-    pub disble_system_prompt: bool,
+    /// The earlier misspelling `disble_system_prompt` is still accepted, so
+    /// existing agent files keep working.
+    #[serde(default, alias = "disble_system_prompt")]
+    pub disable_system_prompt: bool,
     /// Agent mode: "primary" (user-selectable, default), "subagent" (tool-only), "all" (both).
     #[serde(default = "default_agent_mode")]
     pub mode: String,
@@ -354,7 +398,7 @@ impl Default for AgentConfig {
             permissions: HashMap::new(),
             instructions: None,
             disable_user_agents_md: false,
-            disble_system_prompt: false,
+            disable_system_prompt: false,
             mode: default_agent_mode(),
             roles: None,
         }
@@ -394,10 +438,7 @@ impl AgentConfig {
 
     /// Resolve the effective instructions for a role.
     /// Falls back: role.instructions -> agent.instructions -> None.
-    pub fn effective_role_instructions(
-        &self,
-        role: &RoleConfig,
-    ) -> Option<String> {
+    pub fn effective_role_instructions(&self, role: &RoleConfig) -> Option<String> {
         role.instructions
             .clone()
             .or_else(|| self.instructions.clone())
@@ -432,18 +473,16 @@ impl Default for GlobalPermissionConfig {
 
 impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path).with_context(|| {
-            format!("Failed to read config: {}", path.display())
-        })?;
-        Ok(toml::from_str(&raw)
-            .context("Failed to parse config.toml — check the format")?)
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config: {}", path.display()))?;
+        toml::from_str(&raw).context("Failed to parse config.toml — check the format")
     }
 
     pub fn effective_provider(&self, agent_override: Option<&str>) -> String {
-        if let Some(model_str) = agent_override {
-            if let Some((provider, _)) = model_str.split_once('/') {
-                return provider.to_string();
-            }
+        if let Some(model_str) = agent_override
+            && let Some((provider, _)) = model_str.split_once('/')
+        {
+            return provider.to_string();
         }
         self.model.provider.clone()
     }
@@ -557,11 +596,7 @@ impl Config {
     }
 
     /// Resolve effective max_tokens: agent → provider default → global.
-    pub fn effective_max_tokens(
-        &self,
-        agent_override: Option<u32>,
-        provider_name: &str,
-    ) -> u32 {
+    pub fn effective_max_tokens(&self, agent_override: Option<u32>, provider_name: &str) -> u32 {
         if let Some(t) = agent_override {
             return t;
         }
@@ -615,8 +650,7 @@ impl Config {
     fn expand(val: &str) -> String {
         use std::sync::LazyLock;
         static ENV_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-                .unwrap()
+            regex::Regex::new(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)").unwrap()
         });
         ENV_RE
             .replace_all(val, |caps: &regex::Captures| {
@@ -636,10 +670,7 @@ impl Config {
 
     /// Get the DeepSeek API key from auth.json first, falling back to config.toml
     /// with a deprecation warning.
-    pub fn resolve_deepseek_api_key(
-        &self,
-        auth: &crate::auth::Auth,
-    ) -> Result<String> {
+    pub fn resolve_deepseek_api_key(&self, auth: &crate::auth::Auth) -> Result<String> {
         // 1. Check auth.json first
         if let Some(key) = auth.api_key("deepseek") {
             return Ok(Self::expand(key));
@@ -694,9 +725,7 @@ impl Config {
         if let Some(key) = auth.api_key(provider) {
             return Ok(Self::expand(key));
         }
-        if let Some(key) =
-            self.provider_api_key_config(provider)?.api_key.as_deref()
-        {
+        if let Some(key) = self.provider_api_key_config(provider)?.api_key.as_deref() {
             tracing::warn!(
                 "Deprecation: {provider}.api_key in config.toml is deprecated. Move it to auth.json (~/.config/mote/auth.json)"
             );
@@ -728,21 +757,17 @@ impl Config {
                 .map(|cfg| cfg.base_url.as_str())
                 .unwrap_or(default_minimax_base_url()),
             _ => {
-                return Ok(Self::expand(
-                    &self.provider_api_key_config(provider)?.base_url,
-                )
-                .trim_end_matches('/')
-                .to_string());
+                return Ok(
+                    Self::expand(&self.provider_api_key_config(provider)?.base_url)
+                        .trim_end_matches('/')
+                        .to_string(),
+                );
             }
         };
         Ok(Self::expand(base_url).trim_end_matches('/').to_string())
     }
 
-    pub fn has_provider_api_key_source(
-        &self,
-        auth: &crate::auth::Auth,
-        provider: &str,
-    ) -> bool {
+    pub fn has_provider_api_key_source(&self, auth: &crate::auth::Auth, provider: &str) -> bool {
         if auth.api_key(provider).is_some() {
             return true;
         }
@@ -775,10 +800,7 @@ impl Config {
         }
     }
 
-    pub fn resolve_audio_api_key(
-        &self,
-        auth: &crate::auth::Auth,
-    ) -> Result<String> {
+    pub fn resolve_audio_api_key(&self, auth: &crate::auth::Auth) -> Result<String> {
         if self.audio.provider != "openai" {
             anyhow::bail!(
                 "Unsupported audio provider '{}'. Supported: openai",
@@ -790,15 +812,10 @@ impl Config {
             .context("No OpenAI API key found. Run --login openai or add {\"openai\":{\"api_key\":\"sk-...\"}} to ~/.config/mote/auth.json.")
     }
 
-    fn provider_api_key_config(
-        &self,
-        provider: &str,
-    ) -> Result<&ProviderApiKey> {
+    fn provider_api_key_config(&self, provider: &str) -> Result<&ProviderApiKey> {
         match provider {
             "glm" => self.providers.glm.as_ref().context("GLM not configured"),
-            "kimi" => {
-                self.providers.kimi.as_ref().context("Kimi not configured")
-            }
+            "kimi" => self.providers.kimi.as_ref().context("Kimi not configured"),
             "minimax" => self
                 .providers
                 .minimax
@@ -811,16 +828,12 @@ impl Config {
     /// Resolve the effective permission for a tool, given the current agent name.
     /// Resolution order: agent-specific → global tool → global default.
     #[allow(dead_code)] // public API, used in tests
-    pub fn resolve_permission(
-        &self,
-        agent_name: &str,
-        tool_name: &str,
-    ) -> Permission {
+    pub fn resolve_permission(&self, agent_name: &str, tool_name: &str) -> Permission {
         // 1. Agent-specific permission
-        if let Some(agent) = self.agents.get(agent_name) {
-            if let Some(perm) = agent.permissions.get(tool_name) {
-                return *perm;
-            }
+        if let Some(agent) = self.agents.get(agent_name)
+            && let Some(perm) = agent.permissions.get(tool_name)
+        {
+            return *perm;
         }
         // 2. Global tool permission
         if let Some(perm) = self.permissions.tools.get(tool_name) {
@@ -858,57 +871,47 @@ fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "md") {
-                    if let Some(stem) =
-                        path.file_stem().and_then(|s| s.to_str())
-                    {
-                        match std::fs::read_to_string(&path) {
-                            Ok(content) => {
-                                match parse_agent_markdown(&content) {
-                                    Ok(mut cfg) => {
-                                        // Validate mode
-                                        let mode = cfg.mode.clone();
-                                        if !["primary", "subagent", "all"]
-                                            .contains(&mode.as_str())
-                                        {
-                                            tracing::warn!(
-                                                "Agent '{}' has unknown mode '{}', defaulting to 'primary'",
-                                                stem,
-                                                mode
-                                            );
-                                            cfg.mode = "primary".into();
-                                        }
-                                        agents.insert(stem.to_string(), cfg);
-                                    }
-                                    Err(e) => {
+                if path.extension().is_some_and(|e| e == "md")
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            match parse_agent_markdown(&content) {
+                                Ok(mut cfg) => {
+                                    // Validate mode
+                                    let mode = cfg.mode.clone();
+                                    if !["primary", "subagent", "all"].contains(&mode.as_str()) {
                                         tracing::warn!(
-                                            "Failed to parse agent file '{}': {e}",
-                                            path.display()
+                                            "Agent '{}' has unknown mode '{}', defaulting to 'primary'",
+                                            stem,
+                                            mode
                                         );
+                                        cfg.mode = "primary".into();
                                     }
+                                    agents.insert(stem.to_string(), cfg);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to parse agent file '{}': {e}",
+                                        path.display()
+                                    );
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to read agent file '{}': {e}",
-                                    path.display()
-                                );
-                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to read agent file '{}': {e}", path.display());
                         }
                     }
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(
-                "Failed to read agents directory '{}': {e}",
-                dir.display()
-            );
+            tracing::warn!("Failed to read agents directory '{}': {e}", dir.display());
         }
     }
 }
 
-fn parse_agent_markdown(content: &str) -> Result<AgentConfig> {
+pub(crate) fn parse_agent_markdown(content: &str) -> Result<AgentConfig> {
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let trimmed = normalized.trim();
 
@@ -937,9 +940,7 @@ fn split_markdown_frontmatter(content: &str) -> Option<(&str, &str)> {
 
 /// Get all agents: merged from config.toml `[agents]` and file-based agents.
 /// Config.toml agents take precedence on name collision.
-pub fn all_agents(
-    config_agents: &HashMap<String, AgentConfig>,
-) -> HashMap<String, AgentConfig> {
+pub fn all_agents(config_agents: &HashMap<String, AgentConfig>) -> HashMap<String, AgentConfig> {
     let mut agents = load_file_agents();
     for (name, cfg) in config_agents {
         agents.insert(name.clone(), cfg.clone());
@@ -1197,7 +1198,7 @@ base_url = "https://api.deepseek.com/v1"
                 permissions: HashMap::new(),
                 instructions: None,
                 disable_user_agents_md: false,
-                disble_system_prompt: false,
+                disable_system_prompt: false,
                 mode: "primary".into(),
                 roles: None,
             },
@@ -1231,10 +1232,7 @@ permissions = { bash = "allow" }
         )
         .unwrap();
         // Agent "code" overrides bash to "allow"
-        assert_eq!(
-            config.resolve_permission("code", "bash"),
-            Permission::Allow
-        );
+        assert_eq!(config.resolve_permission("code", "bash"), Permission::Allow);
         // No agent → falls back to global tool → global default
         assert_eq!(
             config.resolve_permission("nonexistent", "bash"),
@@ -1289,10 +1287,7 @@ You are a review agent.
         assert_eq!(cfg.temperature, Some(0.2));
         assert_eq!(cfg.max_tokens, Some(2048));
         assert_eq!(cfg.mode, "all");
-        assert_eq!(
-            cfg.permissions.get("bash").copied(),
-            Some(Permission::Deny)
-        );
+        assert_eq!(cfg.permissions.get("bash").copied(), Some(Permission::Deny));
         assert_eq!(
             cfg.instructions.as_deref(),
             Some("# Review\n\nYou are a review agent.")
@@ -1352,15 +1347,13 @@ Plan instructions.
         )
         .unwrap();
 
-        let content =
-            std::fs::read_to_string(agent_dir.join("review.md")).unwrap();
+        let content = std::fs::read_to_string(agent_dir.join("review.md")).unwrap();
         let cfg = parse_agent_markdown(&content).unwrap();
         assert_eq!(cfg.model.as_deref(), Some("ollama/qwen"));
         assert_eq!(cfg.temperature, Some(0.2));
         assert_eq!(cfg.instructions.as_deref(), Some("Review instructions."));
 
-        let content2 =
-            std::fs::read_to_string(agent_dir.join("plan.md")).unwrap();
+        let content2 = std::fs::read_to_string(agent_dir.join("plan.md")).unwrap();
         let cfg2 = parse_agent_markdown(&content2).unwrap();
         assert_eq!(cfg2.model.as_deref(), Some("ollama/deepseek"));
         assert_eq!(
@@ -1375,21 +1368,15 @@ Plan instructions.
         let merged = all_agents(&HashMap::new());
         // File agents depend on the user's ~/.config/mote/agents/ directory.
         // If markdown agent files exist, ensure at least some are loaded.
-        let agent_dir = dirs::home_dir()
-            .map(|h| h.join(".config").join("mote").join("agents"));
-        let has_markdown_agents = agent_dir.as_ref().map_or(false, |d| {
+        let agent_dir = dirs::home_dir().map(|h| h.join(".config").join("mote").join("agents"));
+        let has_markdown_agents = agent_dir.as_ref().is_some_and(|d| {
             d.is_dir()
                 && std::fs::read_dir(d)
                     .ok()
                     .into_iter()
                     .flatten()
                     .flatten()
-                    .any(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .map_or(false, |ext| ext == "md")
-                    })
+                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
         });
         if has_markdown_agents {
             assert!(!merged.is_empty(), "expected file agents to be loaded");
@@ -1449,7 +1436,7 @@ subagent = "deny"
             Some(Permission::Deny)
         );
         // Unknown keys are ignored
-        assert!(cfg.permissions.get("nonexistent").is_none());
+        assert!(!cfg.permissions.contains_key("nonexistent"));
     }
 
     #[test]
@@ -1476,10 +1463,7 @@ Use markdown instructions.
         assert!(cfg.is_user_selectable());
         assert!(cfg.is_subagent_callable());
         assert_eq!(cfg.temperature, Some(0.2));
-        assert_eq!(
-            cfg.permissions.get("bash").copied(),
-            Some(Permission::Deny)
-        );
+        assert_eq!(cfg.permissions.get("bash").copied(), Some(Permission::Deny));
         assert_eq!(
             cfg.instructions.as_deref(),
             Some("Use markdown instructions.")
@@ -1634,10 +1618,7 @@ Fallback instructions.
         assert_eq!(roles.len(), 2);
         assert_eq!(roles[0].name, "orchestrator");
         assert_eq!(roles[0].model.as_deref(), Some("deepseek/v4"));
-        assert_eq!(
-            roles[0].instructions.as_deref(),
-            Some("Plan and delegate.")
-        );
+        assert_eq!(roles[0].instructions.as_deref(), Some("Plan and delegate."));
         assert_eq!(roles[1].name, "coder");
         assert_eq!(roles[1].model.as_deref(), Some("deepseek/v3"));
         assert!(roles[1].instructions.is_none());
@@ -1663,31 +1644,31 @@ Just instructions.
     fn test_agent_prompt_disable_flags_default_false() {
         let cfg = parse_agent_markdown("# Build\n\nInstructions.").unwrap();
         assert!(!cfg.disable_user_agents_md);
-        assert!(!cfg.disble_system_prompt);
+        assert!(!cfg.disable_system_prompt);
     }
 
     #[test]
     fn test_parse_agent_prompt_disable_flags() {
         let markdown = r#"---
 disable_user_agents_md: true
-disble_system_prompt: true
----
-# Build
-"#;
-        let cfg = parse_agent_markdown(markdown).unwrap();
-        assert!(cfg.disable_user_agents_md);
-        assert!(cfg.disble_system_prompt);
-    }
-
-    #[test]
-    fn test_parse_agent_prompt_disable_system_prompt_alias() {
-        let markdown = r#"---
 disable_system_prompt: true
 ---
 # Build
 "#;
         let cfg = parse_agent_markdown(markdown).unwrap();
-        assert!(cfg.disble_system_prompt);
+        assert!(cfg.disable_user_agents_md);
+        assert!(cfg.disable_system_prompt);
+    }
+
+    #[test]
+    fn test_parse_agent_prompt_accepts_old_misspelled_key() {
+        let markdown = r#"---
+disble_system_prompt: true
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert!(cfg.disable_system_prompt);
     }
 
     #[test]
@@ -1770,14 +1751,12 @@ model_id = "deepseek-chat"
         let config: Config = toml::from_str(toml).unwrap();
 
         // Role model wins
-        let (prov, model) =
-            config.effective_role_model(Some("ollama/qwen"), None);
+        let (prov, model) = config.effective_role_model(Some("ollama/qwen"), None);
         assert_eq!(prov, "ollama");
         assert_eq!(model, "qwen");
 
         // Agent model fallback when role has no model
-        let (prov, model) =
-            config.effective_role_model(None, Some("glm/glm-4"));
+        let (prov, model) = config.effective_role_model(None, Some("glm/glm-4"));
         assert_eq!(prov, "glm");
         assert_eq!(model, "glm-4");
 

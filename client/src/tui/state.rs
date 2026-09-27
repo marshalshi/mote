@@ -161,6 +161,47 @@ pub struct App {
     /// Active server-side run ID, used to reattach after transient websocket drops.
     pub active_run_id: Option<String>,
 
+    /// Identifies this TUI process to the server, which allows at most one
+    /// active run per instance.
+    pub client_instance_id: String,
+
+    /// Number of run-log events received for `active_run_id` (see
+    /// `ServerEvent::is_run_log_event`). Sent as `replay_from` on reattach so
+    /// the server resumes exactly where this client stopped.
+    pub run_event_count: usize,
+
+    /// Replayed run-log events to drop because they were already applied
+    /// (used when the server attaches us to a run we had lost track of).
+    pub skip_run_log_events: usize,
+
+    /// A run whose connection could not be restored, with how many of its
+    /// log events are already on screen. Kept separate from `active_run_id`
+    /// so a new request never reattaches to it by accident; used only if
+    /// the server later reports it as still busy.
+    pub lost_run: Option<(String, usize)>,
+
+    /// Swallow the attached run's events until it ends. Set when the server
+    /// attaches us to an earlier run of this TUI that belongs to a
+    /// conversation the user has since left (e.g. after /new); that run is
+    /// cancelled rather than mixed into the current conversation.
+    pub discarding_run: bool,
+
+    /// Ctrl+C pressed again while a cancel could not be delivered yet (the
+    /// websocket is reconnecting): stop waiting for the connection.
+    pub stop_reattach_requested: bool,
+
+    /// Size of the conversation the model sees, as last reported by the
+    /// server (`ServerEvent::ContextSize`). It includes tool calls and
+    /// results, which the local view does not show.
+    pub server_context_chars: Option<u64>,
+
+    /// Answers (allowed, remember) this client already sent in the current
+    /// run, by permission id. When the server re-announces one of these as
+    /// `PermissionPending`, the answer either raced with the attach snapshot
+    /// or was lost with the old socket; re-sending it covers both, and the
+    /// server ignores a duplicate.
+    pub answered_permissions: std::collections::HashMap<String, (bool, bool)>,
+
     /// Session picker popup state.
     pub session_picker_open: bool,
     pub session_picker_items: Vec<marshaling_protocol::SessionInfo>,
@@ -331,10 +372,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 
 impl App {
     #[allow(dead_code)]
-    pub fn new(
-        ui_config: &marshaling_protocol::UiConfig,
-        model_info: String,
-    ) -> Self {
+    pub fn new(ui_config: &marshaling_protocol::UiConfig, model_info: String) -> Self {
         let workspace_root = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".into());
@@ -426,6 +464,18 @@ impl App {
             repo_agents_md,
             runtime_session_key,
             active_run_id: None,
+            client_instance_id: format!(
+                "tui-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ),
+            run_event_count: 0,
+            skip_run_log_events: 0,
+            lost_run: None,
+            discarding_run: false,
+            stop_reattach_requested: false,
+            answered_permissions: std::collections::HashMap::new(),
+            server_context_chars: None,
             session_picker_open: false,
             session_picker_items: Vec::new(),
             session_picker_index: 0,
@@ -449,8 +499,7 @@ impl App {
     }
 
     fn invalidate_response_render_cache(&mut self) {
-        self.response_render_revision =
-            self.response_render_revision.wrapping_add(1);
+        self.response_render_revision = self.response_render_revision.wrapping_add(1);
         self.response_render_cache = None;
     }
 
@@ -530,9 +579,7 @@ impl App {
         } else if self.login_picker_open {
             Some("Close the login picker before entering selection mode.")
         } else if self.pending_permission.is_some() {
-            Some(
-                "Resolve the permission prompt before entering selection mode.",
-            )
+            Some("Resolve the permission prompt before entering selection mode.")
         } else {
             None
         }
@@ -542,9 +589,7 @@ impl App {
         self.agent_model_overrides.get(&self.current_agent)
     }
 
-    pub fn current_model_override_parts(
-        &self,
-    ) -> (Option<String>, Option<String>) {
+    pub fn current_model_override_parts(&self) -> (Option<String>, Option<String>) {
         if let Some(ov) = &self.pending_command_model {
             return (Some(ov.model_id.clone()), ov.provider.clone());
         }
@@ -592,8 +637,7 @@ impl App {
     }
 
     fn sync_current_agent_model_info(&mut self) {
-        self.model_info =
-            self.effective_model_info_for_agent(&self.current_agent);
+        self.model_info = self.effective_model_info_for_agent(&self.current_agent);
     }
 
     // ── Input submission ──────────────────────────────────
@@ -657,9 +701,7 @@ impl App {
 
     fn remember_input(&mut self, text: &str) {
         // Save to history first (including slash commands), dedup against last entry
-        if !text.is_empty()
-            && self.input_history.last().map_or(true, |last| last != text)
-        {
+        if !text.is_empty() && self.input_history.last().is_none_or(|last| last != text) {
             self.input_history.push(text.to_string());
         }
         self.input_history_idx = None;
@@ -673,10 +715,7 @@ impl App {
         self.reset_suggestions();
         self.handled_slash_command = true;
         if command.is_empty() {
-            self.push_command_message(
-                Role::Assistant,
-                "Usage: ! <shell command>",
-            );
+            self.push_command_message(Role::Assistant, "Usage: ! <shell command>");
         } else {
             self.push_command_message(Role::User, format!("$ {command}"));
             self.pending_slash = Some(SlashAction::RunShell(command));
@@ -737,13 +776,8 @@ impl App {
     }
 
     fn handle_secret_login_input(&mut self, text: String) {
-        let Some(secret) =
-            (!text.trim().is_empty()).then_some(text.trim().to_string())
-        else {
-            self.push_command_message(
-                Role::Assistant,
-                "No API key entered. Login cancelled.",
-            );
+        let Some(secret) = (!text.trim().is_empty()).then_some(text.trim().to_string()) else {
+            self.push_command_message(Role::Assistant, "No API key entered. Login cancelled.");
             self.pending_secret_login = None;
             return;
         };
@@ -774,10 +808,7 @@ impl App {
         self.invalidate_response_render_cache();
     }
 
-    pub fn set_custom_commands(
-        &mut self,
-        mut commands: Vec<CustomSlashCommand>,
-    ) {
+    pub fn set_custom_commands(&mut self, mut commands: Vec<CustomSlashCommand>) {
         commands.sort_by(|a, b| a.name.cmp(&b.name));
         self.custom_commands = commands;
         self.update_suggestions();
@@ -821,10 +852,20 @@ impl App {
     pub fn apply_compaction(
         &mut self,
         session_id: String,
-        compaction: marshaling_protocol::CompactionState,
+        mut compaction: marshaling_protocol::CompactionState,
     ) {
+        // The server counts compacted messages in its transcript; locally
+        // the count only marks where compaction happened in this view (for
+        // the context-size heuristic), so use the local position: every
+        // conversation message except a still-unsent user message.
+        let pending = usize::from(self.pending_user_message_content().is_some());
+        compaction.compacted_message_count =
+            self.conversation_message_count().saturating_sub(pending);
         self.active_session_id = Some(session_id);
         self.compaction_state = Some(compaction);
+        // Unknown until the next run reports it; the compacted history is
+        // far smaller than before.
+        self.server_context_chars = None;
         self.pending_compact_confirmation = false;
         self.compact_declined_for_message = None;
         self.push_command_message(
@@ -843,7 +884,14 @@ impl App {
         if self.compact_declined_for_message.as_deref() == Some(last_content) {
             return false;
         }
-        self.uncompacted_context_chars(false) > AUTO_COMPACT_CHAR_THRESHOLD
+        // The server's figure covers tool output the local view lacks; the
+        // unsent message is not in it yet.
+        let server = self.server_context_chars.map_or(0, |chars| {
+            usize::try_from(chars)
+                .unwrap_or(usize::MAX)
+                .saturating_add(last_content.len())
+        });
+        self.uncompacted_context_chars(false).max(server) > AUTO_COMPACT_CHAR_THRESHOLD
     }
 
     pub fn request_auto_compact_confirmation(&mut self) {
@@ -887,8 +935,7 @@ impl App {
             .rev()
             .find(|m| m.source == MessageSource::Conversation)?;
 
-        (latest_conversation.role == Role::User)
-            .then_some(latest_conversation.content.as_str())
+        (latest_conversation.role == Role::User).then_some(latest_conversation.content.as_str())
     }
 
     fn conversation_message_count(&self) -> usize {
@@ -898,10 +945,7 @@ impl App {
             .count()
     }
 
-    fn uncompacted_conversation_message_count(
-        &self,
-        include_latest_user: bool,
-    ) -> usize {
+    fn uncompacted_conversation_message_count(&self, include_latest_user: bool) -> usize {
         self.compact_history_messages(include_latest_user).len()
     }
 
@@ -956,8 +1000,7 @@ impl App {
         if parts.is_empty() {
             return;
         }
-        if let Some(invocation) = self.custom_command_invocation(cmd, parts[0])
-        {
+        if let Some(invocation) = self.custom_command_invocation(cmd, parts[0]) {
             self.handle_custom_command(invocation);
             return;
         }
@@ -996,16 +1039,14 @@ impl App {
             "## Keybindings".to_string(),
             "- `Enter` — Send message".to_string(),
             "- `Alt+Enter` — Newline".to_string(),
-            "- `F6` — Toggle selection mode for native terminal copy"
-                .to_string(),
+            "- `F6` — Toggle selection mode for native terminal copy".to_string(),
             "- `Ctrl+A / Ctrl+E` — Line start / end".to_string(),
             "- `Ctrl+D` — Delete current char".to_string(),
             "- `Ctrl+K` — Clear current line".to_string(),
             "- `Esc` — Press twice within 2s to stop running agent".to_string(),
             "- `Ctrl+C` — Quit / cancel immediately".to_string(),
             "- `Tab` — Cycle agent".to_string(),
-            "- `Up/Down` — Input history, or scroll overflowing draft"
-                .to_string(),
+            "- `Up/Down` — Input history, or scroll overflowing draft".to_string(),
             "- `PgUp/PgDn, Ctrl+↑/↓` — Scroll".to_string(),
             "- `Ctrl+P` — Agent command".to_string(),
             "- `F5` — Cycle subagent views".to_string(),
@@ -1014,8 +1055,7 @@ impl App {
             lines.push(String::new());
             lines.push("## Custom Commands".to_string());
             lines.extend(self.custom_commands.iter().map(|command| {
-                let description =
-                    command.description.as_deref().unwrap_or("Custom prompt");
+                let description = command.description.as_deref().unwrap_or("Custom prompt");
                 format!("- `/{}` — {}", command.name, description)
             }));
         }
@@ -1033,8 +1073,7 @@ impl App {
             .iter()
             .find(|command| command.name == name)?
             .clone();
-        let arguments =
-            full_input[command_token.len()..].trim_start().to_string();
+        let arguments = full_input[command_token.len()..].trim_start().to_string();
         Some(CustomCommandInvocation { command, arguments })
     }
 
@@ -1051,8 +1090,7 @@ impl App {
         }
         if let Some(model) = invocation.command.model.as_deref() {
             let (model_id, provider) = self.resolve_model_selection(model);
-            self.pending_command_model =
-                Some(AgentModelOverride { provider, model_id });
+            self.pending_command_model = Some(AgentModelOverride { provider, model_id });
         }
         self.push_command_message(
             Role::User,
@@ -1094,19 +1132,11 @@ impl App {
             .iter()
             .find(|(name, _, _)| *name == provider)
         {
-            self.handle_api_key_login_command(
-                parts,
-                provider,
-                display_name,
-                key_url,
-            );
+            self.handle_api_key_login_command(parts, provider, display_name, key_url);
         } else {
             self.push_command_message(
                 Role::Assistant,
-                format!(
-                    "Unknown provider: {provider}.\n\n{}",
-                    login_provider_help()
-                ),
+                format!("Unknown provider: {provider}.\n\n{}", login_provider_help()),
             );
         }
     }
@@ -1121,17 +1151,12 @@ impl App {
         let Some(key) = parts.get(2) else {
             self.push_command_message(
                 Role::Assistant,
-                format!(
-                    "Usage: /login {provider} <api_key>\nGet your key at: {key_url}"
-                ),
+                format!("Usage: /login {provider} <api_key>\nGet your key at: {key_url}"),
             );
             return;
         };
 
-        self.push_command_message(
-            Role::Assistant,
-            format!("Saving {display_name} API key..."),
-        );
+        self.push_command_message(Role::Assistant, format!("Saving {display_name} API key..."));
         self.pending_slash = Some(SlashAction::SaveCredential(
             provider.into(),
             "api_key".into(),
@@ -1159,31 +1184,21 @@ impl App {
 
     fn handle_compact_command(&mut self) {
         if self.state != AppState::Idle {
-            self.push_command_message(
-                Role::Assistant,
-                "Cannot compact while agent is running.",
-            );
+            self.push_command_message(Role::Assistant, "Cannot compact while agent is running.");
             return;
         }
         if self.uncompacted_conversation_message_count(true) == 0 {
-            self.push_command_message(
-                Role::Assistant,
-                "Nothing new to compact.",
-            );
+            self.push_command_message(Role::Assistant, "Nothing new to compact.");
             return;
         }
-        self.push_command_message(
-            Role::Assistant,
-            "Compacting older conversation context...",
-        );
+        self.push_command_message(Role::Assistant, "Compacting older conversation context...");
         self.pending_slash = Some(SlashAction::Compact {
             include_latest_user: true,
         });
     }
 
     fn handle_agent_command(&mut self, parts: &[&str]) {
-        let all_agents =
-            all_agent_names(&self.agent_names, &self.default_agent);
+        let all_agents = all_agent_names(&self.agent_names, &self.default_agent);
         if parts.len() < 2 {
             self.push_command_message(
                 Role::Assistant,
@@ -1196,9 +1211,7 @@ impl App {
         }
 
         let name = parts[1];
-        if name == self.default_agent.as_str()
-            || self.agent_names.contains(&name.to_string())
-        {
+        if name == self.default_agent.as_str() || self.agent_names.contains(&name.to_string()) {
             self.current_agent = name.to_string();
             self.input_accent = agent_accent_color(&self.current_agent);
             self.sync_current_agent_model_info();
@@ -1220,10 +1233,7 @@ impl App {
 
     fn handle_model_command(&mut self, parts: &[&str]) {
         if parts.len() < 2 {
-            self.push_command_message(
-                Role::Assistant,
-                "Fetching available models...",
-            );
+            self.push_command_message(Role::Assistant, "Fetching available models...");
             self.pending_slash = Some(SlashAction::FetchModels);
             return;
         }
@@ -1272,13 +1282,7 @@ impl App {
             let status = if sv.done { "done" } else { "running" };
             let viewing = self.current_subagent_index == Some(i);
             let marker = if viewing { " ←" } else { "" };
-            lines.push(format!(
-                "  {}. {} ({}){}",
-                i + 1,
-                sv.name,
-                status,
-                marker
-            ));
+            lines.push(format!("  {}. {} ({}){}", i + 1, sv.name, status, marker));
         }
         lines.push(String::new());
         lines.push("Press F5 to cycle between views.".into());
@@ -1360,10 +1364,7 @@ impl App {
         if streamed.is_empty() {
             return content.to_string();
         }
-        if content.is_empty()
-            || streamed == content
-            || streamed.contains(content)
-        {
+        if content.is_empty() || streamed == content || streamed.contains(content) {
             return streamed.to_string();
         }
         if content.starts_with(streamed) {
@@ -1409,11 +1410,7 @@ impl App {
 
     /// Called at the end of each agent turn. Saves the intermediate text
     /// and tool calls to the conversation history.
-    pub fn agent_turn_done(
-        &mut self,
-        text: &str,
-        tool_calls: &[ToolCallDisplay],
-    ) {
+    pub fn agent_turn_done(&mut self, text: &str, tool_calls: &[ToolCallDisplay]) {
         let change_summary = render_change_summary(tool_calls);
         let final_text = if change_summary.is_empty() {
             text.to_string()
@@ -1448,6 +1445,36 @@ impl App {
         self.invalidate_response_render_cache();
     }
 
+    /// The server is retrying a failed provider request. Text streamed for
+    /// the current turn is dropped when the server says the retry will
+    /// regenerate it, so it is not shown twice.
+    pub fn agent_retrying(
+        &mut self,
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: &str,
+        discarded_output: bool,
+    ) {
+        if discarded_output {
+            self.stream_buffer.clear();
+            self.reasoning_buffer.clear();
+        }
+        let discarded = if discarded_output {
+            "; partial response discarded"
+        } else {
+            ""
+        };
+        self.messages.push(DisplayMessage::command(
+            Role::Assistant,
+            format!(
+                "Provider error: {reason}\nRetrying in {:.1}s (attempt {attempt}/{max_attempts}){discarded}.",
+                delay_ms as f64 / 1000.0
+            ),
+        ));
+        self.invalidate_response_render_cache();
+    }
+
     /// Called when the agent loop finishes entirely.
     pub fn agent_done(&mut self, content: &str) {
         let thinking = if self.reasoning_buffer.is_empty() {
@@ -1458,7 +1485,7 @@ impl App {
         // Sentinel values from the agent loop — don't display as assistant messages
         if matches!(
             content,
-            "(cancelled)" | "(max steps reached)" | "(interrupted)"
+            "(cancelled)" | "(max steps reached)" | "(interrupted)" | "(permission denied)"
         ) {
             if thinking.is_some() {
                 self.messages.push(DisplayMessage {
@@ -1498,6 +1525,184 @@ impl App {
         self.loading_progress = None;
         self.loading_label = None;
         self.invalidate_response_render_cache();
+    }
+
+    /// Track this client's position in the active run's event log.
+    ///
+    /// Returns false when the event is a replayed duplicate that has already
+    /// been applied and must be ignored.
+    pub fn accept_run_log_event(&mut self, event: &marshaling_protocol::ServerEvent) -> bool {
+        if !event.is_run_log_event() {
+            return true;
+        }
+        if matches!(event, marshaling_protocol::ServerEvent::RunStarted { .. }) {
+            self.run_event_count = 0;
+        }
+        self.run_event_count += 1;
+        if self.skip_run_log_events > 0 {
+            self.skip_run_log_events -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// Reset run tracking before sending a new chat request, so nothing from
+    /// a previous run (id, event count, pending skip) leaks into it.
+    pub fn prepare_new_run(&mut self) {
+        self.active_run_id = None;
+        self.run_event_count = 0;
+        self.skip_run_log_events = 0;
+        self.discarding_run = false;
+        self.stop_reattach_requested = false;
+        self.answered_permissions.clear();
+    }
+
+    /// Show a permission prompt for `id`, or answer it right away when the
+    /// user chose "allow always" for this tool.
+    pub fn show_permission_request(
+        &mut self,
+        id: String,
+        tool_name: String,
+        args: &serde_json::Value,
+    ) {
+        if self.auto_allowed_tools.contains(&tool_name) {
+            self.pending_permission_response = Some((id, true, true));
+        } else {
+            self.pending_permission = Some(PendingPermission {
+                id,
+                tool_name,
+                args: args.to_string(),
+                confirming_always: false,
+            });
+            self.touch_response_render();
+        }
+    }
+
+    /// The server re-announced an unanswered prompt after (re)attaching.
+    /// Re-send our earlier answer if we have one; otherwise show the prompt
+    /// unless it is already shown or an answer is already queued.
+    pub fn show_pending_permission(
+        &mut self,
+        id: String,
+        tool_name: String,
+        args: &serde_json::Value,
+    ) {
+        let shown = self.pending_permission.as_ref().is_some_and(|p| p.id == id);
+        let queued = self
+            .pending_permission_response
+            .as_ref()
+            .is_some_and(|(queued_id, _, _)| *queued_id == id);
+        if shown || queued {
+            return;
+        }
+        match self.answered_permissions.get(&id).copied() {
+            Some((allowed, remember)) => {
+                self.pending_permission_response = Some((id, allowed, remember));
+            }
+            None => self.show_permission_request(id, tool_name, args),
+        }
+    }
+
+    /// The server refused to start our message because this client already
+    /// has an active run, and attached us to that run instead.
+    pub fn handle_session_busy(&mut self, run_id: String) {
+        self.run_event_count = 0;
+        self.active_run_id = Some(run_id.clone());
+        let notice = match self.lost_run.take() {
+            // The run we lost track of: everything up to our last known
+            // position is already on screen; skip that part of the replay.
+            Some((lost_id, count)) if lost_id == run_id => {
+                self.skip_run_log_events = count;
+                "A run is already active in this session; attached to it. Your message was not sent and is back in the input box."
+            }
+            // An earlier run from a conversation we have since left: don't
+            // mix its output into this one. Cancel it and swallow its events.
+            _ => {
+                self.skip_run_log_events = 0;
+                self.discarding_run = true;
+                self.pending_cancel = true;
+                "An earlier run from this TUI was still active; cancelling it. Your message was not sent and is back in the input box."
+            }
+        };
+
+        // The message was not sent: take it back out of the conversation and
+        // restore it into the input box so the user can resend it later.
+        if let Some(idx) = self
+            .messages
+            .iter()
+            .rposition(|m| m.source == MessageSource::Conversation)
+            .filter(|&idx| self.messages[idx].role == Role::User)
+        {
+            let restored = self.messages.remove(idx).content;
+            self.input = if self.input.is_empty() {
+                restored
+            } else {
+                format!("{restored}\n{}", self.input)
+            };
+            self.input_cursor = self.input.len();
+            self.reset_input_scroll();
+        }
+        self.messages
+            .push(DisplayMessage::command(Role::Assistant, notice.into()));
+        self.state = AppState::AgentRunning;
+        self.invalidate_response_render_cache();
+    }
+
+    /// The discarded earlier run has ended; return to idle.
+    pub fn finish_discarded_run(&mut self) {
+        self.discarding_run = false;
+        self.active_run_id = None;
+        self.pending_permission = None;
+        self.pending_permission_response = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+        self.state = AppState::Idle;
+        self.loading_progress = None;
+        self.loading_label = None;
+        // Queued inputs are not sent here: the restored message in the input
+        // box comes first, and the queue drains after that run as usual.
+        let notice = match self.input_queue.len() {
+            0 => "Earlier run stopped. Press Enter to send your message.".to_string(),
+            n => format!(
+                "Earlier run stopped. Press Enter to send your message; {n} queued message(s) will follow after it."
+            ),
+        };
+        self.messages
+            .push(DisplayMessage::command(Role::Assistant, notice));
+        self.invalidate_response_render_cache();
+    }
+
+    /// The connection to an in-flight run could not be restored.
+    pub fn connection_lost(&mut self, reason: &str) {
+        self.pending_permission = None;
+        self.pending_permission_response = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+        // Keep whatever was streamed so far visible.
+        if !self.stream_buffer.is_empty() {
+            let text = std::mem::take(&mut self.stream_buffer);
+            self.messages.push(DisplayMessage {
+                role: Role::Assistant,
+                content: text,
+                thinking: None,
+                source: MessageSource::Conversation,
+            });
+        }
+        // Remember the run and our position in it: if the server later
+        // reports it as still busy, the replay resumes from there without
+        // duplicating output. A run being discarded is not ours to resume,
+        // and with no active run an older lost run stays remembered.
+        if let Some(id) = self.active_run_id.take() {
+            self.lost_run = if self.discarding_run {
+                None
+            } else {
+                Some((id, self.run_event_count))
+            };
+        }
+        self.skip_run_log_events = 0;
+        self.discarding_run = false;
+        self.stop_reattach_requested = false;
+        self.set_error(reason);
     }
 
     /// Show an error message (used by start_agent on setup failure).
@@ -1697,8 +1902,7 @@ impl App {
     }
 
     pub fn input_scroll_down(&mut self, amount: usize) {
-        self.input_scroll_offset =
-            self.input_scroll_offset.saturating_sub(amount);
+        self.input_scroll_offset = self.input_scroll_offset.saturating_sub(amount);
     }
 
     pub fn reset_input_scroll(&mut self) {
@@ -1720,14 +1924,9 @@ impl App {
         self.sync_current_agent_model_info();
     }
 
-    pub fn open_session_picker(
-        &mut self,
-        mut items: Vec<marshaling_protocol::SessionInfo>,
-    ) {
+    pub fn open_session_picker(&mut self, mut items: Vec<marshaling_protocol::SessionInfo>) {
         // Newest sessions first in the popup (top = latest).
-        items.sort_by(|a, b| {
-            b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id))
-        });
+        items.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id)));
         self.session_picker_open = true;
         self.session_picker_items = items;
         self.session_picker_index = 0;
@@ -1795,8 +1994,7 @@ impl App {
         if self.login_picker_items.is_empty() {
             return;
         }
-        self.login_picker_index =
-            (self.login_picker_index + 1) % self.login_picker_items.len();
+        self.login_picker_index = (self.login_picker_index + 1) % self.login_picker_items.len();
     }
 
     pub fn selected_login_choice(&self) -> Option<LoginProviderChoice> {
@@ -1838,8 +2036,7 @@ impl App {
         if self.model_picker_items.is_empty() {
             return;
         }
-        self.model_picker_index =
-            (self.model_picker_index + 1) % self.model_picker_items.len();
+        self.model_picker_index = (self.model_picker_index + 1) % self.model_picker_items.len();
     }
 
     pub fn selected_model_choice(&self) -> Option<ModelChoice> {
@@ -1921,6 +2118,8 @@ impl App {
         self.tokens_input = 0;
         self.tokens_output = 0;
         self.active_run_id = None;
+        self.lost_run = None;
+        self.server_context_chars = None;
         self.compaction_state = None;
         self.pending_compact_confirmation = false;
         self.pending_auto_compact_send = false;
@@ -1957,6 +2156,8 @@ impl App {
         self.pending_secret_login = None;
         self.active_session_id = None;
         self.active_run_id = None;
+        self.lost_run = None;
+        self.server_context_chars = None;
         self.compaction_state = None;
         self.pending_compact_confirmation = false;
         self.pending_auto_compact_send = false;
@@ -1998,8 +2199,8 @@ impl App {
         self.suggestions.clear();
         self.suggestion_index = 0;
         let input = self.input.trim_start();
-        if input.starts_with('@') {
-            let after = input[1..].trim_start();
+        if let Some(rest) = input.strip_prefix('@') {
+            let after = rest.trim_start();
             for name in &self.subagent_names {
                 if name.starts_with(after) {
                     self.suggestions.push(format!("@{}", name));
@@ -2014,9 +2215,7 @@ impl App {
         if let Some(cmd) = input.split_whitespace().next() {
             let after = input[cmd.len()..].trim_start();
             if !after.is_empty() && (cmd == "/agent" || cmd == "/a") {
-                for name in
-                    all_agent_names(&self.agent_names, &self.default_agent)
-                {
+                for name in all_agent_names(&self.agent_names, &self.default_agent) {
                     if name.starts_with(after) {
                         self.suggestions.push(format!("/agent {}", name));
                     }
@@ -2032,8 +2231,7 @@ impl App {
         for command in &self.custom_commands {
             let cmd = format!("/{}", command.name);
             if cmd.starts_with(&lower) {
-                let desc =
-                    command.description.as_deref().unwrap_or("Custom prompt");
+                let desc = command.description.as_deref().unwrap_or("Custom prompt");
                 self.suggestions.push(format!("{}  — {}", cmd, desc));
             }
         }
@@ -2046,8 +2244,7 @@ impl App {
 
     pub fn suggestion_next(&mut self) {
         if !self.suggestions.is_empty() {
-            self.suggestion_index =
-                (self.suggestion_index + 1).min(self.suggestions.len());
+            self.suggestion_index = (self.suggestion_index + 1).min(self.suggestions.len());
         }
     }
 
@@ -2058,9 +2255,7 @@ impl App {
     }
 
     pub fn selected_suggestion(&self) -> Option<&str> {
-        if self.suggestion_index > 0
-            && self.suggestion_index <= self.suggestions.len()
-        {
+        if self.suggestion_index > 0 && self.suggestion_index <= self.suggestions.len() {
             let s = &self.suggestions[self.suggestion_index - 1];
             Some(s.split("  —").next().unwrap_or(s))
         } else {
@@ -2134,14 +2329,15 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 fn parse_ui_color(name: &str) -> Color {
     let s = name.trim();
     // Support hex colors: #RRGGBB
-    if s.starts_with('#') && s.len() == 7 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
+    if s.starts_with('#')
+        && s.len() == 7
+        && let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&s[1..3], 16),
             u8::from_str_radix(&s[3..5], 16),
             u8::from_str_radix(&s[5..7], 16),
-        ) {
-            return Color::Rgb(r, g, b);
-        }
+        )
+    {
+        return Color::Rgb(r, g, b);
     }
     match s.to_lowercase().as_str() {
         "cyan" => Color::Cyan,
@@ -3255,10 +3451,7 @@ mod tests {
         app.agent_done("output with details");
 
         assert_eq!(app.messages.len(), 1);
-        assert_eq!(
-            app.messages[0].content,
-            "full streamed output with details"
-        );
+        assert_eq!(app.messages[0].content, "full streamed output with details");
     }
 
     #[test]
@@ -3291,9 +3484,7 @@ mod tests {
         app.agent_tool_started("c2", "bash");
         app.agent_tool_failed("c2", "error msg");
         assert_eq!(app.tool_calls.len(), 2);
-        assert!(
-            matches!(&app.tool_calls[1].status, ToolStatus::Failed(e) if e == "error msg")
-        );
+        assert!(matches!(&app.tool_calls[1].status, ToolStatus::Failed(e) if e == "error msg"));
     }
 
     #[test]
@@ -3333,9 +3524,7 @@ mod tests {
         });
 
         // Append text delta
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.stream_buffer.push_str("Hello ");
             sv.stream_buffer.push_str("World");
         }
@@ -3357,9 +3546,7 @@ mod tests {
         });
 
         // Mark done
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.done = true;
             sv.content = "No bugs found.".into();
             sv.stream_buffer.clear();
@@ -3435,9 +3622,7 @@ mod tests {
             content: String::new(),
         });
 
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.tool_calls.push(marshaling_protocol::ToolCallDisplay {
                 id: "tc_1".into(),
                 name: "read".into(),
@@ -3468,9 +3653,7 @@ mod tests {
             content: String::new(),
         });
 
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.reasoning_buffer.push_str("thinking...");
         }
         assert!(app.subagent_views[0].reasoning_buffer.contains("thinking"));
@@ -3506,9 +3689,7 @@ mod tests {
         assert_eq!(app.subagent_views[1].name, "wiki");
 
         // Update specific subagent by ID
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_002")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_002") {
             sv.stream_buffer.push_str(" done");
         }
         assert_eq!(app.subagent_views[1].stream_buffer, "researching... done");
@@ -3530,9 +3711,7 @@ mod tests {
         });
 
         // Simulate SubagentDone
-        if let Some(sv) =
-            app.subagent_views.iter_mut().find(|s| s.id == "sub_001")
-        {
+        if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == "sub_001") {
             sv.done = true;
             sv.content = "No bugs found.".into();
         }

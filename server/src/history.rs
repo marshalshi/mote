@@ -12,23 +12,21 @@ const MESSAGE_HEADING_SEPARATOR: &str = " — ";
 
 /// Parse a session file (markdown + YAML frontmatter) into its metadata and messages.
 pub fn parse_file(path: &Path) -> Result<(SessionMeta, Vec<Message>)> {
-    let content = std::fs::read_to_string(path).with_context(|| {
-        format!("Failed to read session file: {}", path.display())
-    })?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read session file: {}", path.display()))?;
     parse(&content)
 }
 
 /// Parse a session file's content string.
 pub fn parse(content: &str) -> Result<(SessionMeta, Vec<Message>)> {
     // Split on the first `---` to isolate YAML frontmatter.
-    let rest = strip_frontmatter_prefix(content)
-        .context("Session file must start with `---`")?;
+    let rest = strip_frontmatter_prefix(content).context("Session file must start with `---`")?;
 
-    let (yaml_text, body) = split_frontmatter(rest)
-        .context("Session file missing closing `---` after frontmatter")?;
+    let (yaml_text, body) =
+        split_frontmatter(rest).context("Session file missing closing `---` after frontmatter")?;
 
-    let meta: SessionMeta = serde_yaml::from_str(yaml_text)
-        .context("Failed to parse YAML frontmatter")?;
+    let meta: SessionMeta =
+        serde_yaml::from_str(yaml_text).context("Failed to parse YAML frontmatter")?;
 
     let messages = parse_body(body);
 
@@ -92,6 +90,7 @@ fn is_conversation_heading_line(line: &str) -> bool {
     matches!(parse_message_heading(line), Some(Some(_)))
 }
 
+#[cfg(test)]
 fn escape_message_line(line: &str) -> String {
     if is_conversation_heading_line(line)
         || line.starts_with("\\## User — ")
@@ -104,13 +103,12 @@ fn escape_message_line(line: &str) -> String {
 }
 
 fn unescape_message_line(line: &str) -> &str {
-    if let Some(rest) = line.strip_prefix('\\') {
-        if is_conversation_heading_line(rest)
+    if let Some(rest) = line.strip_prefix('\\')
+        && (is_conversation_heading_line(rest)
             || rest.starts_with("\\## User — ")
-            || rest.starts_with("\\## Assistant — ")
-        {
-            return rest;
-        }
+            || rest.starts_with("\\## Assistant — "))
+    {
+        return rest;
     }
     line
 }
@@ -147,10 +145,12 @@ impl ParsedMessage {
     }
 }
 
-/// Serialize a session to a markdown string with YAML frontmatter.
+/// Serialize a session to a markdown string with YAML frontmatter. Sessions
+/// are written as JSONL transcripts now (see `store`); this remains to build
+/// legacy-format fixtures in tests.
+#[cfg(test)]
 pub fn serialize(meta: &SessionMeta, messages: &[Message]) -> Result<String> {
-    let yaml = serde_yaml::to_string(meta)
-        .context("Failed to serialize session metadata")?;
+    let yaml = serde_yaml::to_string(meta).context("Failed to serialize session metadata")?;
 
     let mut body = String::new();
     for msg in messages {
@@ -169,48 +169,6 @@ pub fn serialize(meta: &SessionMeta, messages: &[Message]) -> Result<String> {
     }
 
     Ok(format!("---\n{}---\n\n{}", yaml, body.trim()))
-}
-
-/// Save a session to disk. Creates `{hist_dir}/{id}.md`.
-pub fn save_session(
-    hist_dir: &Path,
-    session: &crate::session::Session,
-) -> Result<()> {
-    let meta = session.meta();
-    let content = serialize(&meta, &session.messages)?;
-    std::fs::create_dir_all(hist_dir)?;
-    let path = hist_dir.join(format!("{}.md", session.id));
-    std::fs::write(&path, content)?;
-    tracing::info!("Session saved: {}", path.display());
-    Ok(())
-}
-
-/// List sessions from a history directory, returning metadata for each.
-/// Entries are sorted by modification time, newest first.
-pub fn list_sessions(
-    hist_dir: &Path,
-) -> Result<Vec<(SessionMeta, std::path::PathBuf)>> {
-    if !hist_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut entries: Vec<_> = std::fs::read_dir(hist_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
-        .collect();
-    entries.sort_by_key(|e| {
-        e.path().metadata().ok().and_then(|m| m.modified().ok())
-    });
-
-    let mut sessions = Vec::new();
-    for entry in entries {
-        let path = entry.path();
-        if let Ok((meta, _msgs)) = parse_file(&path) {
-            sessions.push((meta, path));
-        }
-    }
-    sessions.reverse(); // newest first
-    Ok(sessions)
 }
 
 #[cfg(test)]
@@ -368,10 +326,7 @@ mod tests {
     fn test_serialize_preserves_content() {
         let msgs = vec![
             Message::new(Role::User, "Multi\nline\ninput".into()),
-            Message::new(
-                Role::Assistant,
-                "Code:\n```rust\nfn main() {}\n```".into(),
-            ),
+            Message::new(Role::Assistant, "Code:\n```rust\nfn main() {}\n```".into()),
         ];
         let meta = SessionMeta {
             id: "test".into(),

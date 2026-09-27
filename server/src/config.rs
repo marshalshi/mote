@@ -241,6 +241,33 @@ pub struct ServerConfig {
     /// Agent name used when no agent is specified (default: "build").
     #[serde(default = "default_agent_name")]
     pub default_agent: String,
+    /// Cancel a run whose permission prompt stays unanswered with no client
+    /// attached for this long (default: 600 seconds).
+    #[serde(default = "default_detached_permission_timeout_secs")]
+    pub detached_permission_timeout_secs: u64,
+    /// Fail (and retry) a provider request when its first streamed data
+    /// takes longer than this: queueing, model loading, prompt evaluation
+    /// (default: 600 seconds; 0 disables).
+    #[serde(default = "default_first_response_timeout_secs")]
+    pub first_response_timeout_secs: u64,
+    /// Fail (and retry) a provider stream when no data arrives for this long
+    /// between chunks (default: 180 seconds; 0 disables).
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    /// Time budget for one subagent run, excluding time spent waiting for
+    /// the user to answer its permission prompts (default: 900 seconds,
+    /// longer than `first_response_timeout_secs` so a slow first response
+    /// is retried before the budget runs out; 0 disables).
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub subagent_timeout_secs: u64,
+    /// Put the per-turn `<system-reminder>` after the conversation instead
+    /// of before it (default: false). At the end, the prompt prefix stays
+    /// identical between steps, so providers can reuse their prompt cache —
+    /// much cheaper and faster on long runs. Off by default because some
+    /// models' chat templates only honor a system message at the start;
+    /// enable it after checking your provider handles it.
+    #[serde(default)]
+    pub system_reminder_at_end: bool,
 }
 
 fn default_server_port() -> u16 {
@@ -252,6 +279,18 @@ fn default_max_steps() -> usize {
 fn default_agent_name() -> String {
     marshaling_protocol::DEFAULT_AGENT_NAME.into()
 }
+fn default_detached_permission_timeout_secs() -> u64 {
+    600
+}
+fn default_first_response_timeout_secs() -> u64 {
+    600
+}
+fn default_stream_idle_timeout_secs() -> u64 {
+    180
+}
+fn default_subagent_timeout_secs() -> u64 {
+    900
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -259,6 +298,12 @@ impl Default for ServerConfig {
             port: default_server_port(),
             max_steps: default_max_steps(),
             default_agent: default_agent_name(),
+            detached_permission_timeout_secs:
+                default_detached_permission_timeout_secs(),
+            first_response_timeout_secs: default_first_response_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            subagent_timeout_secs: default_subagent_timeout_secs(),
+            system_reminder_at_end: false,
         }
     }
 }
@@ -326,10 +371,10 @@ pub struct AgentConfig {
     pub disable_user_agents_md: bool,
     /// If true, omit the shared system prompt layer for this agent.
     ///
-    /// The field name intentionally matches the current agent-definition
-    /// contract spelling. `disable_system_prompt` is accepted as an alias.
-    #[serde(default, alias = "disable_system_prompt")]
-    pub disble_system_prompt: bool,
+    /// The earlier misspelling `disble_system_prompt` is still accepted, so
+    /// existing agent files keep working.
+    #[serde(default, alias = "disble_system_prompt")]
+    pub disable_system_prompt: bool,
     /// Agent mode: "primary" (user-selectable, default), "subagent" (tool-only), "all" (both).
     #[serde(default = "default_agent_mode")]
     pub mode: String,
@@ -354,7 +399,7 @@ impl Default for AgentConfig {
             permissions: HashMap::new(),
             instructions: None,
             disable_user_agents_md: false,
-            disble_system_prompt: false,
+            disable_system_prompt: false,
             mode: default_agent_mode(),
             roles: None,
         }
@@ -435,15 +480,15 @@ impl Config {
         let raw = std::fs::read_to_string(path).with_context(|| {
             format!("Failed to read config: {}", path.display())
         })?;
-        Ok(toml::from_str(&raw)
-            .context("Failed to parse config.toml — check the format")?)
+        toml::from_str(&raw)
+            .context("Failed to parse config.toml — check the format")
     }
 
     pub fn effective_provider(&self, agent_override: Option<&str>) -> String {
-        if let Some(model_str) = agent_override {
-            if let Some((provider, _)) = model_str.split_once('/') {
-                return provider.to_string();
-            }
+        if let Some(model_str) = agent_override
+            && let Some((provider, _)) = model_str.split_once('/')
+        {
+            return provider.to_string();
         }
         self.model.provider.clone()
     }
@@ -817,10 +862,10 @@ impl Config {
         tool_name: &str,
     ) -> Permission {
         // 1. Agent-specific permission
-        if let Some(agent) = self.agents.get(agent_name) {
-            if let Some(perm) = agent.permissions.get(tool_name) {
-                return *perm;
-            }
+        if let Some(agent) = self.agents.get(agent_name)
+            && let Some(perm) = agent.permissions.get(tool_name)
+        {
+            return *perm;
         }
         // 2. Global tool permission
         if let Some(perm) = self.permissions.tools.get(tool_name) {
@@ -858,42 +903,41 @@ fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "md") {
-                    if let Some(stem) =
+                if path.extension().is_some_and(|e| e == "md")
+                    && let Some(stem) =
                         path.file_stem().and_then(|s| s.to_str())
-                    {
-                        match std::fs::read_to_string(&path) {
-                            Ok(content) => {
-                                match parse_agent_markdown(&content) {
-                                    Ok(mut cfg) => {
-                                        // Validate mode
-                                        let mode = cfg.mode.clone();
-                                        if !["primary", "subagent", "all"]
-                                            .contains(&mode.as_str())
-                                        {
-                                            tracing::warn!(
-                                                "Agent '{}' has unknown mode '{}', defaulting to 'primary'",
-                                                stem,
-                                                mode
-                                            );
-                                            cfg.mode = "primary".into();
-                                        }
-                                        agents.insert(stem.to_string(), cfg);
-                                    }
-                                    Err(e) => {
+                {
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            match parse_agent_markdown(&content) {
+                                Ok(mut cfg) => {
+                                    // Validate mode
+                                    let mode = cfg.mode.clone();
+                                    if !["primary", "subagent", "all"]
+                                        .contains(&mode.as_str())
+                                    {
                                         tracing::warn!(
-                                            "Failed to parse agent file '{}': {e}",
-                                            path.display()
+                                            "Agent '{}' has unknown mode '{}', defaulting to 'primary'",
+                                            stem,
+                                            mode
                                         );
+                                        cfg.mode = "primary".into();
                                     }
+                                    agents.insert(stem.to_string(), cfg);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to parse agent file '{}': {e}",
+                                        path.display()
+                                    );
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to read agent file '{}': {e}",
-                                    path.display()
-                                );
-                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to read agent file '{}': {e}",
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -908,7 +952,7 @@ fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
     }
 }
 
-fn parse_agent_markdown(content: &str) -> Result<AgentConfig> {
+pub(crate) fn parse_agent_markdown(content: &str) -> Result<AgentConfig> {
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let trimmed = normalized.trim();
 
@@ -1197,7 +1241,7 @@ base_url = "https://api.deepseek.com/v1"
                 permissions: HashMap::new(),
                 instructions: None,
                 disable_user_agents_md: false,
-                disble_system_prompt: false,
+                disable_system_prompt: false,
                 mode: "primary".into(),
                 roles: None,
             },
@@ -1377,7 +1421,7 @@ Plan instructions.
         // If markdown agent files exist, ensure at least some are loaded.
         let agent_dir = dirs::home_dir()
             .map(|h| h.join(".config").join("mote").join("agents"));
-        let has_markdown_agents = agent_dir.as_ref().map_or(false, |d| {
+        let has_markdown_agents = agent_dir.as_ref().is_some_and(|d| {
             d.is_dir()
                 && std::fs::read_dir(d)
                     .ok()
@@ -1385,10 +1429,7 @@ Plan instructions.
                     .flatten()
                     .flatten()
                     .any(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .map_or(false, |ext| ext == "md")
+                        entry.path().extension().is_some_and(|ext| ext == "md")
                     })
         });
         if has_markdown_agents {
@@ -1449,7 +1490,7 @@ subagent = "deny"
             Some(Permission::Deny)
         );
         // Unknown keys are ignored
-        assert!(cfg.permissions.get("nonexistent").is_none());
+        assert!(!cfg.permissions.contains_key("nonexistent"));
     }
 
     #[test]
@@ -1663,31 +1704,31 @@ Just instructions.
     fn test_agent_prompt_disable_flags_default_false() {
         let cfg = parse_agent_markdown("# Build\n\nInstructions.").unwrap();
         assert!(!cfg.disable_user_agents_md);
-        assert!(!cfg.disble_system_prompt);
+        assert!(!cfg.disable_system_prompt);
     }
 
     #[test]
     fn test_parse_agent_prompt_disable_flags() {
         let markdown = r#"---
 disable_user_agents_md: true
-disble_system_prompt: true
----
-# Build
-"#;
-        let cfg = parse_agent_markdown(markdown).unwrap();
-        assert!(cfg.disable_user_agents_md);
-        assert!(cfg.disble_system_prompt);
-    }
-
-    #[test]
-    fn test_parse_agent_prompt_disable_system_prompt_alias() {
-        let markdown = r#"---
 disable_system_prompt: true
 ---
 # Build
 "#;
         let cfg = parse_agent_markdown(markdown).unwrap();
-        assert!(cfg.disble_system_prompt);
+        assert!(cfg.disable_user_agents_md);
+        assert!(cfg.disable_system_prompt);
+    }
+
+    #[test]
+    fn test_parse_agent_prompt_accepts_old_misspelled_key() {
+        let markdown = r#"---
+disble_system_prompt: true
+---
+# Build
+"#;
+        let cfg = parse_agent_markdown(markdown).unwrap();
+        assert!(cfg.disable_system_prompt);
     }
 
     #[test]

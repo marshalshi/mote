@@ -54,6 +54,14 @@ pub struct ChatRequest {
     /// Optional active run to attach to instead of starting a new agent run.
     #[serde(default)]
     pub run_id: Option<String>,
+    /// When attaching to `run_id`, skip this many run-log events (see
+    /// [`ServerEvent::is_run_log_event`]) because the client already has them.
+    #[serde(default)]
+    pub replay_from: Option<usize>,
+    /// Identifies one running client instance (e.g. one TUI process). The
+    /// server allows at most one active run per instance id.
+    #[serde(default)]
+    pub client_instance_id: Option<String>,
     /// Summary of older turns that should replace the first N history messages.
     #[serde(default)]
     pub compaction: Option<CompactionState>,
@@ -158,11 +166,33 @@ pub enum AudioServerEvent {
 #[serde(tag = "type")]
 pub enum ServerEvent {
     #[serde(rename = "run_started")]
-    RunStarted { run_id: String },
+    RunStarted {
+        run_id: String,
+        /// Session the run belongs to; for a new conversation this is the id
+        /// the server just created, which the client sends on later requests.
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     #[serde(rename = "run_attached")]
     RunAttached { run_id: String },
     #[serde(rename = "run_detached")]
     RunDetached { run_id: String },
+    /// A new chat request arrived while `run_id` is still active in the same
+    /// session. The message was not started; the socket is attached to the
+    /// active run instead (with a full replay).
+    #[serde(rename = "session_busy")]
+    SessionBusy { run_id: String },
+    /// Sent to a newly attached socket for every permission request of the
+    /// run that is still unanswered, after the replay. Lets a client that
+    /// skipped the original `PermissionRequest` (resume by count) or whose
+    /// answer was lost with the old socket show the prompt again. Clients
+    /// ignore it when they already show or have answered that id.
+    #[serde(rename = "permission_pending")]
+    PermissionPending {
+        id: String,
+        tool_name: String,
+        args: serde_json::Value,
+    },
     #[serde(rename = "text_delta")]
     TextDelta { data: String },
     #[serde(rename = "reasoning_delta")]
@@ -219,6 +249,14 @@ pub enum ServerEvent {
         sub_id: String,
         error: String,
     },
+    /// A subagent's provider request is being retried. With
+    /// `discarded_output`, text it streamed for its current turn is void.
+    #[serde(rename = "sub_retrying")]
+    SubagentRetrying {
+        id: String,
+        reason: String,
+        discarded_output: bool,
+    },
     #[serde(rename = "sub_done")]
     SubagentDone { id: String, content: String },
     #[serde(rename = "done")]
@@ -239,6 +277,23 @@ pub enum ServerEvent {
         tokens_input: u64,
         tokens_output: u64,
     },
+    /// Approximate size (characters) of the conversation the model will see
+    /// on the next request: sent when a run starts and after every committed
+    /// step. Includes tool calls and results, which the client's own view
+    /// omits; clients use it to decide when to suggest compaction.
+    #[serde(rename = "context_size")]
+    ContextSize { chars: u64 },
+    /// A provider request failed and is retried after `delay_ms`. When
+    /// `discarded_output` is set, the text streamed so far for the current
+    /// turn is void and must be discarded: the retry regenerates the turn.
+    #[serde(rename = "retrying")]
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: String,
+        discarded_output: bool,
+    },
     #[serde(rename = "error")]
     Error { message: String },
     /// Result of a user-triggered rollback operation.
@@ -252,6 +307,28 @@ pub enum ServerEvent {
     /// Catch-all for unknown event types (backwards compatibility).
     #[serde(other)]
     Unknown,
+}
+
+impl ServerEvent {
+    /// Whether this event belongs to a run's replayable event log.
+    ///
+    /// The server stores exactly these events per run and replays them on
+    /// attach; the client counts exactly these to request a gap-free resume
+    /// via [`ChatRequest::replay_from`]. Connection-scoped notices are sent
+    /// directly to one socket and are never logged.
+    ///
+    /// `Unknown` counts as a log event: a newer server may log event types
+    /// this client does not know, and miscounting them would break resume.
+    pub fn is_run_log_event(&self) -> bool {
+        !matches!(
+            self,
+            ServerEvent::RunAttached { .. }
+                | ServerEvent::RunDetached { .. }
+                | ServerEvent::SessionBusy { .. }
+                | ServerEvent::PermissionPending { .. }
+                | ServerEvent::RollbackResult { .. }
+        )
+    }
 }
 
 // ── Shared display types ─────────────────────────────────
@@ -406,6 +483,10 @@ pub struct SessionData {
     pub messages: Vec<HistoryMessage>,
     #[serde(default)]
     pub compaction: Option<CompactionState>,
+    /// Approximate size of the conversation the model sees when this
+    /// session continues (see `ServerEvent::ContextSize`).
+    #[serde(default)]
+    pub context_chars: Option<u64>,
 }
 
 // ── Health check ─────────────────────────────────────────
@@ -546,5 +627,67 @@ mod tests {
         let json = r#"{"type":"future_audio_event","foo":1}"#;
         let event: AudioServerEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event, AudioServerEvent::Unknown);
+    }
+
+    #[test]
+    fn chat_request_without_new_fields_still_parses() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"message":"hi","agent":"build","model_override":null}"#,
+        )
+        .unwrap();
+        assert_eq!(req.replay_from, None);
+        assert_eq!(req.client_instance_id, None);
+    }
+
+    #[test]
+    fn session_busy_roundtrips_and_is_not_a_run_log_event() {
+        let evt = ServerEvent::SessionBusy {
+            run_id: "run_1".into(),
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains(r#""type":"session_busy""#));
+        let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, ServerEvent::SessionBusy { ref run_id } if run_id == "run_1")
+        );
+        assert!(!parsed.is_run_log_event());
+        assert!(ServerEvent::TextDelta { data: "x".into() }.is_run_log_event());
+        assert!(
+            !ServerEvent::RunAttached { run_id: "r".into() }.is_run_log_event()
+        );
+        assert!(
+            !ServerEvent::PermissionPending {
+                id: "p".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({}),
+            }
+            .is_run_log_event()
+        );
+        // Unknown (newer server) events are logged server-side, so count them.
+        assert!(ServerEvent::Unknown.is_run_log_event());
+    }
+
+    #[test]
+    fn retrying_event_roundtrips_and_is_logged() {
+        let evt = ServerEvent::Retrying {
+            attempt: 2,
+            max_attempts: 5,
+            delay_ms: 4000,
+            reason: "overloaded".into(),
+            discarded_output: true,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains(r#""type":"retrying""#));
+        let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            ServerEvent::Retrying {
+                attempt: 2,
+                discarded_output: true,
+                ..
+            }
+        ));
+        // Part of the run log, so a reattaching client replays it in order.
+        assert!(parsed.is_run_log_event());
     }
 }

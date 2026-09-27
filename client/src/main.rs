@@ -72,6 +72,11 @@ struct Cli {
     #[arg(short = 'M', long)]
     message: Option<String>,
 
+    /// In single message mode, approve tool permission prompts. Without it
+    /// they are denied (there is no one to ask), which ends the run.
+    #[arg(short = 'y', long, requires = "message")]
+    yes: bool,
+
     /// Resume a saved session by ID.
     #[arg(short = 'r', long)]
     resume: Option<String>,
@@ -184,7 +189,17 @@ async fn main() -> Result<()> {
 
     // Handle single message mode
     if let Some(msg) = &cli.message {
-        return single_message(&client, &ui_config, msg, &workspace_ctx).await;
+        return single_message(
+            &client,
+            &ui_config,
+            msg,
+            &workspace_ctx,
+            SingleMessageOptions {
+                session_id: cli.resume.clone(),
+                approve_tools: cli.yes,
+            },
+        )
+        .await;
     }
 
     // Start TUI, optionally resuming a session
@@ -373,11 +388,19 @@ fn command_exists(name: &str) -> bool {
     })
 }
 
+struct SingleMessageOptions {
+    /// Continue this saved session (`--resume`) instead of starting one.
+    session_id: Option<String>,
+    /// Answer permission prompts with "allow" (`--yes`) instead of "deny".
+    approve_tools: bool,
+}
+
 async fn single_message(
     client: &client::MoteClient,
     ui: &marshaling_protocol::UiConfig,
     msg: &str,
     workspace_ctx: &workspace::WorkspaceContext,
+    options: SingleMessageOptions,
 ) -> Result<()> {
     let request = marshaling_protocol::ChatRequest {
         message: msg.to_string(),
@@ -385,11 +408,13 @@ async fn single_message(
         model_override: None,
         provider_override: None,
         history: vec![],
-        session_id: None,
+        session_id: options.session_id,
         workspace_root: Some(workspace_ctx.root.to_string_lossy().to_string()),
         repo_agents_md: workspace_ctx.repo_agents_md.clone(),
         runtime_session_key: Some(workspace_ctx.runtime_session_key.clone()),
         run_id: None,
+        replay_from: None,
+        client_instance_id: None,
         compaction: None,
     };
     let mut stream = client
@@ -398,15 +423,55 @@ async fn single_message(
         .context("Failed to start chat stream")?;
 
     let mut content = String::new();
+    let mut finished = false;
     while let Some(event) = stream.rx.recv().await {
         match event {
             marshaling_protocol::ServerEvent::TextDelta { data } => {
                 print!("{}", data);
                 content.push_str(&data);
             }
+            // Nobody can be asked interactively here: answer per `--yes`.
+            marshaling_protocol::ServerEvent::PermissionRequest {
+                id,
+                tool_name,
+                ..
+            }
+            | marshaling_protocol::ServerEvent::PermissionPending {
+                id,
+                tool_name,
+                ..
+            } => {
+                let allowed = options.approve_tools;
+                if !allowed {
+                    eprintln!(
+                        "\n[denied '{tool_name}': tools that need approval are refused in single message mode; pass --yes to allow them]"
+                    );
+                }
+                stream
+                    .send(
+                        marshaling_protocol::ClientEvent::PermissionResponse {
+                            id,
+                            allowed,
+                            remember: false,
+                        },
+                    )
+                    .await
+                    .context("Failed to answer permission prompt")?;
+            }
+            marshaling_protocol::ServerEvent::NeedsContinuation {
+                content,
+                ..
+            } if content == "(permission denied)" => {
+                // A refused tool ended the run: not a success for scripts.
+                println!();
+                anyhow::bail!(
+                    "The run stopped because a tool was not approved"
+                );
+            }
             marshaling_protocol::ServerEvent::Done { .. }
             | marshaling_protocol::ServerEvent::Cancelled { .. }
             | marshaling_protocol::ServerEvent::NeedsContinuation { .. } => {
+                finished = true;
                 break;
             }
             marshaling_protocol::ServerEvent::Error { message } => {
@@ -415,6 +480,11 @@ async fn single_message(
             }
             _ => {} // ignore tool events, reasoning, etc.
         }
+    }
+    if !finished {
+        let message = "Chat websocket closed before completion";
+        eprintln!("\nError: {message}");
+        return Err(anyhow::anyhow!(message));
     }
     // Ensure final newline
     if !content.ends_with('\n') {

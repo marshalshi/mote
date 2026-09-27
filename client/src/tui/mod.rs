@@ -1,6 +1,11 @@
 pub mod keybinding;
+mod reattach;
 pub mod render;
+mod server_events;
 pub mod state;
+
+use self::reattach::*;
+use self::server_events::*;
 
 use std::time::Duration;
 
@@ -21,6 +26,14 @@ use crate::client::{AudioTranscriptionStream, ChatStream, MoteClient};
 
 enum BackgroundEvent {
     CompactFinished(anyhow::Result<marshaling_protocol::CompactResponse>),
+    /// Result of one attempt to reattach to an in-flight run.
+    Reattached {
+        run_id: String,
+        /// Reattach cycle this attempt belongs to; results from an earlier,
+        /// abandoned cycle carry a stale `replay_from` and are dropped.
+        generation: u64,
+        result: anyhow::Result<ChatStream>,
+    },
 }
 
 /// Run the TUI event loop. Returns when the user quits.
@@ -48,6 +61,10 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
 
     // Agent / WS chat channels
     let mut chat_stream: Option<ChatStream> = None;
+    // Index of the next reattach attempt while the run's websocket is down.
+    let mut reattach_attempt: Option<usize> = None;
+    // Bumped each time a reattach cycle starts.
+    let mut reattach_generation: u64 = 0;
     let mut audio_stream: Option<AudioTranscriptionStream> = None;
     let mut audio_capture: Option<AudioCapture> = None;
     let (background_tx, mut background_rx) =
@@ -94,35 +111,44 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                 }
                 server_event = stream.rx.recv() => {
                     match server_event {
-                        Some(event) => handle_server_event(&mut app, event, &mut chat_stream),
+                        Some(event) => {
+                            if app.discarding_run {
+                                if event.is_run_log_event() && is_terminal_server_event(&event) {
+                                    app.finish_discarded_run();
+                                    chat_stream = None;
+                                }
+                            } else if app.accept_run_log_event(&event) {
+                                handle_server_event(&mut app, event, &mut chat_stream);
+                            }
+                        }
                         None => {
-                            if let Some(run_id) = app.active_run_id.clone() {
-                                match client.chat_stream(build_attach_request(&app, run_id)).await {
-                                    Ok(new_stream) => {
-                                        *stream = new_stream;
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        app.server_health = ServerHealth::Disconnected(format!(
-                                            "stream reconnect failed: {e}"
-                                        ));
-                                    }
+                            // The websocket dropped before a terminal event.
+                            // The server keeps the run alive, so reattach in
+                            // the background instead of failing the turn.
+                            chat_stream = None;
+                            match app.active_run_id.clone() {
+                                Some(run_id) => {
+                                    app.server_health = ServerHealth::Disconnected(
+                                        REATTACH_STATUS.into(),
+                                    );
+                                    reattach_attempt = Some(0);
+                                    reattach_generation += 1;
+                                    schedule_reattach(
+                                        client,
+                                        &app,
+                                        run_id,
+                                        0,
+                                        reattach_generation,
+                                        &background_tx,
+                                    );
+                                }
+                                None => {
+                                    app.connection_lost(
+                                        "Chat websocket closed before the run started",
+                                    );
                                 }
                             }
-                            app.pending_permission = None;
-                            // Flush any buffered content before going idle
-                            if !app.stream_buffer.is_empty() {
-                                let text = std::mem::take(&mut app.stream_buffer);
-                                app.messages.push(self::state::DisplayMessage {
-                                    role: crate::llm::Role::Assistant,
-                                    content: text,
-                                    thinking: None,
-                                    source: self::state::MessageSource::Conversation,
-                                });
-                                app.touch_response_render();
-                            }
-                            chat_stream = None;
-                            app.state = AppState::Idle;
+                            app.touch_response_render();
                         }
                     }
                 }
@@ -145,7 +171,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                 }, if audio_stream.is_some() => {
                     handle_audio_event(&mut app, audio_event, &mut audio_stream, &mut audio_capture);
                 }
-                _ = health_interval.tick() => {
+                _ = health_interval.tick(), if reattach_attempt.is_none() => {
                     let healthy = client.health().await;
                     app.server_health = if healthy {
                         ServerHealth::Connected
@@ -158,8 +184,25 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                     }
                 }
                 background = background_rx.recv() => {
-                    if let Some(event) = background {
-                        handle_background_event(&mut app, event);
+                    match background {
+                        Some(BackgroundEvent::Reattached { run_id, generation, result }) => {
+                            // Results from an earlier, abandoned reattach
+                            // cycle carry a stale replay offset.
+                            if generation == reattach_generation {
+                                handle_reattach_result(
+                                    client,
+                                    &mut app,
+                                    run_id,
+                                    generation,
+                                    result,
+                                    &mut chat_stream,
+                                    &mut reattach_attempt,
+                                    &background_tx,
+                                );
+                            }
+                        }
+                        Some(event) => handle_background_event(&mut app, event),
+                        None => {}
                     }
                 }
             }
@@ -264,6 +307,7 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
                                 });
                             }
                             app.compaction_state = session.compaction;
+                            app.server_context_chars = session.context_chars;
                             app.active_session_id = Some(id.clone());
                             app.scroll_to_bottom();
                             app.messages.push(
@@ -387,10 +431,24 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
             app.touch_response_render();
         }
 
-        // Send pending permission response if any
-        if let Some((id, allowed, remember)) =
-            app.pending_permission_response.take()
+        // Ctrl+C pressed again while a cancel is stuck waiting for the
+        // connection: stop reconnecting and give control back to the user.
+        if std::mem::take(&mut app.stop_reattach_requested)
+            && reattach_attempt.take().is_some()
         {
+            app.connection_lost(
+                "Stopped reconnecting. The run may still be active on the server.",
+            );
+        }
+
+        // Send pending permission response if any. While reattaching, keep it
+        // queued so it is delivered once the run's websocket is back.
+        if let Some((id, allowed, remember)) = app
+            .pending_permission_response
+            .take_if(|_| reattach_attempt.is_none() || chat_stream.is_some())
+        {
+            app.answered_permissions
+                .insert(id.clone(), (allowed, remember));
             if let Some(ref mut stream) = chat_stream {
                 let resp =
                     marshaling_protocol::ClientEvent::PermissionResponse {
@@ -405,8 +463,11 @@ pub async fn run_tui(mut app: App, client: &MoteClient) -> Result<App> {
             }
         }
 
-        // Send cancel signal if user pressed Escape/CancelAgent during streaming
-        if app.pending_cancel {
+        // Send cancel signal if user pressed Escape/CancelAgent during streaming.
+        // While reattaching, keep it pending until the websocket is back.
+        if app.pending_cancel
+            && (reattach_attempt.is_none() || chat_stream.is_some())
+        {
             app.pending_cancel = false;
             if let Some(ref mut stream) = chat_stream {
                 let cancel_event = marshaling_protocol::ClientEvent::Cancel;
@@ -456,6 +517,7 @@ async fn start_chat(
     };
 
     app.pending_auto_compact_send = false;
+    app.prepare_new_run();
     app.start_agent();
 
     let request = build_chat_request(app, user_msg.clone());
@@ -489,11 +551,21 @@ fn start_compaction(
     include_latest_user: bool,
     background_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
 ) {
-    let history = app.compact_history_messages(include_latest_user);
-    if history.is_empty() && app.compaction_state.is_none() {
+    // The server compacts its own transcript of the session; the local
+    // view only decides whether there is anything worth compacting.
+    let nothing_new =
+        app.compact_history_messages(include_latest_user).is_empty();
+    if app.active_session_id.is_none() || nothing_new {
+        // Don't ask again for this message; if it was an auto-compaction
+        // prompt, the message is still sent (`pending_auto_compact_send`).
+        app.suppress_auto_compact_for_latest_message();
         app.messages.push(self::state::DisplayMessage::command(
             crate::llm::Role::Assistant,
-            "Nothing new to compact.".into(),
+            if app.active_session_id.is_none() {
+                "Nothing to compact yet.".into()
+            } else {
+                "Nothing new to compact.".into()
+            },
         ));
         app.touch_response_render();
         return;
@@ -505,8 +577,8 @@ fn start_compaction(
         agent: app.request_agent().to_string(),
         model_override,
         provider_override,
-        history,
-        prior_compaction: app.compaction_state.clone(),
+        history: Vec::new(),
+        prior_compaction: None,
         session_id: app.active_session_id.clone(),
         workspace_root: Some(app.workspace_root.clone()),
         repo_agents_md: app.repo_agents_md.clone(),
@@ -547,6 +619,9 @@ fn handle_background_event(app: &mut App, event: BackgroundEvent) {
                 }
             }
         }
+        BackgroundEvent::Reattached { .. } => {
+            // Routed to `handle_reattach_result` by the event loop.
+        }
     }
 }
 
@@ -561,32 +636,12 @@ fn build_chat_request(
 ) -> marshaling_protocol::ChatRequest {
     let (model_override, provider_override) =
         app.current_model_override_parts();
-    let history = app.compact_history_messages(false);
 
+    // Only the new message is sent: the server continues the session from
+    // its own transcript (full tool history included).
     marshaling_protocol::ChatRequest {
         message: user_msg,
         agent: app.request_agent().to_string(),
-        model_override,
-        provider_override,
-        session_id: app.active_session_id.clone(),
-        history,
-        workspace_root: Some(app.workspace_root.clone()),
-        repo_agents_md: app.repo_agents_md.clone(),
-        runtime_session_key: Some(app.runtime_session_key.clone()),
-        run_id: None,
-        compaction: app.compaction_state.clone(),
-    }
-}
-
-fn build_attach_request(
-    app: &App,
-    run_id: String,
-) -> marshaling_protocol::ChatRequest {
-    let (model_override, provider_override) =
-        app.current_model_override_parts();
-    marshaling_protocol::ChatRequest {
-        message: String::new(),
-        agent: app.current_agent.clone(),
         model_override,
         provider_override,
         session_id: app.active_session_id.clone(),
@@ -594,250 +649,10 @@ fn build_attach_request(
         workspace_root: Some(app.workspace_root.clone()),
         repo_agents_md: app.repo_agents_md.clone(),
         runtime_session_key: Some(app.runtime_session_key.clone()),
-        run_id: Some(run_id),
-        compaction: app.compaction_state.clone(),
-    }
-}
-
-/// Handle a server-sent event.
-fn handle_server_event(
-    app: &mut App,
-    event: marshaling_protocol::ServerEvent,
-    chat_stream: &mut Option<ChatStream>,
-) {
-    use marshaling_protocol::ServerEvent;
-    match event {
-        ServerEvent::RunStarted { run_id }
-        | ServerEvent::RunAttached { run_id } => {
-            app.active_run_id = Some(run_id);
-        }
-        ServerEvent::RunDetached { .. } => {}
-        ServerEvent::TextDelta { data } => {
-            app.agent_text_delta(&data);
-            app.loading_progress = Some(0.5);
-        }
-        ServerEvent::ReasoningDelta { data } => {
-            app.agent_reasoning_delta(&data);
-        }
-        ServerEvent::ToolStarted { id, name } => {
-            app.agent_tool_started(&id, &name);
-            app.loading_progress = Some(0.3);
-        }
-        ServerEvent::ToolCompleted {
-            id,
-            result,
-            changes,
-        } => {
-            app.agent_tool_completed(&id, &result, &changes);
-            app.loading_progress = Some(0.6);
-        }
-        ServerEvent::ToolFailed { id, error } => {
-            app.agent_tool_failed(&id, &error);
-        }
-        ServerEvent::TurnDone { text, tool_calls } => {
-            app.agent_turn_done(&text, &tool_calls);
-            app.loading_progress = Some(0.7);
-        }
-        ServerEvent::PermissionRequest {
-            id,
-            tool_name,
-            args,
-        } => {
-            // If user previously chose "Allow Always" for this tool, auto-allow
-            if app.auto_allowed_tools.contains(&tool_name) {
-                app.pending_permission_response = Some((id, true, true));
-            } else {
-                app.pending_permission = Some(self::state::PendingPermission {
-                    id,
-                    tool_name,
-                    args: args.to_string(),
-                    confirming_always: false,
-                });
-                app.touch_response_render();
-            }
-        }
-        ServerEvent::SkillsLoaded { .. } => {
-            // Skills loaded silently — no user-facing message.
-            // Skills are advertised in the system prompt, no need to echo them.
-        }
-        ServerEvent::SkillSelected { name } => {
-            app.current_skill = Some(name);
-        }
-        ServerEvent::SubagentStarted { id, name } => {
-            app.subagent_views.push(self::state::SubagentView {
-                id,
-                name,
-                stream_buffer: String::new(),
-                reasoning_buffer: String::new(),
-                tool_calls: Vec::new(),
-                done: false,
-                content: String::new(),
-            });
-            app.touch_response_render();
-        }
-        ServerEvent::SubagentTextDelta { id, data } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                sv.stream_buffer.push_str(&data);
-                app.touch_response_render();
-            } else {
-                tracing::warn!("SubagentTextDelta for unknown id: {}", id);
-            }
-        }
-        ServerEvent::SubagentReasoningDelta { id, data } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                sv.reasoning_buffer.push_str(&data);
-                app.touch_response_render();
-            } else {
-                tracing::warn!("SubagentReasoningDelta for unknown id: {}", id);
-            }
-        }
-        ServerEvent::SubagentToolStarted {
-            id,
-            sub_id,
-            tool_name,
-        } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                sv.tool_calls.push(marshaling_protocol::ToolCallDisplay {
-                    id: sub_id,
-                    name: tool_name,
-                    status: marshaling_protocol::ToolStatus::Running,
-                    changes: Vec::new(),
-                });
-                app.touch_response_render();
-            } else {
-                tracing::warn!("SubagentToolStarted for unknown id: {}", id);
-            }
-        }
-        ServerEvent::SubagentToolCompleted {
-            id,
-            sub_id,
-            changes,
-            ..
-        } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                if let Some(tc) =
-                    sv.tool_calls.iter_mut().find(|t| t.id == sub_id)
-                {
-                    tc.status = marshaling_protocol::ToolStatus::Success;
-                    tc.changes = changes;
-                    app.touch_response_render();
-                }
-            } else {
-                tracing::warn!("SubagentToolCompleted for unknown id: {}", id);
-            }
-        }
-        ServerEvent::SubagentToolFailed { id, sub_id, error } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                if let Some(tc) =
-                    sv.tool_calls.iter_mut().find(|t| t.id == sub_id)
-                {
-                    tc.status = marshaling_protocol::ToolStatus::Failed(error);
-                    app.touch_response_render();
-                }
-            } else {
-                tracing::warn!("SubagentToolFailed for unknown id: {}", id);
-            }
-        }
-        ServerEvent::SubagentDone { id, content } => {
-            if let Some(sv) = app.subagent_views.iter_mut().find(|s| s.id == id)
-            {
-                sv.done = true;
-                sv.content = content;
-                // Flush any remaining stream buffer text
-                if !sv.stream_buffer.is_empty() {
-                    if sv.content.is_empty() {
-                        sv.content = std::mem::take(&mut sv.stream_buffer);
-                    } else {
-                        // stream_buffer is delta that was already included in content
-                        sv.stream_buffer.clear();
-                    }
-                }
-                // Add subagent result to primary conversation (must be Conversation so it's sent to LLM)
-                let name = sv.name.clone();
-                let result = sv.content.clone();
-                app.messages.push(self::state::DisplayMessage {
-                    role: crate::llm::Role::Assistant,
-                    content: format!("--- Subagent: {} ---\n{}", name, result),
-                    thinking: None,
-                    source: self::state::MessageSource::Conversation,
-                });
-                app.touch_response_render();
-            }
-        }
-        ServerEvent::Done {
-            content,
-            tokens_input,
-            tokens_output,
-        }
-        | ServerEvent::Cancelled {
-            content,
-            tokens_input,
-            tokens_output,
-        }
-        | ServerEvent::NeedsContinuation {
-            content,
-            tokens_input,
-            tokens_output,
-        } => {
-            app.pending_permission = None;
-            app.clear_esc_cancel_arm();
-            app.agent_done(&content);
-            app.active_run_id = None;
-            app.tokens_input += tokens_input;
-            app.tokens_output += tokens_output;
-            app.loading_progress = None;
-            app.clear_pending_command_overrides();
-            *chat_stream = None;
-            // Auto-dequeue one queued prompt after the current assistant turn
-            // has been recorded, preserving conversation chronology.
-            app.pop_queued_input_as_message();
-        }
-        ServerEvent::RollbackResult {
-            success,
-            message,
-            changes,
-        } => {
-            let mut lines = vec![message];
-            for ch in changes {
-                match ch.kind {
-                    marshaling_protocol::FileChangeKind::Added => {
-                        lines.push(format!("! new file added: {}", ch.path))
-                    }
-                    marshaling_protocol::FileChangeKind::Removed => {
-                        lines.push(format!("! file removed: {}", ch.path))
-                    }
-                    marshaling_protocol::FileChangeKind::Modified => {
-                        lines.push(format!("~ modified: {}", ch.path))
-                    }
-                }
-            }
-            app.messages.push(self::state::DisplayMessage {
-                role: crate::llm::Role::Assistant,
-                content: lines.join("\n"),
-                thinking: None,
-                source: if success {
-                    self::state::MessageSource::Command
-                } else {
-                    self::state::MessageSource::Error
-                },
-            });
-            app.touch_response_render();
-        }
-        ServerEvent::Error { message } => {
-            app.pending_permission = None;
-            app.clear_esc_cancel_arm();
-            app.clear_pending_command_overrides();
-            app.set_error(&message);
-            *chat_stream = None;
-        }
-        ServerEvent::Unknown => {
-            // Unknown event type — ignore for backwards compatibility
-        }
+        run_id: None,
+        replay_from: None,
+        client_instance_id: Some(app.client_instance_id.clone()),
+        compaction: None,
     }
 }
 
@@ -1125,9 +940,7 @@ fn handle_key_event(
                     if handle_permission_mouse_click(app, m.column, m.row) {
                         return;
                     }
-                    if handle_picker_mouse_click(app, m.column, m.row) {
-                        return;
-                    }
+                    handle_picker_mouse_click(app, m.column, m.row);
                 }
                 MouseEventKind::ScrollDown => {
                     app.scroll_down(3);
@@ -1231,7 +1044,12 @@ fn handle_action(
     // During agent running, Ctrl+C cancels immediately and Esc requires a double-tap
     match action {
         Some(Action::Quit) if app.state == AppState::AgentRunning => {
-            // Ctrl+C cancels immediately while running.
+            // Ctrl+C cancels immediately while running. A cancel that is
+            // still pending could not be delivered (reconnecting), so a
+            // second press asks to stop waiting instead.
+            if app.pending_cancel {
+                app.stop_reattach_requested = true;
+            }
             app.pending_cancel = true;
             app.clear_esc_cancel_arm();
             return;
@@ -1335,10 +1153,10 @@ fn handle_action(
                     app.history_up();
                 }
             }
-            Some(Action::HistoryDown) => {
-                if !handle_input_vertical_scroll(app, false) {
-                    app.history_down();
-                }
+            Some(Action::HistoryDown)
+                if !handle_input_vertical_scroll(app, false) =>
+            {
+                app.history_down();
             }
             None => {
                 if let crossterm::event::KeyCode::Char(c) = code {
@@ -1362,10 +1180,10 @@ fn handle_action(
                     app.history_up();
                 }
             }
-            Some(Action::HistoryDown) => {
-                if !handle_input_vertical_scroll(app, false) {
-                    app.history_down();
-                }
+            Some(Action::HistoryDown)
+                if !handle_input_vertical_scroll(app, false) =>
+            {
+                app.history_down();
             }
             _ => {}
         }
@@ -1479,10 +1297,8 @@ fn normal_action(
                 app.update_suggestions();
             }
         }
-        Some(Action::Complete) => {
-            if app.state == AppState::Idle {
-                app.cycle_agent();
-            }
+        Some(Action::Complete) if app.state == AppState::Idle => {
+            app.cycle_agent();
         }
         None => {
             if let crossterm::event::KeyCode::Char(c) = code {
@@ -1586,8 +1402,8 @@ fn login_picker_index_at(app: &App, column: u16, row: u16) -> Option<usize> {
     let area = Rect::new(0, 0, term_width, term_height);
     let rect = centered_rect_local(
         area,
-        area.width.min(92).max(44),
-        area.height.min(22).max(9),
+        area.width.clamp(44, 92),
+        area.height.clamp(9, 22),
     );
     let inner = inset_local(rect, 2, 1);
     let available_rows = inner.height.saturating_sub(4) as usize;
@@ -1637,10 +1453,9 @@ fn permission_popup_action_at(
     let area = Rect::new(0, 0, term_width, term_height);
     let rect = centered_rect_local(
         area,
-        area.width.min(88).max(46),
+        area.width.clamp(46, 88),
         area.height
-            .min(if perm.confirming_always { 18 } else { 20 })
-            .max(10),
+            .clamp(10, if perm.confirming_always { 18 } else { 20 }),
     );
     let inner = inset_local(rect, 3, 1);
     let content_width = inner.width.saturating_sub(2) as usize;
@@ -1906,8 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_chat_request_includes_compaction_and_skips_compacted_history()
-    {
+    fn test_build_chat_request_sends_only_the_new_message() {
         let cfg = test_ui_config();
         let mut app = App::new_with_workspace(
             &cfg,
@@ -1928,6 +1742,7 @@ mod tests {
                 source: super::state::MessageSource::Conversation,
             });
         }
+        app.active_session_id = Some("chat-1".into());
         app.compaction_state = Some(marshaling_protocol::CompactionState {
             summary: "old summary".into(),
             compacted_message_count: 2,
@@ -1937,8 +1752,74 @@ mod tests {
 
         let req = build_chat_request(&app, "latest".into());
 
+        // The server continues the session from its own transcript.
+        assert_eq!(req.message, "latest");
+        assert_eq!(req.session_id.as_deref(), Some("chat-1"));
         assert!(req.history.is_empty());
-        assert_eq!(req.compaction.as_ref().unwrap().summary, "old summary");
+        assert!(req.compaction.is_none());
+    }
+
+    #[test]
+    fn test_run_started_adopts_server_session_id() {
+        let mut app = reattach_test_app();
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::RunStarted {
+                run_id: "run_1".into(),
+                session_id: Some("chat-new".into()),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.active_session_id.as_deref(), Some("chat-new"));
+        // An event without a session id (older server) keeps the current one.
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::RunStarted {
+                run_id: "run_2".into(),
+                session_id: None,
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.active_session_id.as_deref(), Some("chat-new"));
+    }
+
+    #[test]
+    fn test_apply_compaction_marks_local_position_before_pending_message() {
+        let mut app = reattach_test_app();
+        for (role, content) in [
+            (crate::llm::Role::User, "a"),
+            (crate::llm::Role::Assistant, "b"),
+            (crate::llm::Role::User, "unsent"),
+        ] {
+            app.messages.push(super::state::DisplayMessage {
+                role,
+                content: content.into(),
+                thinking: None,
+                source: super::state::MessageSource::Conversation,
+            });
+        }
+        app.apply_compaction(
+            "chat-1".into(),
+            marshaling_protocol::CompactionState {
+                summary: "s".into(),
+                // The server's transcript count; not meaningful locally.
+                compacted_message_count: 17,
+                model_provider: "p".into(),
+                model_id: "m".into(),
+            },
+        );
+        assert_eq!(
+            app.compaction_state
+                .as_ref()
+                .unwrap()
+                .compacted_message_count,
+            2
+        );
+        // Only the unsent message is outside the compacted range.
+        let rest = app.compact_history_messages(true);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].content, "unsent");
     }
 
     #[test]
@@ -2188,5 +2069,472 @@ mod tests {
             ],
         );
         assert_eq!(action, Some(PermissionMouseAction::AllowAlways));
+    }
+
+    fn reattach_test_app() -> App {
+        let cfg = test_ui_config();
+        App::new_with_workspace(
+            &cfg,
+            cfg.model_info.clone(),
+            "/tmp/ws".into(),
+            None,
+            "runtime-key".into(),
+        )
+    }
+
+    fn text_delta(data: &str) -> marshaling_protocol::ServerEvent {
+        marshaling_protocol::ServerEvent::TextDelta { data: data.into() }
+    }
+
+    #[test]
+    fn test_accept_run_log_event_counts_only_run_log_events() {
+        use marshaling_protocol::ServerEvent;
+        let mut app = reattach_test_app();
+        assert!(app.accept_run_log_event(&ServerEvent::RunStarted {
+            run_id: "run_1".into(),
+            session_id: None,
+        }));
+        assert!(app.accept_run_log_event(&text_delta("a")));
+        assert!(app.accept_run_log_event(&ServerEvent::RunAttached {
+            run_id: "run_1".into()
+        }));
+        assert!(app.accept_run_log_event(&ServerEvent::RollbackResult {
+            success: true,
+            message: String::new(),
+            changes: Vec::new(),
+        }));
+        assert_eq!(app.run_event_count, 2);
+
+        // A new run restarts the count.
+        assert!(app.accept_run_log_event(&ServerEvent::RunStarted {
+            run_id: "run_2".into(),
+            session_id: None,
+        }));
+        assert_eq!(app.run_event_count, 1);
+    }
+
+    #[test]
+    fn test_accept_run_log_event_skips_already_applied_replay() {
+        use marshaling_protocol::ServerEvent;
+        let mut app = reattach_test_app();
+        app.skip_run_log_events = 2;
+        assert!(!app.accept_run_log_event(&ServerEvent::RunStarted {
+            run_id: "run_1".into(),
+            session_id: None,
+        }));
+        assert!(!app.accept_run_log_event(&text_delta("a")));
+        assert!(app.accept_run_log_event(&text_delta("b")));
+        assert_eq!(app.run_event_count, 3);
+        assert_eq!(app.skip_run_log_events, 0);
+    }
+
+    #[test]
+    fn test_build_attach_request_resumes_from_event_count() {
+        let mut app = reattach_test_app();
+        app.run_event_count = 7;
+        let req = build_attach_request(&app, "run_1".into());
+        assert_eq!(req.run_id.as_deref(), Some("run_1"));
+        assert_eq!(req.replay_from, Some(7));
+        assert_eq!(
+            req.client_instance_id.as_deref(),
+            Some(app.client_instance_id.as_str())
+        );
+        let chat = build_chat_request(&app, "hi".into());
+        assert_eq!(chat.replay_from, None);
+        assert_eq!(chat.client_instance_id, req.client_instance_id);
+    }
+
+    #[test]
+    fn test_session_busy_restores_message_and_attaches() {
+        let mut app = reattach_test_app();
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "second message".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+        app.start_agent();
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::SessionBusy {
+                run_id: "run_other".into(),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.input, "second message");
+        assert_eq!(app.input_cursor, app.input.len());
+        assert!(app.pending_user_message_content().is_none());
+        assert_eq!(app.active_run_id.as_deref(), Some("run_other"));
+        assert_eq!(app.skip_run_log_events, 0);
+        assert_eq!(app.state, AppState::AgentRunning);
+        // Not the run we lost: it belongs to a conversation we left, so it is
+        // cancelled and its events are swallowed instead of displayed.
+        assert!(app.discarding_run);
+        assert!(app.pending_cancel);
+    }
+
+    #[test]
+    fn test_session_busy_for_lost_run_skips_known_events() {
+        let mut app = reattach_test_app();
+        app.lost_run = Some(("run_1".into(), 5));
+        app.handle_session_busy("run_1".into());
+        assert_eq!(app.skip_run_log_events, 5);
+        assert_eq!(app.run_event_count, 0);
+        assert_eq!(app.active_run_id.as_deref(), Some("run_1"));
+        assert!(app.lost_run.is_none());
+        assert!(!app.discarding_run);
+        assert!(!app.pending_cancel);
+    }
+
+    #[test]
+    fn test_connection_lost_keeps_run_position_and_goes_idle() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.active_run_id = Some("run_1".into());
+        app.run_event_count = 4;
+        app.pending_cancel = true;
+        app.agent_text_delta("partial");
+        app.connection_lost("gone");
+        assert_eq!(app.state, AppState::Idle);
+        // Moved aside so a new request can never reattach to it by accident.
+        assert_eq!(app.active_run_id, None);
+        assert_eq!(app.lost_run, Some(("run_1".to_string(), 4)));
+        assert!(!app.pending_cancel);
+        assert!(app.messages.iter().any(|m| m.content == "partial"));
+        assert!(app.messages.iter().any(|m| m.content.contains("gone")));
+    }
+
+    #[tokio::test]
+    async fn test_reattach_result_ignores_stale_and_gives_up_after_last_attempt()
+     {
+        let client = MoteClient::new("http://127.0.0.1:1");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.active_run_id = Some("run_1".into());
+        let mut chat_stream = None;
+
+        // Not reattaching any more: result is ignored.
+        let mut attempt = None;
+        handle_reattach_result(
+            &client,
+            &mut app,
+            "run_1".into(),
+            1,
+            Err(anyhow::anyhow!("refused")),
+            &mut chat_stream,
+            &mut attempt,
+            &tx,
+        );
+        assert_eq!(app.state, AppState::AgentRunning);
+
+        // Late result for a different run: the current run's attempt stays.
+        let mut attempt = Some(0);
+        handle_reattach_result(
+            &client,
+            &mut app,
+            "run_old".into(),
+            1,
+            Err(anyhow::anyhow!("refused")),
+            &mut chat_stream,
+            &mut attempt,
+            &tx,
+        );
+        assert_eq!(attempt, Some(0));
+        assert_eq!(app.state, AppState::AgentRunning);
+
+        // Final attempt fails: give up and go idle.
+        let mut attempt = Some(REATTACH_DELAYS_MS.len() - 1);
+        handle_reattach_result(
+            &client,
+            &mut app,
+            "run_1".into(),
+            1,
+            Err(anyhow::anyhow!("refused")),
+            &mut chat_stream,
+            &mut attempt,
+            &tx,
+        );
+        assert_eq!(attempt, None);
+        assert_eq!(app.state, AppState::Idle);
+        assert!(chat_stream.is_none());
+    }
+
+    #[test]
+    fn test_permission_pending_is_shown_once_and_not_after_answering() {
+        let mut app = reattach_test_app();
+        let args = serde_json::json!({"command": "ls"});
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::PermissionPending {
+                id: "perm_0_c".into(),
+                tool_name: "bash".into(),
+                args: args.clone(),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(
+            app.pending_permission.as_ref().map(|p| p.id.as_str()),
+            Some("perm_0_c")
+        );
+
+        // Already answered locally (response queued while reconnecting).
+        app.pending_permission = None;
+        app.pending_permission_response =
+            Some(("perm_0_c".into(), true, false));
+        app.show_pending_permission("perm_0_c".into(), "bash".into(), &args);
+        assert!(app.pending_permission.is_none());
+
+        // Answer lost with the old socket: shown again.
+        app.pending_permission_response = None;
+        app.show_pending_permission("perm_0_c".into(), "bash".into(), &args);
+        assert!(app.pending_permission.is_some());
+    }
+
+    #[test]
+    fn test_discarded_run_finishes_on_terminal_event() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.handle_session_busy("run_old".into());
+        assert!(app.discarding_run);
+        app.finish_discarded_run();
+        assert!(!app.discarding_run);
+        assert_eq!(app.state, AppState::Idle);
+        assert_eq!(app.active_run_id, None);
+        assert!(!app.pending_cancel);
+        assert!(is_terminal_server_event(
+            &marshaling_protocol::ServerEvent::Cancelled {
+                content: String::new(),
+                tokens_input: 0,
+                tokens_output: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_prepare_new_run_and_error_clear_active_run() {
+        let mut app = reattach_test_app();
+        app.active_run_id = Some("run_1".into());
+        app.run_event_count = 3;
+        app.skip_run_log_events = 2;
+        app.lost_run = Some(("run_0".into(), 9));
+        app.prepare_new_run();
+        assert_eq!(app.active_run_id, None);
+        assert_eq!(app.run_event_count, 0);
+        assert_eq!(app.skip_run_log_events, 0);
+        // Kept for a possible SessionBusy answer to the new request.
+        assert!(app.lost_run.is_some());
+
+        app.active_run_id = Some("run_1".into());
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::Error {
+                message: "boom".into(),
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.active_run_id, None);
+
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::RunStarted {
+                run_id: "run_2".into(),
+                session_id: None,
+            },
+            &mut chat_stream,
+        );
+        assert!(app.lost_run.is_none());
+    }
+
+    #[test]
+    fn test_second_ctrl_c_with_undelivered_cancel_requests_stop_reattach() {
+        let mut app = reattach_test_app();
+        let keys = Keybindings::from_config(None);
+        let mut chat_stream = None;
+        app.start_agent();
+        let ctrl_c = || {
+            Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))
+        };
+        handle_key_event(&mut app, &keys, ctrl_c(), &mut chat_stream);
+        assert!(app.pending_cancel);
+        assert!(!app.stop_reattach_requested);
+        handle_key_event(&mut app, &keys, ctrl_c(), &mut chat_stream);
+        assert!(app.stop_reattach_requested);
+        assert_eq!(app.state, AppState::AgentRunning);
+    }
+
+    #[test]
+    fn test_permission_pending_for_answered_id_resends_the_answer() {
+        let mut app = reattach_test_app();
+        let args = serde_json::json!({});
+        app.answered_permissions
+            .insert("perm_0_c".into(), (false, false));
+        app.show_pending_permission("perm_0_c".into(), "bash".into(), &args);
+        // No ghost popup; the earlier answer is queued to be sent again in
+        // case the first one was lost with the old socket.
+        assert!(app.pending_permission.is_none());
+        assert_eq!(
+            app.pending_permission_response,
+            Some(("perm_0_c".to_string(), false, false))
+        );
+        // A new run forgets the old answers.
+        app.prepare_new_run();
+        assert!(app.answered_permissions.is_empty());
+    }
+
+    #[test]
+    fn test_connection_lost_while_discarding_does_not_remember_run() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.handle_session_busy("run_old".into());
+        assert!(app.discarding_run);
+        app.connection_lost("gone");
+        assert!(app.lost_run.is_none());
+        assert!(!app.discarding_run);
+    }
+
+    #[test]
+    fn test_connection_lost_without_active_run_keeps_older_lost_run() {
+        let mut app = reattach_test_app();
+        app.lost_run = Some(("run_1".into(), 4));
+        app.active_run_id = None;
+        app.connection_lost("closed before start");
+        assert_eq!(app.lost_run, Some(("run_1".to_string(), 4)));
+    }
+
+    #[test]
+    fn test_finish_discarded_run_mentions_queued_messages() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.handle_session_busy("run_old".into());
+        app.queue_input("later");
+        app.pending_permission_response =
+            Some(("perm_0_x".into(), true, false));
+        app.finish_discarded_run();
+        assert!(app.pending_permission_response.is_none());
+        assert_eq!(app.input_queue.len(), 1);
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.content.contains("1 queued message"))
+        );
+    }
+
+    #[test]
+    fn test_retrying_discards_partial_turn_only_when_told() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        app.agent_text_delta("half an ans");
+        app.agent_reasoning_delta("thinking");
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::Retrying {
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: 2000,
+                reason: "DeepSeek API error (503)".into(),
+                discarded_output: false,
+            },
+            &mut chat_stream,
+        );
+        assert_eq!(app.stream_buffer, "half an ans");
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::Retrying {
+                attempt: 2,
+                max_attempts: 5,
+                delay_ms: 4000,
+                reason: "stream stalled".into(),
+                discarded_output: true,
+            },
+            &mut chat_stream,
+        );
+        assert!(app.stream_buffer.is_empty());
+        assert!(app.reasoning_buffer.is_empty());
+        assert_eq!(app.state, AppState::AgentRunning);
+        let notice = &app.messages.last().unwrap().content;
+        assert!(notice.contains("stream stalled"), "{notice}");
+        assert!(notice.contains("attempt 2/5"), "{notice}");
+        assert!(notice.contains("partial response discarded"), "{notice}");
+        // Notices are not conversation, so they are never sent to the model.
+        assert!(app.pending_user_message_content().is_none());
+    }
+
+    #[test]
+    fn test_server_context_size_drives_auto_compact_prompt() {
+        let mut app = reattach_test_app();
+        app.messages.push(super::state::DisplayMessage {
+            role: crate::llm::Role::User,
+            content: "short question".into(),
+            thinking: None,
+            source: super::state::MessageSource::Conversation,
+        });
+        // The local text view is tiny...
+        assert!(!app.needs_auto_compact());
+        // ...but the server reports a large history (tool output).
+        let mut chat_stream = None;
+        handle_server_event(
+            &mut app,
+            marshaling_protocol::ServerEvent::ContextSize { chars: 500_000 },
+            &mut chat_stream,
+        );
+        assert!(app.needs_auto_compact());
+        // After compaction the figure is unknown until the next run.
+        app.apply_compaction(
+            "chat-1".into(),
+            marshaling_protocol::CompactionState {
+                summary: "s".into(),
+                compacted_message_count: 0,
+                model_provider: "p".into(),
+                model_id: "m".into(),
+            },
+        );
+        assert_eq!(app.server_context_chars, None);
+    }
+
+    #[test]
+    fn test_session_busy_replay_never_switches_session() {
+        let mut app = reattach_test_app();
+        app.active_session_id = Some("chat-mine".into());
+        app.start_agent();
+        // Busy with an earlier run from a conversation we left: discarded.
+        app.handle_session_busy("run_old".into());
+        assert!(app.discarding_run);
+        let replayed = marshaling_protocol::ServerEvent::RunStarted {
+            run_id: "run_old".into(),
+            session_id: Some("chat-other".into()),
+        };
+        // The event loop routes events to the discard path, never to
+        // handle_server_event, while discarding.
+        assert!(replayed.is_run_log_event());
+        assert_eq!(app.active_session_id.as_deref(), Some("chat-mine"));
+
+        // Busy with our own lost run: the replayed RunStarted is skipped.
+        let mut app = reattach_test_app();
+        app.active_session_id = Some("chat-mine".into());
+        app.lost_run = Some(("run_1".into(), 3));
+        app.handle_session_busy("run_1".into());
+        let replayed = marshaling_protocol::ServerEvent::RunStarted {
+            run_id: "run_1".into(),
+            session_id: Some("chat-mine".into()),
+        };
+        assert!(!app.accept_run_log_event(&replayed));
+    }
+
+    #[test]
+    fn test_permission_denied_end_is_a_status_not_a_message() {
+        let mut app = reattach_test_app();
+        app.start_agent();
+        let before = app.messages.len();
+        app.agent_done("(permission denied)");
+        assert_eq!(app.messages.len(), before);
+        assert_eq!(app.state, AppState::Idle);
     }
 }

@@ -16,7 +16,7 @@ pub struct PromptAssembler {
     config: Config,
     agent_instructions: Option<String>,
     disable_user_agents_md: bool,
-    disble_system_prompt: bool,
+    disable_system_prompt: bool,
     workspace_root: Option<PathBuf>,
     repo_agents_md: Option<String>,
 }
@@ -29,7 +29,7 @@ impl PromptAssembler {
             config,
             agent_instructions: None,
             disable_user_agents_md: false,
-            disble_system_prompt: false,
+            disable_system_prompt: false,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -44,13 +44,13 @@ impl PromptAssembler {
         let instructions = agent.and_then(|a| a.instructions.clone());
         let disable_user_agents_md =
             agent.is_some_and(|a| a.disable_user_agents_md);
-        let disble_system_prompt =
-            agent.is_some_and(|a| a.disble_system_prompt);
+        let disable_system_prompt =
+            agent.is_some_and(|a| a.disable_system_prompt);
         Self {
             config: cfg,
             agent_instructions: instructions,
             disable_user_agents_md,
-            disble_system_prompt,
+            disable_system_prompt,
             workspace_root: None,
             repo_agents_md: None,
         }
@@ -127,7 +127,7 @@ impl PromptAssembler {
         if let Some(layer) = self.agent_instructions_layer() {
             let has_skills = layers
                 .last()
-                .map_or(false, |l| l.starts_with("Skills available:"));
+                .is_some_and(|l| l.starts_with("Skills available:"));
             if has_skills {
                 layers.insert(layers.len() - 1, layer);
             } else {
@@ -142,7 +142,7 @@ impl PromptAssembler {
         &self,
         _model_provider: &str,
     ) -> Result<Option<String>> {
-        if self.disble_system_prompt {
+        if self.disable_system_prompt {
             return Ok(None);
         }
         let prompt =
@@ -369,7 +369,9 @@ pub struct ReminderContext<'a> {
 
 /// Build the dynamic `<system-reminder>` block for the current turn.
 pub fn build_system_reminder(ctx: &ReminderContext) -> String {
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    // Minute resolution: the reminder should change as little as possible
+    // between steps (it is part of every request).
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
 
     let tool_list: Vec<String> = ctx
         .tool_defs
@@ -383,11 +385,7 @@ pub fn build_system_reminder(ctx: &ReminderContext) -> String {
     };
 
     let results_section = if ctx.last_turn_results.is_empty() {
-        if ctx.step > 1 {
-            String::new()
-        } else {
-            String::new()
-        }
+        String::new()
     } else {
         let mut lines = String::from("<last_turn_results>\n");
         for r in &ctx.last_turn_results {
@@ -540,7 +538,7 @@ default = "/nonexistent/prompts/system/mote.md"
         {
             let has_skills = shared
                 .last()
-                .map_or(false, |l| l.starts_with("Skills available:"));
+                .is_some_and(|l| l.starts_with("Skills available:"));
             if has_skills {
                 shared.insert(shared.len() - 1, layer);
             } else {
@@ -571,7 +569,7 @@ default = "{}"
         );
         let config: Config = toml::from_str(&toml).unwrap();
         let agent = crate::config::AgentConfig {
-            disble_system_prompt: true,
+            disable_system_prompt: true,
             ..Default::default()
         };
 
@@ -663,15 +661,15 @@ default = "/nonexistent/prompts/system/mote.md"
         let layers = a.assemble("test", "test-model").unwrap();
         // Layer 1 (env) should always be present. Layer 3 (~/.config/mote/AGENTS.md)
         // is optional — depends on user's filesystem. Just check env is there.
-        assert!(layers.len() >= 1);
+        assert!(!layers.is_empty());
         assert!(layers[0].contains("test-model"));
         // If AGENTS.md exists, it should be the last layer
         let agents_path = dirs::home_dir()
             .map(|h| h.join(".config").join("mote").join("AGENTS.md"));
-        if let Some(ref p) = agents_path {
-            if p.exists() {
-                assert!(layers.len() >= 2);
-            }
+        if let Some(ref p) = agents_path
+            && p.exists()
+        {
+            assert!(layers.len() >= 2);
         }
     }
 
@@ -701,7 +699,7 @@ default = "/nonexistent/mote.md"
         let config: Config = toml::from_str(toml).unwrap();
         let a = PromptAssembler::new(config);
         let layers = a.assemble("ollama", "test-model").unwrap();
-        assert!(layers.len() >= 1);
+        assert!(!layers.is_empty());
         assert!(layers[0].contains("test-model"));
     }
 

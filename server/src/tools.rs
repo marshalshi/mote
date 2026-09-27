@@ -12,21 +12,11 @@ use crate::llm::{
     ToolFunctionDef,
 };
 
-/// Maximum bytes returned from tool output before truncation.
-const MAX_OUTPUT_BYTES: usize = 51200; // 50 KiB
-
-/// Truncate tool output if it exceeds MAX_OUTPUT_BYTES.
-fn truncate_output(output: String) -> String {
-    if output.len() <= MAX_OUTPUT_BYTES {
-        return output;
-    }
-    let truncated = crate::agent::safe_truncate(&output, MAX_OUTPUT_BYTES);
-    format!(
-        "{}\n\n[output truncated — {} bytes total]",
-        truncated,
-        output.len()
-    )
-}
+/// Lines `read` returns when the caller gives no limit.
+const DEFAULT_READ_LINES: usize = 2000;
+/// Bytes `read` returns at most; kept below the registry's 50 KiB output cap
+/// so the paging note is never truncated away.
+const MAX_READ_BYTES: usize = 48 * 1024;
 
 const MAX_DIFF_LINES_PER_FILE: usize = 40;
 const DIFF_CONTEXT_LINES: usize = 3;
@@ -210,17 +200,56 @@ impl Tool for ReadTool {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        if offset == 0 && limit.is_none() {
+        let lines: Vec<&str> = content.lines().collect();
+        if offset == 0
+            && limit.is_none()
+            && lines.len() <= DEFAULT_READ_LINES
+            && content.len() <= MAX_READ_BYTES
+        {
             return Ok(result_no_changes(content));
         }
 
-        let lines: Vec<&str> = content.lines().collect();
         let start = offset.saturating_sub(1).min(lines.len());
+        if offset > lines.len() && !lines.is_empty() {
+            // Distinguish "nothing there" from an empty file.
+            return Ok(result_no_changes(format!(
+                "[offset {offset} is past the end of the file ({} lines).]",
+                lines.len()
+            )));
+        }
         let end = limit
-            .map(|l| start + l)
+            .map(|l| start.saturating_add(l))
             .unwrap_or(lines.len())
             .min(lines.len());
-        Ok(result_no_changes(lines[start..end].join("\n")))
+        // Without an explicit limit, a read returns at most
+        // DEFAULT_READ_LINES lines; every read stays under MAX_READ_BYTES so
+        // the registry's generic output cap never cuts off the note below.
+        let line_cap = match limit {
+            Some(_) => end,
+            None => end.min(start.saturating_add(DEFAULT_READ_LINES)),
+        };
+        let mut shown_end = start;
+        let mut bytes = 0;
+        for line in &lines[start..line_cap] {
+            let size = line.len() + 1;
+            if bytes + size > MAX_READ_BYTES && shown_end > start {
+                break;
+            }
+            bytes += size;
+            shown_end += 1;
+        }
+
+        let mut output = lines[start..shown_end].join("\n");
+        if shown_end < end {
+            output.push_str(&format!(
+                "\n\n[Showing lines {}-{} of {}. Use offset={} to continue.]",
+                start + 1,
+                shown_end,
+                lines.len(),
+                shown_end + 1
+            ));
+        }
+        Ok(result_no_changes(output))
     }
 }
 
@@ -333,8 +362,19 @@ where
     }
 }
 
-fn preferred_grep_backend() -> GrepBackend {
-    preferred_grep_backend_with(command_available)
+/// Detected once per process: probing spawns a process, and blocking.
+async fn preferred_grep_backend() -> GrepBackend {
+    static BACKEND: tokio::sync::OnceCell<GrepBackend> =
+        tokio::sync::OnceCell::const_new();
+    *BACKEND
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(|| {
+                preferred_grep_backend_with(command_available)
+            })
+            .await
+            .unwrap_or(GrepBackend::Grep)
+        })
+        .await
 }
 
 impl GrepTool {
@@ -397,7 +437,7 @@ impl Tool for GrepTool {
 
         let include = args.get("include").and_then(|v| v.as_str());
 
-        let output = match preferred_grep_backend() {
+        let output = match preferred_grep_backend().await {
             GrepBackend::Ripgrep => {
                 // Use ripgrep (preferred)
                 let mut cmd = tokio::process::Command::new("rg");
@@ -426,10 +466,25 @@ impl Tool for GrepTool {
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // Exit codes: 0 matches, 1 no matches, anything else an error (bad
+        // pattern, unreadable files) — which may come with partial matches.
+        let failed = !matches!(output.status.code(), Some(0 | 1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let problem = stderr.lines().next().unwrap_or("search failed").trim();
+        if failed && stdout.is_empty() {
+            anyhow::bail!("Search failed: {problem}");
+        }
         if stdout.is_empty() {
             return Ok(result_no_changes("No matches found.".into()));
         }
-        Ok(result_no_changes(truncate_output(stdout)))
+        let mut result = stdout;
+        if failed {
+            result.push_str(&format!(
+                "\n[some files could not be searched: {problem}]"
+            ));
+        }
+        // Output size is limited centrally by `ToolRegistry::execute`.
+        Ok(result_no_changes(result))
     }
 }
 
@@ -592,7 +647,7 @@ impl Tool for EditTool {
             def_type: "function".into(),
             function: ToolFunctionDef {
                 name: "edit".into(),
-                description: "Perform a search-and-replace edit on a file. Replaces the first occurrence of old_string with new_string.".into(),
+                description: "Perform a search-and-replace edit on a file. old_string must match exactly one place in the file (include surrounding lines to make it unique), unless replace_all is true.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -607,6 +662,11 @@ impl Tool for EditTool {
                         "new_string": {
                             "type": "string",
                             "description": "The replacement text"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every occurrence instead of requiring exactly one (default: false)",
+                            "default": false
                         }
                     },
                     "required": ["file_path", "old_string", "new_string"]
@@ -628,6 +688,15 @@ impl Tool for EditTool {
             .get("new_string")
             .and_then(|v| v.as_str())
             .context("Missing new_string")?;
+        let replace_all = args
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if old.is_empty() {
+            anyhow::bail!(
+                "old_string must not be empty; use the write tool to create or overwrite a file"
+            );
+        }
         let resolved = if PathBuf::from(path).is_absolute() {
             PathBuf::from(path)
         } else {
@@ -640,13 +709,17 @@ impl Tool for EditTool {
                 .with_context(|| {
                     format!("Failed to read {}", resolved.display())
                 })?;
-        if !content.contains(old) {
-            return Err(anyhow::anyhow!(
-                "old_string not found in {}",
+        let new_content = match content.matches(old).count() {
+            0 => {
+                anyhow::bail!("old_string not found in {}", resolved.display())
+            }
+            1 => content.replacen(old, new, 1),
+            _ if replace_all => content.replace(old, new),
+            n => anyhow::bail!(
+                "old_string matches {n} places in {}; include more surrounding text to make it unique, or set replace_all to true",
                 resolved.display()
-            ));
-        }
-        let new_content = content.replacen(old, new, 1);
+            ),
+        };
         tokio::fs::write(&resolved, &new_content)
             .await
             .with_context(|| {
@@ -779,7 +852,7 @@ impl Tool for BashTool {
             def_type: "function".into(),
             function: ToolFunctionDef {
                 name: "bash".into(),
-                description: "Execute a shell command. Use with caution."
+                description: "Execute a shell command. Output keeps the start and end of very long results. Processes the command leaves running are terminated when it finishes, and the timeout is capped at 600 seconds; for long-running processes (dev servers, watchers) set background: true instead."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -795,8 +868,13 @@ impl Tool for BashTool {
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "Timeout in seconds (default: 120)",
+                            "description": "Timeout in seconds (default: 120, max: 600)",
                             "default": 120
+                        },
+                        "background": {
+                            "type": "boolean",
+                            "description": "Start the command and return immediately; it keeps running, its output goes to a log file, and the result says how to read the log and stop it (default: false)",
+                            "default": false
                         }
                     },
                     "required": ["command"]
@@ -810,60 +888,313 @@ impl Tool for BashTool {
             .get("command")
             .and_then(|v| v.as_str())
             .context("Missing command")?;
-        let timeout_secs =
-            args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
+        if args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return start_background(cmd, &self.ctx.workspace).await;
+        }
+        let timeout_secs = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
+            .clamp(1, MAX_BASH_TIMEOUT_SECS);
 
-        // Use sh -c for portable shell execution, with a timeout guard.
-        // `kill_on_drop(true)` ensures a timed-out command does not keep
-        // running in the background after the future is dropped.
-        let child = tokio::process::Command::new("sh")
+        let mut command = tokio::process::Command::new("sh");
+        command
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.ctx.workspace)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("Failed to execute command")?;
+            .kill_on_drop(true);
+        // Own process group, so the whole tree (including background jobs)
+        // can be signalled at once.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().context("Failed to execute command")?;
+        // Kills the group when dropped: covers cancellation of this future.
+        let mut group = ProcessGroup::new(child.id());
 
-        let output = match tokio::time::timeout(
+        let stdout = child.stdout.take().map(Capture::start);
+        let stderr = child.stderr.take().map(Capture::start);
+
+        let status = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
+            child.wait(),
         )
         .await
         {
-            Ok(result) => result.context("Failed to execute command")?,
-            Err(_) => {
-                return Ok(result_no_changes(format!(
-                    "[command timed out after {}s]",
-                    timeout_secs
-                )));
-            }
+            Ok(status) => Some(status.context("Failed to execute command")?),
+            Err(_) => None,
         };
+        // The shell has exited (or timed out). Anything it left running still
+        // holds the output pipes, and the readers would wait for them
+        // forever; end the whole group so they reach EOF.
+        group.kill();
+        if status.is_none() {
+            // Without process groups (non-unix) only this kills the shell.
+            let _ = child.start_kill();
+            let _ =
+                tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await;
+        }
 
         let mut result = String::new();
-        if !output.stdout.is_empty() {
-            result.push_str(&String::from_utf8_lossy(&output.stdout));
+        // Drain both streams at once, so a held-open pipe costs one wait.
+        let finish = |capture: Option<Capture>| async move {
+            match capture {
+                Some(capture) => {
+                    Some(capture.finish(OUTPUT_DRAIN_TIMEOUT).await)
+                }
+                None => None,
+            }
+        };
+        let (stdout, stderr) = tokio::join!(finish(stdout), finish(stderr));
+        let mut still_open = false;
+        for (i, (text, complete)) in
+            [stdout, stderr].into_iter().flatten().enumerate()
+        {
+            still_open |= !complete;
+            if text.is_empty() {
+                continue;
+            }
+            if !result.is_empty() && i > 0 {
+                result.push('\n');
+            }
+            result.push_str(&text);
         }
-        if !output.stderr.is_empty() {
+        if still_open {
             if !result.is_empty() {
                 result.push('\n');
             }
-            result.push_str(&String::from_utf8_lossy(&output.stderr));
+            result.push_str(
+                "[output may be incomplete: a process that left the command's process group still holds its output open]",
+            );
         }
-        if !output.status.success() {
-            if !result.is_empty() {
-                result.push('\n');
+        match status {
+            None => {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&format!(
+                    "[command timed out after {timeout_secs}s and was terminated]"
+                ));
             }
-            result.push_str(&format!(
-                "[exit code: {}]",
-                output.status.code().unwrap_or(-1)
-            ));
+            Some(status) if !status.success() => {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&format!(
+                    "[exit code: {}]",
+                    status.code().unwrap_or(-1)
+                ));
+            }
+            Some(_) => {}
         }
         if result.is_empty() {
             result = "(no output)".into();
         }
-        Ok(result_no_changes(truncate_output(result)))
+        // Output size is limited centrally by `ToolRegistry::execute`.
+        Ok(result_no_changes(result))
+    }
+}
+
+/// Start `cmd` detached from the tool call: in its own process group (so the
+/// usual kill-on-exit does not apply), output appended to a log file. The
+/// child is reaped in the background when it exits.
+async fn start_background(
+    cmd: &str,
+    workspace: &std::path::Path,
+) -> Result<ToolExecutionResult> {
+    let log_path = std::env::temp_dir().join(format!(
+        "mote-bg-{}.log",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S%6f")
+    ));
+    // Readable by the owner only: the temp dir may be shared, and command
+    // output can contain secrets.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let log = options
+        .open(&log_path)
+        .with_context(|| format!("Failed to create {}", log_path.display()))?;
+    let log_err = log.try_clone().context("Failed to open the log file")?;
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .context("Failed to start background command")?;
+    let Some(pid) = child.id() else {
+        anyhow::bail!("Background command exited before it could be tracked");
+    };
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    let stop = if cfg!(unix) {
+        format!("kill -- -{pid}")
+    } else {
+        format!("kill {pid}")
+    };
+    Ok(result_no_changes(format!(
+        "Started in the background (pid {pid}). Output is written to {log}.\nRead it with: tail -n 50 {log}\nStop it with: {stop}",
+        log = log_path.display()
+    )))
+}
+
+/// Default and maximum run time for one bash command.
+const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
+const MAX_BASH_TIMEOUT_SECS: u64 = 600;
+/// How long to wait for remaining output after the process group is gone.
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+/// Bytes of each output stream kept from its start and from its end; the
+/// middle of very long output (e.g. a verbose build) is dropped. Both
+/// streams together stay under the registry's output cap.
+const CAPTURE_HEAD_BYTES: usize = 12 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 10 * 1024;
+
+/// A command output stream being read in the background, keeping only its
+/// head and tail so a command that prints without end cannot exhaust
+/// memory. What was read so far stays available even if the stream never
+/// closes.
+struct Capture {
+    buffer: Arc<std::sync::Mutex<CaptureBuffer>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct CaptureBuffer {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: usize,
+}
+
+impl Capture {
+    fn start(
+        mut stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    ) -> Self {
+        let buffer = Arc::new(std::sync::Mutex::new(CaptureBuffer::default()));
+        let shared = Arc::clone(&buffer);
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(&chunk[..n]),
+                }
+            }
+        });
+        Self { buffer, reader }
+    }
+
+    /// Wait up to `limit` for the stream to close, then return what was
+    /// captured and whether the stream was read to the end. A stream still
+    /// open after `limit` is abandoned (its reader stopped) rather than
+    /// discarded.
+    async fn finish(mut self, limit: std::time::Duration) -> (String, bool) {
+        let complete =
+            tokio::time::timeout(limit, &mut self.reader).await.is_ok();
+        if !complete {
+            self.reader.abort();
+        }
+        let text = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .render();
+        (text, complete)
+    }
+}
+
+impl CaptureBuffer {
+    fn push(&mut self, mut chunk: &[u8]) {
+        if self.head.len() < CAPTURE_HEAD_BYTES {
+            let take = chunk.len().min(CAPTURE_HEAD_BYTES - self.head.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        self.tail.extend(chunk);
+        if self.tail.len() > CAPTURE_TAIL_BYTES {
+            let excess = self.tail.len() - CAPTURE_TAIL_BYTES;
+            self.tail.drain(..excess);
+            self.dropped += excess;
+        }
+    }
+
+    fn render(&mut self) -> String {
+        let tail = self.tail.make_contiguous();
+        if self.dropped == 0 {
+            // Nothing was cut: decode as one, so a character spanning the
+            // head/tail seam stays intact.
+            let mut all = self.head.clone();
+            all.extend_from_slice(tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        // Cut points can fall inside a multi-byte character; drop the
+        // partial bytes on either side instead of showing U+FFFD.
+        let head_end = match std::str::from_utf8(&self.head) {
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            _ => self.head.len(),
+        };
+        let tail_start = tail
+            .iter()
+            .take(3)
+            .take_while(|&&b| b & 0xC0 == 0x80)
+            .count();
+        format!(
+            "{}\n[... {} bytes of output omitted ...]\n{}",
+            String::from_utf8_lossy(&self.head[..head_end]),
+            self.dropped,
+            String::from_utf8_lossy(&tail[tail_start..])
+        )
+    }
+}
+
+/// The process group of a spawned command. Killing it ends the command and
+/// everything it started; dropping it kills too, so a cancelled tool call
+/// leaves nothing running.
+struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    fn new(pgid: Option<u32>) -> Self {
+        Self(pgid)
+    }
+
+    fn kill(&mut self) {
+        let Some(pgid) = self.0.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Ok(pgid) = libc::pid_t::try_from(pgid) {
+            // SAFETY: killpg only sends a signal; no memory is shared. ESRCH
+            // (the group already exited) is expected and ignored.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pgid; // Without process groups, `kill_on_drop` stops the shell.
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -1006,7 +1337,7 @@ pub trait SubagentRunner: Send + Sync {
         &self,
         agent_name: &str,
         task: &str,
-        workspace: &PathBuf,
+        workspace: &std::path::Path,
     ) -> Result<String>;
 }
 
@@ -1069,7 +1400,7 @@ impl Tool for SubagentTool {
 use std::sync::Arc;
 
 pub struct AgentSubagentRunner {
-    pub tools: Arc<Vec<Box<dyn crate::llm::Tool>>>,
+    pub tools: Arc<crate::llm::ToolRegistry>,
     pub config: crate::config::Config,
     pub auth: crate::auth::Auth,
     pub merged_agents:
@@ -1085,6 +1416,12 @@ pub struct AgentSubagentRunner {
     pub parent_events_tx: tokio::sync::mpsc::UnboundedSender<
         anyhow::Result<crate::agent::AgentEvent>,
     >,
+    /// The parent run's permission broker. Subagent prompts are forwarded to
+    /// the parent's client and answered through it.
+    pub permission_broker: crate::agent::PermissionBroker,
+    /// Tools the user chose "allow always" for in this session, applied to
+    /// the subagent the same way they are applied to the parent.
+    pub remembered_allow_tools: std::collections::HashSet<String>,
 }
 
 #[async_trait]
@@ -1093,7 +1430,7 @@ impl SubagentRunner for AgentSubagentRunner {
         &self,
         agent_name: &str,
         task: &str,
-        workspace: &PathBuf,
+        workspace: &std::path::Path,
     ) -> Result<String> {
         if self.depth >= self.max_depth {
             anyhow::bail!(
@@ -1113,7 +1450,7 @@ impl SubagentRunner for AgentSubagentRunner {
             anyhow::bail!("Unknown sub-agent: '{}'", agent_name);
         }
         let req_ctx = crate::RequestContext {
-            workspace: workspace.clone(),
+            workspace: workspace.to_path_buf(),
             workspace_display: workspace.display().to_string(),
             runtime_session_key: "subagent".into(),
             repo_agents_md: self.repo_agents_md.clone(),
@@ -1129,18 +1466,21 @@ impl SubagentRunner for AgentSubagentRunner {
         )
         .await?;
 
-        // Build permission map using the shared helper.
-        // Subagent remaps "ask" → "allow" (no TUI for subagent permission prompts).
+        // Build permission map using the shared helper. "ask" stays "ask":
+        // the prompt is forwarded to the parent's client (see the event
+        // collector below), so subagents never bypass user approval.
         let tool_names: Vec<String> = self
             .tools
+            .defs()
             .iter()
-            .map(|t| t.def().function.name.clone())
+            .map(|def| def.function.name.clone())
             .collect();
         let mut perms =
             crate::build_permission_map(&self.config, agent_cfg, &tool_names);
-        // Remap Ask → Allow for subagents (no interactive TUI)
-        for perm in perms.values_mut() {
-            if *perm == crate::config::Permission::Ask {
+        for tool in &self.remembered_allow_tools {
+            if let Some(perm) = perms.get_mut(tool)
+                && *perm == crate::config::Permission::Ask
+            {
                 *perm = crate::config::Permission::Allow;
             }
         }
@@ -1148,12 +1488,13 @@ impl SubagentRunner for AgentSubagentRunner {
         let mut opts = context.opts;
         opts.tools = self
             .tools
+            .defs()
             .iter()
-            .filter(|t| {
-                perms.get(&t.def().function.name).copied()
+            .filter(|def| {
+                perms.get(&def.function.name).copied()
                     != Some(crate::config::Permission::Deny)
             })
-            .map(|t| t.def())
+            .cloned()
             .collect();
 
         // Create channels for the subagent
@@ -1166,11 +1507,11 @@ impl SubagentRunner for AgentSubagentRunner {
             let _ = parent_cancel.changed().await;
             let _ = sub_cancel_tx.send(true);
         });
-        // _perm_tx is intentionally dropped immediately: subagent permissions are
-        // remapped to "allow" or "deny" only (never "ask"), so the permission
-        // channel is never used. If this changes, store _perm_tx and wire it to a
-        // permission forwarding mechanism.
-        let (_perm_tx, perm_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Generate a unique subagent session ID
+        let sub_id =
+            format!("sub_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"));
+        let permission_broker =
+            self.permission_broker.scoped(&format!("{sub_id}:"));
 
         let user_msg = task.to_string();
         let history: Vec<crate::llm::ChatMessage> = Vec::new();
@@ -1179,29 +1520,33 @@ impl SubagentRunner for AgentSubagentRunner {
         let workspace_display = workspace.display().to_string();
 
         let role_config = context.role_loop_config;
+        let reminder_at_end = self.config.server.system_reminder_at_end;
 
         tokio::spawn(async move {
             crate::agent::run_loop(
-                p2,
-                t2,
-                context.system_layers,
+                crate::agent::RunConfig {
+                    provider: p2,
+                    tools: t2,
+                    system_layers: context.system_layers,
+                    options: opts,
+                    permissions: perms,
+                    max_steps: crate::agent::DEFAULT_MAX_STEPS,
+                    working_directory: workspace_display,
+                    role_config,
+                    reminder_at_end,
+                },
+                crate::agent::RunChannels {
+                    events_tx: agent_tx,
+                    cancel_rx: sub_cancel_rx,
+                    permission_broker,
+                    notes_rx: None,
+                },
                 user_msg,
                 history,
-                opts,
-                agent_tx,
-                sub_cancel_rx,
-                perm_rx,
-                perms,
-                crate::agent::DEFAULT_MAX_STEPS,
-                workspace_display,
-                role_config,
             )
             .await;
         });
 
-        // Generate a unique subagent session ID
-        let sub_id =
-            format!("sub_{}", chrono::Local::now().format("%Y%m%d%H%M%S%6f"));
         let sub_name = agent_name.to_string();
 
         // Signal that a subagent started
@@ -1213,117 +1558,205 @@ impl SubagentRunner for AgentSubagentRunner {
         ));
 
         // Collect the result while forwarding events to the parent.
-        // Subagent has a 5-minute timeout to prevent blocking the parent indefinitely.
+        // Subagent has a time budget (`server.subagent_timeout_secs`) to prevent blocking the parent
+        // indefinitely. Time spent waiting for the user to answer a forwarded
+        // permission prompt does not count against it: the subagent is idle
+        // then, and the parent run's own detached-permission watchdog covers
+        // a user who never answers.
         let mut content = String::new();
         let mut tool_log = String::new();
-        let subagent_timeout = std::time::Duration::from_secs(300);
+        let budget_secs = self.config.server.subagent_timeout_secs;
+        // 0 disables the budget; an overflowing deadline means "none".
+        let mut deadline = (budget_secs > 0)
+            .then(|| {
+                tokio::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(budget_secs))
+            })
+            .flatten();
+        let mut awaiting_permission_since: Option<tokio::time::Instant> = None;
+        let mut timed_out = false;
+        let mut user_denied = false;
+        // Length of `content` when the current turn started, so a retry that
+        // discards partial output can drop just this turn's text.
+        let mut turn_start = 0;
 
-        let collect_result = tokio::time::timeout(subagent_timeout, async {
-            while let Some(event) = agent_rx.recv().await {
-                match event {
-                    Ok(crate::agent::AgentEvent::Done {
-                        content: c, ..
-                    })
-                    | Ok(crate::agent::AgentEvent::Cancelled {
-                        content: c,
-                        ..
-                    })
-                    | Ok(crate::agent::AgentEvent::NeedsContinuation {
-                        content: c,
-                        ..
-                    }) => {
-                        content = c;
-                        break;
+        loop {
+            let next = match (awaiting_permission_since, deadline) {
+                (None, Some(deadline)) => {
+                    match tokio::time::timeout_at(deadline, agent_rx.recv())
+                        .await
+                    {
+                        Ok(next) => next,
+                        Err(_) => {
+                            timed_out = true;
+                            break;
+                        }
                     }
-                    Ok(crate::agent::AgentEvent::TextDelta(text)) => {
-                        content.push_str(&text);
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentTextDelta {
-                                id: sub_id.clone(),
-                                data: text,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ReasoningDelta(text)) => {
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentReasoningDelta {
-                                id: sub_id.clone(),
-                                data: text,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ToolStarted {
-                        id: tool_call_id,
-                        name,
-                    }) => {
-                        tool_log.push_str(&format!("\n  [Tool: {}]", name));
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentToolStarted {
-                                id: sub_id.clone(),
-                                sub_id: tool_call_id,
-                                tool_name: name,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ToolCompleted {
-                        id: tool_call_id,
-                        result,
-                        changes,
-                        ..
-                    }) => {
-                        let summary = if result.len() > 100 {
-                            format!(
-                                "{}...",
-                                crate::agent::safe_truncate(&result, 97)
-                            )
-                        } else {
-                            result.clone()
-                        };
-                        tool_log.push_str(&format!(" → {}", summary));
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentToolCompleted {
-                                id: sub_id.clone(),
-                                sub_id: tool_call_id,
-                                result,
-                                changes,
-                            },
-                        ));
-                    }
-                    Ok(crate::agent::AgentEvent::ToolFailed {
-                        id: tool_call_id,
-                        error,
-                    }) => {
-                        tool_log.push_str(&format!(" → FAILED: {}", error));
-                        let _ = self.parent_events_tx.send(Ok(
-                            crate::agent::AgentEvent::SubagentToolFailed {
-                                id: sub_id.clone(),
-                                sub_id: tool_call_id,
-                                error,
-                            },
-                        ));
-                    }
-                    Err(e) => {
-                        content = format!("[Sub-agent error: {:#}]", e);
-                        break;
-                    }
-                    _ => {}
                 }
+                _ => agent_rx.recv().await,
+            };
+            let Some(event) = next else {
+                break;
+            };
+            // The first event after a prompt is normally `PermissionResolved`
+            // (or `Cancelled`); give the waiting time back to the budget.
+            if let Some(since) = awaiting_permission_since.take() {
+                deadline =
+                    deadline.and_then(|d| d.checked_add(since.elapsed()));
             }
-        })
-        .await;
+            match event {
+                // The user refused a prompt inside the subagent: stop the
+                // parent too, instead of letting it work around the refusal.
+                Ok(crate::agent::AgentEvent::NeedsContinuation {
+                    content: c,
+                    ..
+                }) if c == crate::agent::PERMISSION_DENIED_CONTENT => {
+                    user_denied = true;
+                    content = c;
+                    break;
+                }
+                Ok(crate::agent::AgentEvent::Done { content: c, .. })
+                | Ok(crate::agent::AgentEvent::Cancelled {
+                    content: c, ..
+                })
+                | Ok(crate::agent::AgentEvent::NeedsContinuation {
+                    content: c,
+                    ..
+                }) => {
+                    content = c;
+                    break;
+                }
+                Ok(crate::agent::AgentEvent::TextDelta(text)) => {
+                    content.push_str(&text);
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentTextDelta {
+                            id: sub_id.clone(),
+                            data: text,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ReasoningDelta(text)) => {
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentReasoningDelta {
+                            id: sub_id.clone(),
+                            data: text,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ToolStarted {
+                    id: tool_call_id,
+                    name,
+                }) => {
+                    tool_log.push_str(&format!("\n  [Tool: {}]", name));
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentToolStarted {
+                            id: sub_id.clone(),
+                            sub_id: tool_call_id,
+                            tool_name: name,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ToolCompleted {
+                    id: tool_call_id,
+                    name,
+                    result,
+                    changes,
+                    rollback_entries,
+                }) => {
+                    let summary = if result.len() > 100 {
+                        format!(
+                            "{}...",
+                            crate::agent::safe_truncate(&result, 97)
+                        )
+                    } else {
+                        result.clone()
+                    };
+                    tool_log.push_str(&format!(" → {}", summary));
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentToolCompleted {
+                            id: sub_id.clone(),
+                            sub_id: tool_call_id,
+                            tool_name: name,
+                            result,
+                            changes,
+                            rollback_entries,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::ToolFailed {
+                    id: tool_call_id,
+                    error,
+                }) => {
+                    tool_log.push_str(&format!(" → FAILED: {}", error));
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentToolFailed {
+                            id: sub_id.clone(),
+                            sub_id: tool_call_id,
+                            error,
+                        },
+                    ));
+                }
+                // Forward prompts to the parent's client unchanged; the
+                // answer comes back through the shared permission broker.
+                Ok(
+                    event @ crate::agent::AgentEvent::PermissionRequest {
+                        ..
+                    },
+                ) => {
+                    let _ = self.parent_events_tx.send(Ok(event));
+                    awaiting_permission_since =
+                        Some(tokio::time::Instant::now());
+                }
+                // The user answered: only the waiting time was refunded above,
+                // not the approved tool's run time that follows. Forwarded so
+                // the parent run drops the prompt from its pending set.
+                Ok(
+                    event @ crate::agent::AgentEvent::PermissionResolved {
+                        ..
+                    },
+                ) => {
+                    let _ = self.parent_events_tx.send(Ok(event));
+                }
+                Ok(crate::agent::AgentEvent::TurnDone { .. }) => {
+                    turn_start = content.len();
+                }
+                Ok(crate::agent::AgentEvent::Retrying {
+                    reason,
+                    discarded_output,
+                    ..
+                }) => {
+                    if discarded_output {
+                        content.truncate(turn_start);
+                    }
+                    let _ = self.parent_events_tx.send(Ok(
+                        crate::agent::AgentEvent::SubagentRetrying {
+                            id: sub_id.clone(),
+                            reason,
+                            discarded_output,
+                        },
+                    ));
+                }
+                Ok(crate::agent::AgentEvent::Failed { error: e, .. })
+                | Err(e) => {
+                    content = format!("[Sub-agent error: {:#}]", e);
+                    break;
+                }
+                _ => {}
+            }
+        }
 
         // Handle timeout — cancel the subagent if it didn't finish in time
-        if collect_result.is_err() {
+        if timed_out {
             tracing::warn!(
                 "Sub-agent '{}' timed out after {}s",
                 agent_name,
-                subagent_timeout.as_secs()
+                budget_secs
             );
             let _ = timeout_cancel_tx.send(true);
             anyhow::bail!(
                 "Sub-agent '{}' timed out after {}s",
                 agent_name,
-                subagent_timeout.as_secs()
+                budget_secs
             );
         }
 
@@ -1346,14 +1779,39 @@ impl SubagentRunner for AgentSubagentRunner {
             },
         ));
 
+        if user_denied {
+            return Err(crate::agent::UserDeniedToolCall {
+                summary: tool_log.trim().to_string(),
+            }
+            .into());
+        }
         Ok(result)
+    }
+}
+
+// Mock runner for SubagentTool tests
+#[cfg(test)]
+struct MockSubagentRunner;
+
+#[cfg(test)]
+#[async_trait]
+impl SubagentRunner for MockSubagentRunner {
+    async fn run(
+        &self,
+        agent_name: &str,
+        task: &str,
+        _workspace: &std::path::Path,
+    ) -> Result<String> {
+        Ok(format!(
+            "mock result for agent={}, task={}",
+            agent_name, task
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio;
 
     fn tmp_workspace() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1383,6 +1841,26 @@ mod tests {
         let args = serde_json::json!({"file_path": "lines.txt", "offset": 2, "limit": 3});
         let result = tool.execute(args).await.unwrap();
         assert_eq!(result.output, "b\nc\nd");
+    }
+
+    #[tokio::test]
+    async fn test_read_with_huge_limit_and_offset_past_eof() {
+        let (_tmp, ws) = tmp_workspace();
+        std::fs::write(ws.join("f.txt"), "a\nb\nc").unwrap();
+        let tool = ReadTool::new(ws);
+        let r = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "offset": 2, "limit": u64::MAX}))
+            .await
+            .unwrap();
+        assert_eq!(r.output, "b\nc");
+        let r = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "offset": 99, "limit": u64::MAX}))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.output,
+            "[offset 99 is past the end of the file (3 lines).]"
+        );
     }
 
     #[tokio::test]
@@ -1589,6 +2067,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bash_background_job_does_not_block_and_is_terminated() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws.clone());
+        let started = std::time::Instant::now();
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "sleep 30 & echo $! > bg.pid; echo started"
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(r.output.contains("started"), "{}", r.output);
+        #[cfg(unix)]
+        {
+            let pid: libc::pid_t = std::fs::read_to_string(ws.join("bg.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // Give the kernel a moment to deliver SIGKILL.
+            let mut alive = true;
+            for _ in 0..50 {
+                // SAFETY: signal 0 only checks that the process exists.
+                alive = unsafe { libc::kill(pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(!alive, "background job should be terminated");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bash_background_command_keeps_running_and_logs() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws.clone());
+        let started = std::time::Instant::now();
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "echo ready; echo $$ > bg.pid; sleep 30",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            r.output.contains("Started in the background"),
+            "{}",
+            r.output
+        );
+        let log = r
+            .output
+            .split("Output is written to ")
+            .nth(1)
+            .and_then(|rest| rest.split(".\n").next())
+            .unwrap()
+            .to_string();
+        let mut logged = String::new();
+        for _ in 0..50 {
+            logged = std::fs::read_to_string(&log).unwrap_or_default();
+            if logged.contains("ready") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(logged.contains("ready"), "{logged}");
+        #[cfg(unix)]
+        {
+            let pid: libc::pid_t = std::fs::read_to_string(ws.join("bg.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // Still running after the call returned.
+            // SAFETY: signal 0 only checks that the process exists.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+            // SAFETY: cleans up the test's own process group.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "log readable by the owner only");
+        }
+        let _ = std::fs::remove_file(log);
+    }
+
+    #[tokio::test]
+    async fn test_bash_timeout_terminates_and_keeps_partial_output() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws);
+        let started = std::time::Instant::now();
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "echo before; sleep 30",
+                "timeout": 1
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(r.output.contains("before"), "{}", r.output);
+        assert!(r.output.contains("timed out after 1s"), "{}", r.output);
+    }
+
+    #[tokio::test]
+    async fn test_bash_huge_output_keeps_head_and_tail() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws);
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "echo FIRST; yes filler | head -n 100000; echo LAST"
+            }))
+            .await
+            .unwrap();
+        assert!(r.output.starts_with("FIRST"), "{}", &r.output[..40]);
+        assert!(r.output.trim_end().ends_with("LAST"));
+        assert!(r.output.contains("bytes of output omitted"));
+        assert!(r.output.len() < CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES + 200);
+    }
+
+    #[tokio::test]
+    async fn test_bash_through_registry_keeps_exit_code_after_huge_output() {
+        let (_d, ws) = tmp_workspace();
+        let registry =
+            crate::llm::ToolRegistry::new(vec![Box::new(BashTool::new(ws))]);
+        let r = registry
+            .execute(
+                "bash",
+                serde_json::json!({
+                    "command": "yes filler | head -n 100000; yes err | head -n 100000 >&2; exit 3"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(r.output.starts_with("filler"), "{}", &r.output[..40]);
+        assert!(
+            r.output.trim_end().ends_with("[exit code: 3]"),
+            "{}",
+            &r.output[r.output.len() - 80..]
+        );
+        assert!(r.output.len() < 50 * 1024 + 1024);
+    }
+
+    #[test]
+    fn test_capture_keeps_multibyte_characters_intact() {
+        // Nothing dropped: a character spanning the head/tail seam survives.
+        let mut buffer = CaptureBuffer::default();
+        let mut text = "a".repeat(CAPTURE_HEAD_BYTES - 1);
+        text.push('é');
+        text.push_str("tail");
+        buffer.push(text.as_bytes());
+        assert_eq!(buffer.render(), text);
+
+        // Dropped middle: partial characters at the cuts are trimmed.
+        let mut buffer = CaptureBuffer::default();
+        let long = "é".repeat(CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES);
+        buffer.push(long.as_bytes());
+        let rendered = buffer.render();
+        assert!(!rendered.contains('\u{FFFD}'));
+        assert!(rendered.contains("bytes of output omitted"));
+    }
+
+    #[tokio::test]
+    async fn test_capture_returns_partial_output_when_stream_stays_open() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = Capture::start(reader);
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"partial output")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // `writer` is still alive: the stream never closes.
+        let (text, complete) =
+            capture.finish(std::time::Duration::from_millis(100)).await;
+        assert_eq!(text, "partial output");
+        assert!(!complete);
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn test_edit_requires_unique_match_unless_replace_all() {
+        let (_d, ws) = tmp_workspace();
+        std::fs::write(ws.join("f.txt"), "a x a x").unwrap();
+        let tool = EditTool::new(ws.clone());
+        let err = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "old_string": "a", "new_string": "b"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("matches 2 places"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("f.txt")).unwrap(),
+            "a x a x"
+        );
+
+        tool.execute(serde_json::json!({
+            "file_path": "f.txt", "old_string": "a", "new_string": "b", "replace_all": true
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("f.txt")).unwrap(),
+            "b x b x"
+        );
+
+        let err = tool
+            .execute(serde_json::json!({"file_path": "f.txt", "old_string": "", "new_string": "z"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_grep_invalid_pattern_is_an_error_not_no_matches() {
+        let (_d, ws) = tmp_workspace();
+        std::fs::write(ws.join("f.txt"), "hello").unwrap();
+        let tool = GrepTool::new(ws);
+        let err = tool
+            .execute(serde_json::json!({"pattern": "(unclosed"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("Search failed"), "{err}");
+    }
+
+    #[tokio::test]
     async fn test_delete_file() {
         let (_d, ws) = tmp_workspace();
         let f = ws.join("dead.txt");
@@ -1748,44 +2453,66 @@ Actual skill content here."#,
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_truncate_output_short() {
-        let short = "hello world".to_string();
-        assert_eq!(truncate_output(short.clone()), short);
+    #[tokio::test]
+    async fn test_read_stops_at_byte_budget_with_accurate_note() {
+        let (_tmp, ws) = tmp_workspace();
+        // 1000 lines of 100 bytes: under the line cap, over the byte cap.
+        let line = "x".repeat(99);
+        let body = vec![line.as_str(); 1000].join("\n");
+        std::fs::write(ws.join("wide.txt"), &body).unwrap();
+        let tool = ReadTool::new(ws);
+        for args in [
+            serde_json::json!({"file_path": "wide.txt"}),
+            serde_json::json!({"file_path": "wide.txt", "offset": 1, "limit": 5000}),
+        ] {
+            let out = tool.execute(args).await.unwrap().output;
+            let shown = MAX_READ_BYTES / 100;
+            assert!(out.len() < 50 * 1024, "stays under the registry cap");
+            assert!(
+                out.ends_with(&format!(
+                    "[Showing lines 1-{shown} of 1000. Use offset={} to continue.]",
+                    shown + 1
+                )),
+                "{}",
+                &out[out.len() - 120..]
+            );
+        }
     }
 
-    #[test]
-    fn test_truncate_output_long() {
-        let long = "x".repeat(MAX_OUTPUT_BYTES + 1000);
-        let result = truncate_output(long.clone());
-        assert!(result.len() < long.len());
-        assert!(result.contains("[output truncated"));
-        assert!(result.contains(&format!("{} bytes total", long.len())));
-    }
-
-    #[test]
-    fn test_truncate_output_exact_boundary() {
-        let exact = "y".repeat(MAX_OUTPUT_BYTES);
-        assert_eq!(truncate_output(exact.clone()), exact);
-    }
-}
-
-// Mock runner for SubagentTool tests
-#[cfg(test)]
-struct MockSubagentRunner;
-
-#[cfg(test)]
-#[async_trait]
-impl SubagentRunner for MockSubagentRunner {
-    async fn run(
-        &self,
-        agent_name: &str,
-        task: &str,
-        _workspace: &PathBuf,
-    ) -> Result<String> {
-        Ok(format!(
-            "mock result for agent={}, task={}",
-            agent_name, task
-        ))
+    #[tokio::test]
+    async fn test_read_without_range_caps_huge_files() {
+        let (_tmp, ws) = tmp_workspace();
+        let body: Vec<String> = (1..=DEFAULT_READ_LINES + 5)
+            .map(|n| n.to_string())
+            .collect();
+        std::fs::write(ws.join("big.txt"), body.join("\n")).unwrap();
+        let tool = ReadTool::new(ws);
+        let out = tool
+            .execute(serde_json::json!({"file_path": "big.txt"}))
+            .await
+            .unwrap()
+            .output;
+        assert!(out.starts_with("1\n2\n"));
+        assert!(out.contains(&format!("\n{DEFAULT_READ_LINES}\n")));
+        assert!(!out.contains(&format!("\n{}\n", DEFAULT_READ_LINES + 1)));
+        assert!(out.contains(&format!(
+            "[Showing lines 1-{DEFAULT_READ_LINES} of {}. Use offset={} to continue.]",
+            DEFAULT_READ_LINES + 5,
+            DEFAULT_READ_LINES + 1
+        )));
+        // An explicit range is honored beyond the default cap.
+        let out = tool
+            .execute(serde_json::json!({
+                "file_path": "big.txt",
+                "offset": DEFAULT_READ_LINES + 4,
+                "limit": 10
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(
+            out,
+            format!("{}\n{}", DEFAULT_READ_LINES + 4, DEFAULT_READ_LINES + 5)
+        );
     }
 }

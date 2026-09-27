@@ -64,7 +64,9 @@ Layers (in order):
 A 7th dynamic layer is **not** part of the assembled system prompt: the agent
 loop rebuilds a `<system-reminder>` block every turn (`build_system_reminder`)
 with the current step, available tools, last turn's tool results, and the most
-recent user message.
+recent user message. It is sent before the conversation by default, or after it
+when `server.system_reminder_at_end = true` (keeps the prompt prefix stable
+across steps so providers can cache it).
 
 ## Agents
 

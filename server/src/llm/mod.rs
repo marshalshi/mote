@@ -113,6 +113,7 @@ impl ChatMessage {
         }
     }
 
+    #[cfg(test)]
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
         Self::assistant_tool_calls_with_content(calls, None)
     }
@@ -150,6 +151,12 @@ impl ChatMessage {
         let mut message = Self::user(content);
         message.internal_role_task = true;
         message
+    }
+
+    /// A user-role message written by mote itself (e.g. "the user rolled
+    /// back these edits"): sent to the model, hidden from the chat view.
+    pub fn internal_note(content: impl Into<String>) -> Self {
+        Self::role_task(content)
     }
 }
 
@@ -215,6 +222,8 @@ pub enum StreamEvent {
 /// A single executable tool (read, write, bash, etc.).
 #[async_trait]
 pub trait Tool: Send + Sync {
+    /// The tool's definition. Must not change over the tool's lifetime:
+    /// [`ToolRegistry`] computes it once and caches it.
     fn def(&self) -> ToolDef;
     async fn execute(
         &self,
@@ -249,6 +258,117 @@ pub struct RollbackEntry {
 }
 
 // ── Tool registry ─────────────────────────────────────────
+
+/// An agent's tool set with definitions computed once and name lookup.
+///
+/// Also the single place tools are executed, so cross-cutting behavior
+/// (panic isolation, output limits) applies to every tool uniformly.
+pub struct ToolRegistry {
+    tools: Vec<Box<dyn Tool>>,
+    /// `defs[i]` is `tools[i].def()`, in registration order.
+    defs: Vec<ToolDef>,
+    /// Tool name → index; the first tool registered under a name wins.
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl ToolRegistry {
+    pub fn new(tools: Vec<Box<dyn Tool>>) -> Self {
+        let defs: Vec<ToolDef> = tools.iter().map(|tool| tool.def()).collect();
+        let mut index = std::collections::HashMap::new();
+        for (i, def) in defs.iter().enumerate() {
+            index.entry(def.function.name.clone()).or_insert(i);
+        }
+        Self { tools, defs, index }
+    }
+
+    /// Definitions of all tools, in registration order.
+    pub fn defs(&self) -> &[ToolDef] {
+        &self.defs
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    /// Run tool `name`. A panicking tool must not take down the whole run,
+    /// so a panic is caught and returned as an error.
+    pub async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<ToolExecutionResult> {
+        use futures::FutureExt;
+        let Some(&i) = self.index.get(name) else {
+            anyhow::bail!("Unknown tool: {name}");
+        };
+        let mut result =
+            std::panic::AssertUnwindSafe(self.tools[i].execute(args))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    Err(anyhow::anyhow!(
+                        "tool '{name}' panicked: {}",
+                        crate::agent::panic_message(panic.as_ref())
+                    ))
+                })?;
+        result.output = limit_tool_output(result.output);
+        Ok(result)
+    }
+}
+
+/// Largest tool output passed to the model, in bytes and in lines.
+const MAX_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
+const MAX_TOOL_OUTPUT_LINES: usize = 2500;
+/// How much of an over-long output is kept from its start; the rest of the
+/// budget comes from its end, where commands report status and errors.
+const TOOL_OUTPUT_HEAD_BYTES: usize = 30 * 1024;
+const TOOL_OUTPUT_HEAD_LINES: usize = 1500;
+const TOOL_OUTPUT_TAIL_BYTES: usize = 20 * 1024;
+const TOOL_OUTPUT_TAIL_LINES: usize = 1000;
+
+/// Cap a tool's output so one call cannot flood the context window. Keeps
+/// the head and the tail (exit codes, final errors, trailing notes) and says
+/// how to narrow the request.
+fn limit_tool_output(output: String) -> String {
+    let total_lines = output.lines().count();
+    if output.len() <= MAX_TOOL_OUTPUT_BYTES
+        && total_lines <= MAX_TOOL_OUTPUT_LINES
+    {
+        return output;
+    }
+    let head_end = output
+        .match_indices('\n')
+        .nth(TOOL_OUTPUT_HEAD_LINES - 1)
+        .map_or(output.len(), |(i, _)| i + 1);
+    let head = crate::agent::safe_truncate(
+        &output[..head_end],
+        TOOL_OUTPUT_HEAD_BYTES,
+    );
+    let rest = &output[head.len()..];
+    let tail_start = rest
+        .trim_end_matches('\n')
+        .rmatch_indices('\n')
+        .nth(TOOL_OUTPUT_TAIL_LINES - 1)
+        .map_or(0, |(i, _)| i + 1);
+    let mut tail = &rest[tail_start..];
+    if tail.len() > TOOL_OUTPUT_TAIL_BYTES {
+        let mut cut = tail.len() - TOOL_OUTPUT_TAIL_BYTES;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail = &tail[cut..];
+    }
+    let omitted_bytes = output.len() - head.len() - tail.len();
+    let omitted_lines = total_lines
+        .saturating_sub(head.lines().count())
+        .saturating_sub(tail.lines().count());
+    // A head cut at a line break already ends with one.
+    let gap = if head.ends_with('\n') { "" } else { "\n" };
+    format!(
+        "{head}{gap}[... output truncated: {omitted_bytes} bytes (~{omitted_lines} lines) omitted from the middle of {} bytes / {total_lines} lines. Narrow the request: read with offset/limit, use a more specific grep/glob pattern, or pipe command output through head, tail, or grep. ...]\n{tail}",
+        output.len()
+    )
+}
 
 /// Create the default built-in tool set.
 pub fn builtin_tools(workspace_root: std::path::PathBuf) -> Vec<Box<dyn Tool>> {
@@ -286,7 +406,66 @@ pub trait LlmProvider: Send + Sync {
 }
 
 pub mod deepseek;
+pub mod error;
 pub mod ollama;
+
+pub use error::{ProviderError, ProviderErrorKind};
+
+/// Time allowed to establish a connection to a provider.
+const PROVIDER_CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// HTTP client shared by all providers' constructors: fails fast when a
+/// provider is unreachable instead of hanging a run.
+pub fn provider_http_client() -> Result<reqwest::Client> {
+    use anyhow::Context;
+    reqwest::Client::builder()
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        .build()
+        .context("Failed to create HTTP client")
+}
+
+/// Await `future`, failing with a transient provider error if nothing
+/// arrives within `limit` (`None` waits forever). Applied to waiting for the
+/// response and to every streamed chunk, so a stalled connection cannot
+/// hang a run.
+pub async fn with_idle_timeout<T>(
+    limit: Option<std::time::Duration>,
+    provider: &str,
+    future: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, ProviderError> {
+    let Some(limit) = limit else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout(limit, future).await.map_err(|_| {
+        ProviderError::transient(format!(
+            "{provider} request stalled: no data for {}s",
+            limit.as_secs()
+        ))
+    })
+}
+
+/// Provider response time limits, from `[server]` config. `0` disables one.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderTimeouts {
+    /// Until the first streamed data arrives: covers queueing, model
+    /// loading (Ollama), and prompt evaluation of long contexts.
+    pub first_response: Option<std::time::Duration>,
+    /// Between streamed chunks once data is flowing.
+    pub stream_idle: Option<std::time::Duration>,
+}
+
+impl ProviderTimeouts {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let secs = |value: u64| {
+            (value > 0).then(|| std::time::Duration::from_secs(value))
+        };
+        Self {
+            first_response: secs(config.server.first_response_timeout_secs),
+            stream_idle: secs(config.server.stream_idle_timeout_secs),
+        }
+    }
+}
 
 /// Build a provider by name (useful when an agent overrides the provider).
 pub fn build_provider_for(
@@ -439,5 +618,135 @@ mod tests {
         let u = Usage::default();
         assert_eq!(u.prompt_tokens, 0);
         assert_eq!(u.completion_tokens, 0);
+    }
+
+    struct EchoTool {
+        name: &'static str,
+        output: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                def_type: "function".into(),
+                function: ToolFunctionDef {
+                    name: self.name.into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<ToolExecutionResult> {
+            if self.output == "panic" {
+                panic!("echo exploded");
+            }
+            Ok(ToolExecutionResult {
+                output: self.output.into(),
+                changes: Vec::new(),
+                rollback_entries: Vec::new(),
+            })
+        }
+    }
+
+    fn echo(name: &'static str, output: &'static str) -> Box<dyn Tool> {
+        Box::new(EchoTool { name, output })
+    }
+
+    #[test]
+    fn test_limit_tool_output_keeps_small_output_unchanged() {
+        let exact = "y".repeat(MAX_TOOL_OUTPUT_BYTES);
+        assert_eq!(limit_tool_output(exact.clone()), exact);
+        assert_eq!(limit_tool_output("hello".into()), "hello");
+        let lines = vec!["l"; MAX_TOOL_OUTPUT_LINES].join("\n");
+        assert_eq!(limit_tool_output(lines.clone()), lines);
+    }
+
+    #[test]
+    fn test_limit_tool_output_keeps_head_and_tail() {
+        let long = format!(
+            "{}{}",
+            "x".repeat(MAX_TOOL_OUTPUT_BYTES),
+            "z".repeat(1000)
+        );
+        let out = limit_tool_output(long.clone());
+        assert!(out.starts_with(&"x".repeat(TOOL_OUTPUT_HEAD_BYTES)));
+        assert!(out.ends_with(&"z".repeat(1000)));
+        assert!(out.contains("output truncated"));
+        assert!(out.len() < MAX_TOOL_OUTPUT_BYTES + 500);
+
+        let many: Vec<String> = (1..=MAX_TOOL_OUTPUT_LINES + 10)
+            .map(|n| n.to_string())
+            .collect();
+        let out = limit_tool_output(many.join("\n"));
+        assert!(out.starts_with("1\n2\n"));
+        assert!(out.contains(&format!("\n{TOOL_OUTPUT_HEAD_LINES}\n[...")));
+        assert!(out.ends_with(&format!("\n{}", MAX_TOOL_OUTPUT_LINES + 10)));
+        assert!(
+            out.lines().count()
+                <= TOOL_OUTPUT_HEAD_LINES + TOOL_OUTPUT_TAIL_LINES + 1
+        );
+
+        // Multi-byte characters are never split.
+        let wide = "é".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let out = limit_tool_output(wide);
+        assert!(out.contains("output truncated"));
+    }
+
+    #[test]
+    fn test_limit_tool_output_never_drops_the_final_status_line() {
+        let noisy =
+            format!("{}\n[exit code: 101]", "compiling crate\n".repeat(10_000));
+        let out = limit_tool_output(noisy);
+        assert!(
+            out.ends_with("[exit code: 101]"),
+            "{}",
+            &out[out.len() - 60..]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_lookup_order_and_duplicates() {
+        let registry = ToolRegistry::new(vec![
+            echo("read", "first"),
+            echo("bash", "b"),
+            echo("read", "second"),
+        ]);
+        let names: Vec<&str> = registry
+            .defs()
+            .iter()
+            .map(|d| d.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["read", "bash", "read"]);
+        assert!(registry.contains("bash"));
+        assert!(!registry.contains("write"));
+        // The first tool registered under a name wins.
+        let out = registry
+            .execute("read", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out.output, "first");
+    }
+
+    #[tokio::test]
+    async fn test_tool_registry_execute_errors_for_unknown_and_panicking_tools()
+    {
+        let registry = ToolRegistry::new(vec![echo("boom", "panic")]);
+        let unknown = registry
+            .execute("nope", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(format!("{unknown}").contains("Unknown tool: nope"));
+        let panicked = registry
+            .execute("boom", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        let message = format!("{panicked}");
+        assert!(message.contains("tool 'boom' panicked"), "{message}");
+        assert!(message.contains("echo exploded"), "{message}");
     }
 }

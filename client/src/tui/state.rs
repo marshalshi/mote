@@ -161,6 +161,47 @@ pub struct App {
     /// Active server-side run ID, used to reattach after transient websocket drops.
     pub active_run_id: Option<String>,
 
+    /// Identifies this TUI process to the server, which allows at most one
+    /// active run per instance.
+    pub client_instance_id: String,
+
+    /// Number of run-log events received for `active_run_id` (see
+    /// `ServerEvent::is_run_log_event`). Sent as `replay_from` on reattach so
+    /// the server resumes exactly where this client stopped.
+    pub run_event_count: usize,
+
+    /// Replayed run-log events to drop because they were already applied
+    /// (used when the server attaches us to a run we had lost track of).
+    pub skip_run_log_events: usize,
+
+    /// A run whose connection could not be restored, with how many of its
+    /// log events are already on screen. Kept separate from `active_run_id`
+    /// so a new request never reattaches to it by accident; used only if
+    /// the server later reports it as still busy.
+    pub lost_run: Option<(String, usize)>,
+
+    /// Swallow the attached run's events until it ends. Set when the server
+    /// attaches us to an earlier run of this TUI that belongs to a
+    /// conversation the user has since left (e.g. after /new); that run is
+    /// cancelled rather than mixed into the current conversation.
+    pub discarding_run: bool,
+
+    /// Ctrl+C pressed again while a cancel could not be delivered yet (the
+    /// websocket is reconnecting): stop waiting for the connection.
+    pub stop_reattach_requested: bool,
+
+    /// Size of the conversation the model sees, as last reported by the
+    /// server (`ServerEvent::ContextSize`). It includes tool calls and
+    /// results, which the local view does not show.
+    pub server_context_chars: Option<u64>,
+
+    /// Answers (allowed, remember) this client already sent in the current
+    /// run, by permission id. When the server re-announces one of these as
+    /// `PermissionPending`, the answer either raced with the attach snapshot
+    /// or was lost with the old socket; re-sending it covers both, and the
+    /// server ignores a duplicate.
+    pub answered_permissions: std::collections::HashMap<String, (bool, bool)>,
+
     /// Session picker popup state.
     pub session_picker_open: bool,
     pub session_picker_items: Vec<marshaling_protocol::SessionInfo>,
@@ -426,6 +467,18 @@ impl App {
             repo_agents_md,
             runtime_session_key,
             active_run_id: None,
+            client_instance_id: format!(
+                "tui-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ),
+            run_event_count: 0,
+            skip_run_log_events: 0,
+            lost_run: None,
+            discarding_run: false,
+            stop_reattach_requested: false,
+            answered_permissions: std::collections::HashMap::new(),
+            server_context_chars: None,
             session_picker_open: false,
             session_picker_items: Vec::new(),
             session_picker_index: 0,
@@ -658,7 +711,7 @@ impl App {
     fn remember_input(&mut self, text: &str) {
         // Save to history first (including slash commands), dedup against last entry
         if !text.is_empty()
-            && self.input_history.last().map_or(true, |last| last != text)
+            && self.input_history.last().is_none_or(|last| last != text)
         {
             self.input_history.push(text.to_string());
         }
@@ -821,10 +874,21 @@ impl App {
     pub fn apply_compaction(
         &mut self,
         session_id: String,
-        compaction: marshaling_protocol::CompactionState,
+        mut compaction: marshaling_protocol::CompactionState,
     ) {
+        // The server counts compacted messages in its transcript; locally
+        // the count only marks where compaction happened in this view (for
+        // the context-size heuristic), so use the local position: every
+        // conversation message except a still-unsent user message.
+        let pending =
+            usize::from(self.pending_user_message_content().is_some());
+        compaction.compacted_message_count =
+            self.conversation_message_count().saturating_sub(pending);
         self.active_session_id = Some(session_id);
         self.compaction_state = Some(compaction);
+        // Unknown until the next run reports it; the compacted history is
+        // far smaller than before.
+        self.server_context_chars = None;
         self.pending_compact_confirmation = false;
         self.compact_declined_for_message = None;
         self.push_command_message(
@@ -843,7 +907,15 @@ impl App {
         if self.compact_declined_for_message.as_deref() == Some(last_content) {
             return false;
         }
-        self.uncompacted_context_chars(false) > AUTO_COMPACT_CHAR_THRESHOLD
+        // The server's figure covers tool output the local view lacks; the
+        // unsent message is not in it yet.
+        let server = self.server_context_chars.map_or(0, |chars| {
+            usize::try_from(chars)
+                .unwrap_or(usize::MAX)
+                .saturating_add(last_content.len())
+        });
+        self.uncompacted_context_chars(false).max(server)
+            > AUTO_COMPACT_CHAR_THRESHOLD
     }
 
     pub fn request_auto_compact_confirmation(&mut self) {
@@ -1448,6 +1520,36 @@ impl App {
         self.invalidate_response_render_cache();
     }
 
+    /// The server is retrying a failed provider request. Text streamed for
+    /// the current turn is dropped when the server says the retry will
+    /// regenerate it, so it is not shown twice.
+    pub fn agent_retrying(
+        &mut self,
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: &str,
+        discarded_output: bool,
+    ) {
+        if discarded_output {
+            self.stream_buffer.clear();
+            self.reasoning_buffer.clear();
+        }
+        let discarded = if discarded_output {
+            "; partial response discarded"
+        } else {
+            ""
+        };
+        self.messages.push(DisplayMessage::command(
+            Role::Assistant,
+            format!(
+                "Provider error: {reason}\nRetrying in {:.1}s (attempt {attempt}/{max_attempts}){discarded}.",
+                delay_ms as f64 / 1000.0
+            ),
+        ));
+        self.invalidate_response_render_cache();
+    }
+
     /// Called when the agent loop finishes entirely.
     pub fn agent_done(&mut self, content: &str) {
         let thinking = if self.reasoning_buffer.is_empty() {
@@ -1458,7 +1560,10 @@ impl App {
         // Sentinel values from the agent loop — don't display as assistant messages
         if matches!(
             content,
-            "(cancelled)" | "(max steps reached)" | "(interrupted)"
+            "(cancelled)"
+                | "(max steps reached)"
+                | "(interrupted)"
+                | "(permission denied)"
         ) {
             if thinking.is_some() {
                 self.messages.push(DisplayMessage {
@@ -1498,6 +1603,191 @@ impl App {
         self.loading_progress = None;
         self.loading_label = None;
         self.invalidate_response_render_cache();
+    }
+
+    /// Track this client's position in the active run's event log.
+    ///
+    /// Returns false when the event is a replayed duplicate that has already
+    /// been applied and must be ignored.
+    pub fn accept_run_log_event(
+        &mut self,
+        event: &marshaling_protocol::ServerEvent,
+    ) -> bool {
+        if !event.is_run_log_event() {
+            return true;
+        }
+        if matches!(event, marshaling_protocol::ServerEvent::RunStarted { .. })
+        {
+            self.run_event_count = 0;
+        }
+        self.run_event_count += 1;
+        if self.skip_run_log_events > 0 {
+            self.skip_run_log_events -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// Reset run tracking before sending a new chat request, so nothing from
+    /// a previous run (id, event count, pending skip) leaks into it.
+    pub fn prepare_new_run(&mut self) {
+        self.active_run_id = None;
+        self.run_event_count = 0;
+        self.skip_run_log_events = 0;
+        self.discarding_run = false;
+        self.stop_reattach_requested = false;
+        self.answered_permissions.clear();
+    }
+
+    /// Show a permission prompt for `id`, or answer it right away when the
+    /// user chose "allow always" for this tool.
+    pub fn show_permission_request(
+        &mut self,
+        id: String,
+        tool_name: String,
+        args: &serde_json::Value,
+    ) {
+        if self.auto_allowed_tools.contains(&tool_name) {
+            self.pending_permission_response = Some((id, true, true));
+        } else {
+            self.pending_permission = Some(PendingPermission {
+                id,
+                tool_name,
+                args: args.to_string(),
+                confirming_always: false,
+            });
+            self.touch_response_render();
+        }
+    }
+
+    /// The server re-announced an unanswered prompt after (re)attaching.
+    /// Re-send our earlier answer if we have one; otherwise show the prompt
+    /// unless it is already shown or an answer is already queued.
+    pub fn show_pending_permission(
+        &mut self,
+        id: String,
+        tool_name: String,
+        args: &serde_json::Value,
+    ) {
+        let shown =
+            self.pending_permission.as_ref().is_some_and(|p| p.id == id);
+        let queued = self
+            .pending_permission_response
+            .as_ref()
+            .is_some_and(|(queued_id, _, _)| *queued_id == id);
+        if shown || queued {
+            return;
+        }
+        match self.answered_permissions.get(&id).copied() {
+            Some((allowed, remember)) => {
+                self.pending_permission_response =
+                    Some((id, allowed, remember));
+            }
+            None => self.show_permission_request(id, tool_name, args),
+        }
+    }
+
+    /// The server refused to start our message because this client already
+    /// has an active run, and attached us to that run instead.
+    pub fn handle_session_busy(&mut self, run_id: String) {
+        self.run_event_count = 0;
+        self.active_run_id = Some(run_id.clone());
+        let notice = match self.lost_run.take() {
+            // The run we lost track of: everything up to our last known
+            // position is already on screen; skip that part of the replay.
+            Some((lost_id, count)) if lost_id == run_id => {
+                self.skip_run_log_events = count;
+                "A run is already active in this session; attached to it. Your message was not sent and is back in the input box."
+            }
+            // An earlier run from a conversation we have since left: don't
+            // mix its output into this one. Cancel it and swallow its events.
+            _ => {
+                self.skip_run_log_events = 0;
+                self.discarding_run = true;
+                self.pending_cancel = true;
+                "An earlier run from this TUI was still active; cancelling it. Your message was not sent and is back in the input box."
+            }
+        };
+
+        // The message was not sent: take it back out of the conversation and
+        // restore it into the input box so the user can resend it later.
+        if let Some(idx) = self
+            .messages
+            .iter()
+            .rposition(|m| m.source == MessageSource::Conversation)
+            .filter(|&idx| self.messages[idx].role == Role::User)
+        {
+            let restored = self.messages.remove(idx).content;
+            self.input = if self.input.is_empty() {
+                restored
+            } else {
+                format!("{restored}\n{}", self.input)
+            };
+            self.input_cursor = self.input.len();
+            self.reset_input_scroll();
+        }
+        self.messages
+            .push(DisplayMessage::command(Role::Assistant, notice.into()));
+        self.state = AppState::AgentRunning;
+        self.invalidate_response_render_cache();
+    }
+
+    /// The discarded earlier run has ended; return to idle.
+    pub fn finish_discarded_run(&mut self) {
+        self.discarding_run = false;
+        self.active_run_id = None;
+        self.pending_permission = None;
+        self.pending_permission_response = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+        self.state = AppState::Idle;
+        self.loading_progress = None;
+        self.loading_label = None;
+        // Queued inputs are not sent here: the restored message in the input
+        // box comes first, and the queue drains after that run as usual.
+        let notice = match self.input_queue.len() {
+            0 => "Earlier run stopped. Press Enter to send your message."
+                .to_string(),
+            n => format!(
+                "Earlier run stopped. Press Enter to send your message; {n} queued message(s) will follow after it."
+            ),
+        };
+        self.messages
+            .push(DisplayMessage::command(Role::Assistant, notice));
+        self.invalidate_response_render_cache();
+    }
+
+    /// The connection to an in-flight run could not be restored.
+    pub fn connection_lost(&mut self, reason: &str) {
+        self.pending_permission = None;
+        self.pending_permission_response = None;
+        self.pending_cancel = false;
+        self.clear_esc_cancel_arm();
+        // Keep whatever was streamed so far visible.
+        if !self.stream_buffer.is_empty() {
+            let text = std::mem::take(&mut self.stream_buffer);
+            self.messages.push(DisplayMessage {
+                role: Role::Assistant,
+                content: text,
+                thinking: None,
+                source: MessageSource::Conversation,
+            });
+        }
+        // Remember the run and our position in it: if the server later
+        // reports it as still busy, the replay resumes from there without
+        // duplicating output. A run being discarded is not ours to resume,
+        // and with no active run an older lost run stays remembered.
+        if let Some(id) = self.active_run_id.take() {
+            self.lost_run = if self.discarding_run {
+                None
+            } else {
+                Some((id, self.run_event_count))
+            };
+        }
+        self.skip_run_log_events = 0;
+        self.discarding_run = false;
+        self.stop_reattach_requested = false;
+        self.set_error(reason);
     }
 
     /// Show an error message (used by start_agent on setup failure).
@@ -1921,6 +2211,8 @@ impl App {
         self.tokens_input = 0;
         self.tokens_output = 0;
         self.active_run_id = None;
+        self.lost_run = None;
+        self.server_context_chars = None;
         self.compaction_state = None;
         self.pending_compact_confirmation = false;
         self.pending_auto_compact_send = false;
@@ -1957,6 +2249,8 @@ impl App {
         self.pending_secret_login = None;
         self.active_session_id = None;
         self.active_run_id = None;
+        self.lost_run = None;
+        self.server_context_chars = None;
         self.compaction_state = None;
         self.pending_compact_confirmation = false;
         self.pending_auto_compact_send = false;
@@ -1998,8 +2292,8 @@ impl App {
         self.suggestions.clear();
         self.suggestion_index = 0;
         let input = self.input.trim_start();
-        if input.starts_with('@') {
-            let after = input[1..].trim_start();
+        if let Some(rest) = input.strip_prefix('@') {
+            let after = rest.trim_start();
             for name in &self.subagent_names {
                 if name.starts_with(after) {
                     self.suggestions.push(format!("@{}", name));
@@ -2134,14 +2428,15 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 fn parse_ui_color(name: &str) -> Color {
     let s = name.trim();
     // Support hex colors: #RRGGBB
-    if s.starts_with('#') && s.len() == 7 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
+    if s.starts_with('#')
+        && s.len() == 7
+        && let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&s[1..3], 16),
             u8::from_str_radix(&s[3..5], 16),
             u8::from_str_radix(&s[5..7], 16),
-        ) {
-            return Color::Rgb(r, g, b);
-        }
+        )
+    {
+        return Color::Rgb(r, g, b);
     }
     match s.to_lowercase().as_str() {
         "cyan" => Color::Cyan,

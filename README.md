@@ -112,7 +112,8 @@ Start Mote with the compiled client binary:
 - Logs are written to `~/.config/mote/logs/mote.log` (server and client verbose mode).
 - History is stored under `~/.config/mote/history/` by default.
 - In multi-client mode, history is partitioned by client runtime session key:
-  - `~/.config/mote/history/<session-key>/*.md`
+  - `~/.config/mote/history/<session-key>/*.jsonl`
+- Each session is an append-only JSONL transcript holding the full conversation (tool calls and results included), written after every agent step. Older text-only `*.md` sessions are still listed and loadable; continuing one converts it to `.jsonl` and leaves the `.md` file untouched.
 
 ## Usage
 

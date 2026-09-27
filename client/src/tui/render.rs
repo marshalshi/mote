@@ -274,11 +274,8 @@ fn render_picker_popup(
     accent: Color,
     title: &'static str,
 ) -> Rect {
-    let rect = centered_rect(
-        area,
-        area.width.min(92).max(44),
-        area.height.min(22).max(9),
-    );
+    let rect =
+        centered_rect(area, area.width.clamp(44, 92), area.height.clamp(9, 22));
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .title(title)
@@ -304,10 +301,9 @@ fn render_permission_popup(frame: &mut Frame, area: Rect, app: &App) {
     };
     let rect = centered_rect(
         area,
-        area.width.min(88).max(46),
+        area.width.clamp(46, 88),
         area.height
-            .min(if perm.confirming_always { 18 } else { 20 })
-            .max(10),
+            .clamp(10, if perm.confirming_always { 18 } else { 20 }),
     );
     frame.render_widget(Clear, rect);
     let block = Block::default()
@@ -679,7 +675,7 @@ fn render_markdown(
                                 accent_prefix.to_string(),
                                 accent_style,
                             )];
-                            spans.extend(hl_line.into_iter());
+                            spans.extend(hl_line);
                             lines.push(Line::from(spans));
                         }
                     }
@@ -1042,8 +1038,7 @@ fn render_markdown_table(
             } else {
                 Style::default()
             };
-            for col_idx in 0..col_count {
-                let width = widths[col_idx];
+            for (col_idx, &width) in widths.iter().enumerate().take(col_count) {
                 let alignment = table_alignment(col_idx);
                 let cell_text = cell_lines
                     .get(col_idx)
@@ -1177,7 +1172,7 @@ fn push_accent_lines(
         for part in wrapped {
             lines.push(Line::from(vec![
                 Span::styled(accent_prefix.to_string(), accent_style),
-                Span::styled(part, content_style.clone()),
+                Span::styled(part, content_style),
             ]));
         }
     }
@@ -1489,30 +1484,28 @@ fn build_lines(app: &App, content_width: usize) -> Vec<Line<'static>> {
         };
 
         // Separator between role groups (when role changes)
-        let role_changed = prev_role.map_or(true, |r| *r != msg.role);
-        if role_changed {
-            if prev_role.is_some() {
-                lines.push(Line::from(""));
-            }
+        let role_changed = prev_role.is_none_or(|r| *r != msg.role);
+        if role_changed && prev_role.is_some() {
+            lines.push(Line::from(""));
         }
         prev_role = Some(&msg.role);
 
         // Render thinking content with blank side bar, if present
-        if let Some(ref thinking) = msg.thinking {
-            if !thinking.is_empty() {
-                push_accent_lines(
-                    &mut lines,
-                    thinking,
-                    content_width,
-                    "    ",
-                    Style::default(),
-                    grey_content,
-                );
-            }
+        if let Some(ref thinking) = msg.thinking
+            && !thinking.is_empty()
+        {
+            push_accent_lines(
+                &mut lines,
+                thinking,
+                content_width,
+                "    ",
+                Style::default(),
+                grey_content,
+            );
         }
 
         // Empty line between thinking and output if both are present
-        if msg.thinking.as_ref().map_or(false, |t| !t.is_empty())
+        if msg.thinking.as_ref().is_some_and(|t| !t.is_empty())
             && !msg.content.is_empty()
         {
             lines.push(Line::from(Span::styled(
@@ -1647,11 +1640,7 @@ fn render_response_area(frame: &mut Frame, area: Rect, app: &mut App) {
         .unwrap_or(&[]);
     let available_height = area.height.saturating_sub(1) as usize;
     let total_lines = lines.len();
-    let max_scroll = if total_lines > available_height {
-        total_lines - available_height
-    } else {
-        0
-    };
+    let max_scroll = total_lines.saturating_sub(available_height);
     let scroll = if app.auto_scroll {
         max_scroll
     } else {

@@ -21,6 +21,8 @@ mod agent;
 mod audio;
 mod auth;
 mod config;
+#[cfg(test)]
+mod e2e_tests;
 mod history;
 mod llm;
 mod prompt;
@@ -49,7 +51,14 @@ struct AppState {
     /// legacy conversion) to the same session file.
     session_locks:
         tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// Session list entries by transcript path (see `session_infos`).
+    session_info_cache: Arc<std::sync::Mutex<SessionInfoCache>>,
 }
+
+type SessionInfoCache = HashMap<
+    PathBuf,
+    (std::time::SystemTime, u64, marshaling_protocol::SessionInfo),
+>;
 
 impl AppState {
     async fn session_lock(
@@ -67,6 +76,9 @@ struct RollbackChangeSet {
     tool_name: String,
     entries: Vec<llm::RollbackEntry>,
     display_changes: Vec<marshaling_protocol::FileChange>,
+    /// Transcript of the session that made the change; a rollback is noted
+    /// there so the model knows the edit was undone.
+    transcript: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -103,6 +115,14 @@ struct ActiveRun {
     tx: broadcast::Sender<marshaling_protocol::ServerEvent>,
     cancel_tx: watch::Sender<bool>,
     permission_broker: agent::PermissionBroker,
+    /// Delivers notes for the model into the running loop.
+    notes_tx: mpsc::UnboundedSender<String>,
+    /// Notes that reached the run after its loop stopped taking them; the
+    /// forwarder writes them to the transcript when the run ends.
+    pending_notes: Vec<String>,
+    /// False once the forwarder has flushed `pending_notes` for the last
+    /// time; later notes are appended to the transcript directly.
+    accepting_notes: bool,
     /// Permission requests that have not been answered yet, by id. Re-sent
     /// to every newly attached socket as `PermissionPending`.
     pending_permission_tools: HashMap<String, PendingPermission>,
@@ -128,6 +148,7 @@ impl ActiveRun {
         session_path: Option<PathBuf>,
         cancel_tx: watch::Sender<bool>,
         permission_broker: agent::PermissionBroker,
+        notes_tx: mpsc::UnboundedSender<String>,
     ) -> Self {
         let (tx, _) = broadcast::channel(512);
         Self {
@@ -138,6 +159,9 @@ impl ActiveRun {
             tx,
             cancel_tx,
             permission_broker,
+            notes_tx,
+            pending_notes: Vec::new(),
+            accepting_notes: true,
             pending_permission_tools: HashMap::new(),
             finished: false,
             attach_generation: 0,
@@ -223,19 +247,19 @@ fn claim_run_slot(
     run_id: &str,
     run: ActiveRun,
 ) -> std::result::Result<(), RunSlotConflict> {
-    if let Some(instance) = run.client_instance_id.as_deref() {
-        if let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
+    if let Some(instance) = run.client_instance_id.as_deref()
+        && let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
             !r.finished && r.client_instance_id.as_deref() == Some(instance)
-        }) {
-            return Err(RunSlotConflict::SameClient(busy_id.clone()));
-        }
+        })
+    {
+        return Err(RunSlotConflict::SameClient(busy_id.clone()));
     }
-    if let Some(path) = run.session_path.as_deref() {
-        if let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
+    if let Some(path) = run.session_path.as_deref()
+        && let Some((busy_id, _)) = runs.iter().find(|(_, r)| {
             !r.finished && r.session_path.as_deref() == Some(path)
-        }) {
-            return Err(RunSlotConflict::SessionBusy(busy_id.clone()));
-        }
+        })
+    {
+        return Err(RunSlotConflict::SessionBusy(busy_id.clone()));
     }
     runs.insert(run_id.to_string(), run);
     Ok(())
@@ -336,40 +360,70 @@ async fn get_config(
 }
 
 /// Sessions in `dir`, newest first: transcripts, plus legacy `.md` sessions
-/// that have not been converted yet.
+/// that have not been converted yet. A transcript is only parsed when it is
+/// new or changed since the last listing (`cache`, keyed by path and checked
+/// against modification time and size).
 fn session_infos(
     dir: &std::path::Path,
+    cache: &std::sync::Mutex<SessionInfoCache>,
 ) -> Vec<marshaling_protocol::SessionInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut transcripts = HashSet::new();
     let mut found: Vec<(
         std::time::SystemTime,
         marshaling_protocol::SessionInfo,
     )> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
+        let metadata = entry.metadata().ok();
+        let stamp = metadata
+            .as_ref()
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        let (modified, size) = stamp.unwrap_or((std::time::UNIX_EPOCH, 0));
         let info = match path.extension().and_then(|e| e.to_str()) {
-            Some("jsonl") => match store::load(&path) {
-                Ok(transcript) => marshaling_protocol::SessionInfo {
-                    id: transcript.id.clone(),
-                    created: transcript.created.to_rfc3339(),
-                    model: format!(
-                        "{}/{}",
-                        transcript.model_provider, transcript.model_id
-                    ),
-                    message_count: transcript.display_messages().len(),
-                    summary: transcript.summary(),
-                },
-                Err(e) => {
-                    tracing::warn!("Skipping unreadable session: {e:#}");
-                    continue;
+            Some("jsonl") => {
+                transcripts.insert(path.clone());
+                // Without a usable stamp the file cannot be checked for
+                // changes, so it is always parsed and never cached.
+                let cached = stamp.and_then(|_| {
+                    cache
+                        .get(&path)
+                        .filter(|(time, len, _)| {
+                            *time == modified && *len == size
+                        })
+                        .map(|(_, _, info)| info.clone())
+                });
+                let info = match cached {
+                    Some(info) => info,
+                    None => match store::load(&path) {
+                        Ok(transcript) => marshaling_protocol::SessionInfo {
+                            id: transcript.id.clone(),
+                            created: transcript.created.to_rfc3339(),
+                            model: format!(
+                                "{}/{}",
+                                transcript.model_provider, transcript.model_id
+                            ),
+                            message_count: transcript.display_messages().len(),
+                            summary: transcript.summary(),
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                "Skipping unreadable session: {e:#}"
+                            );
+                            continue;
+                        }
+                    },
+                };
+                if stamp.is_some() {
+                    cache.insert(path.clone(), (modified, size, info.clone()));
                 }
-            },
+                info
+            }
             Some("md") if !path.with_extension("jsonl").exists() => {
                 match history::parse_file(&path) {
                     Ok((meta, messages)) => marshaling_protocol::SessionInfo {
@@ -389,7 +443,11 @@ fn session_infos(
         };
         found.push((modified, info));
     }
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    // Forget sessions of this directory that no longer exist.
+    cache.retain(|path, _| {
+        path.parent() != Some(dir) || transcripts.contains(path)
+    });
+    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     found.into_iter().map(|(_, info)| info).collect()
 }
 
@@ -423,6 +481,7 @@ fn load_session_data(
             compaction: protocol_compaction(&transcript),
             context_chars: Some(store::history_chars(&model_history(
                 &transcript,
+                None,
             ))),
             messages,
         });
@@ -460,9 +519,11 @@ async fn list_sessions(
         &state.config.history.dir,
         &runtime_session_key,
     );
-    let items = tokio::task::spawn_blocking(move || session_infos(&hist_dir))
-        .await
-        .unwrap_or_default();
+    let cache = Arc::clone(&state.session_info_cache);
+    let items =
+        tokio::task::spawn_blocking(move || session_infos(&hist_dir, &cache))
+            .await
+            .unwrap_or_default();
     Ok(Json(items))
 }
 
@@ -643,16 +704,16 @@ async fn compact_conversation(
     } else {
         request.agent.clone()
     };
-    if let Some(agent) = state.merged_agents.get(&agent_name) {
-        if !agent.is_user_selectable() {
-            anyhow::bail!("Agent '{agent_name}' is not user-selectable");
-        }
+    if let Some(agent) = state.merged_agents.get(&agent_name)
+        && !agent.is_user_selectable()
+    {
+        anyhow::bail!("Agent '{agent_name}' is not user-selectable");
     }
 
     let auth_guard = state.auth.read().await;
     let ctx = resolve_agent_context(
         &state.config,
-        &*auth_guard,
+        &auth_guard,
         &state.merged_agents,
         &req_ctx,
         &agent_name,
@@ -802,7 +863,8 @@ fn compact_part(message: &llm::ChatMessage) -> String {
     let mut part = String::new();
     match message.role {
         llm::Role::User if message.internal_role_task => {
-            part.push_str(&format!("ROLE HANDOFF:\n{content}\n\n"));
+            // Role hand-offs and notes written by mote itself.
+            part.push_str(&format!("INTERNAL NOTE:\n{content}\n\n"));
         }
         llm::Role::User => {
             part.push_str(&format!("USER:\n{content}\n\n"));
@@ -1175,6 +1237,7 @@ pub(crate) struct AgentContext {
 /// Resolve agent context for role-aware loop mode.
 /// Creates providers for all unique provider names, builds ResolvedRole structs,
 /// and assembles shared system layers using the orchestrator's identity.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_role_aware_context(
     config: &config::Config,
     auth: &auth::Auth,
@@ -1461,7 +1524,7 @@ pub fn build_permission_map(
     perms.insert("finish_task".into(), config::Permission::Allow);
     // switch_role is always allowed when the agent defines roles.
     // This tool is handled internally by the loop (not as a normal Tool trait object).
-    if agent_cfg.map_or(false, |a| a.roles.is_some()) {
+    if agent_cfg.is_some_and(|a| a.roles.is_some()) {
         perms.insert("switch_role".into(), config::Permission::Allow);
     }
     // Resolve subagent permission
@@ -1475,6 +1538,7 @@ pub fn build_permission_map(
 }
 
 /// Build the augmented tool set (builtins + use_skill + subagent tool).
+#[allow(clippy::too_many_arguments)]
 fn build_augmented_tools(
     workspace: &std::path::Path,
     repo_agents_md: Option<String>,
@@ -1596,18 +1660,18 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Validate agent is user-selectable
-    if let Some(agent) = state.merged_agents.get(&agent_name) {
-        if !agent.is_user_selectable() {
-            send_error(&mut socket, format!("Agent '{agent_name}' is a subagent-only agent and cannot be used directly. Use a primary agent and delegate via the subagent tool.")).await;
-            return;
-        }
+    if let Some(agent) = state.merged_agents.get(&agent_name)
+        && !agent.is_user_selectable()
+    {
+        send_error(&mut socket, format!("Agent '{agent_name}' is a subagent-only agent and cannot be used directly. Use a primary agent and delegate via the subagent tool.")).await;
+        return;
     }
 
     // Resolve agent context (provider, model, system prompt, options)
     let auth_guard = state.auth.read().await;
     let ctx = match resolve_agent_context(
         &state.config,
-        &*auth_guard,
+        &auth_guard,
         &state.merged_agents,
         &req_ctx,
         &agent_name,
@@ -1654,6 +1718,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let (agent_tx, agent_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let permission_broker = agent::PermissionBroker::default();
+    let (notes_tx, notes_rx) = mpsc::unbounded_channel();
     let run_id = new_run_id();
 
     let client_instance_id = match request.client_instance_id.clone() {
@@ -1674,6 +1739,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 Some(session_path.clone()),
                 cancel_tx.clone(),
                 permission_broker.clone(),
+                notes_tx,
             ),
         )
     };
@@ -1693,10 +1759,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         let busy = marshaling_protocol::ServerEvent::SessionBusy {
             run_id: busy_run_id.clone(),
         };
-        if let Ok(json) = serde_json::to_string(&busy) {
-            if socket.send(Message::Text(json.into())).await.is_err() {
-                return;
-            }
+        if let Ok(json) = serde_json::to_string(&busy)
+            && socket.send(Message::Text(json.into())).await.is_err()
+        {
+            return;
         }
         attach_socket_to_run(socket, state, busy_run_id, 0).await;
         return;
@@ -1734,7 +1800,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         .map_err(|e| anyhow::anyhow!("session open task failed: {e}"))
         .and_then(|result| result)
     };
-    let (writer, history) = match opened {
+    let OpenedSession { writer, history } = match opened {
         Ok(opened) => opened,
         Err(e) => {
             // The run never started: release its slot.
@@ -1795,6 +1861,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     events_tx: agent_tx,
                     cancel_rx,
                     permission_broker,
+                    notes_rx: Some(notes_rx),
                 },
                 user_msg,
                 history,
@@ -1829,8 +1896,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     attach_socket_to_run(socket, state, run_id, 0).await;
 }
 
-/// Open the transcript a run appends to, returning its writer and the
-/// history the model starts from. Blocking; run under the session lock.
+/// A run's view of its session when it starts.
+struct OpenedSession {
+    writer: store::TranscriptWriter,
+    /// The history the model starts from.
+    history: Vec<llm::ChatMessage>,
+}
+
+/// Open the transcript a run appends to. Blocking; run under the session
+/// lock.
 fn open_run_session(
     dir: PathBuf,
     session_id: String,
@@ -1838,7 +1912,7 @@ fn open_run_session(
     is_new_session: bool,
     model_provider: String,
     model_id: String,
-) -> Result<(store::TranscriptWriter, Vec<llm::ChatMessage>)> {
+) -> Result<OpenedSession> {
     if is_new_session {
         let writer = store::TranscriptWriter::create(
             path,
@@ -1846,11 +1920,16 @@ fn open_run_session(
             model_provider,
             model_id,
         );
-        return Ok((writer, Vec::new()));
+        return Ok(OpenedSession {
+            writer,
+            history: Vec::new(),
+        });
     }
     let transcript = load_or_convert_session(&dir, &session_id)?;
-    let history = model_history(&transcript);
-    Ok((store::TranscriptWriter::resume(path, &transcript), history))
+    Ok(OpenedSession {
+        history: model_history(&transcript, Some(&model_provider)),
+        writer: store::TranscriptWriter::resume(path, &transcript),
+    })
 }
 
 /// Load session `id`, converting a legacy text-only `.md` session into a
@@ -1911,12 +1990,27 @@ fn repair_unanswered_calls(
 
 /// The history the model sees: the compaction summary (if any), then every
 /// message after the compacted range.
-fn model_history(transcript: &store::Transcript) -> Vec<llm::ChatMessage> {
+///
+/// `provider` is the provider about to receive it: when it differs from
+/// the one the session last ran with, earlier reasoning is dropped, as it
+/// is provider-specific (and some APIs reject foreign reasoning fields).
+fn model_history(
+    transcript: &store::Transcript,
+    provider: Option<&str>,
+) -> Vec<llm::ChatMessage> {
     let mut history = Vec::new();
     if let Some(compaction) = protocol_compaction(transcript) {
         history.push(compaction_context_message(&compaction));
     }
-    history.extend(transcript.uncompacted_messages());
+    let switched = provider.is_some_and(|p| p != transcript.model_provider);
+    history.extend(transcript.uncompacted_messages().into_iter().map(
+        |mut message| {
+            if switched {
+                message.reasoning_content = None;
+            }
+            message
+        },
+    ));
     // Steps are written whole, but a crash mid-write can still lose the tail
     // of one: answer any trailing unanswered tool calls so the history is
     // valid for providers.
@@ -1960,7 +2054,49 @@ impl RunPersistence {
         what: &str,
         f: impl FnOnce(&mut store::TranscriptWriter) -> Result<()> + Send + 'static,
     ) {
-        let _guard = self.session_lock.lock().await;
+        let lock = Arc::clone(&self.session_lock);
+        let _guard = lock.lock().await;
+        self.write_locked(what, f).await;
+    }
+
+    /// Write notes that arrived after the loop stopped taking them, and
+    /// stop accepting more (later ones are appended directly). Holding the
+    /// session lock across both closes the race with a concurrent rollback.
+    async fn flush_pending_notes(
+        &mut self,
+        state: &Arc<AppState>,
+        run_id: &str,
+    ) {
+        let lock = Arc::clone(&self.session_lock);
+        let _guard = lock.lock().await;
+        let notes = {
+            let mut runs = state.runs.lock().await;
+            runs.get_mut(run_id)
+                .map(|run| {
+                    run.accepting_notes = false;
+                    std::mem::take(&mut run.pending_notes)
+                })
+                .unwrap_or_default()
+        };
+        if notes.is_empty() {
+            return;
+        }
+        let messages: Vec<llm::ChatMessage> = notes
+            .into_iter()
+            .map(llm::ChatMessage::internal_note)
+            .collect();
+        self.write_locked("late notes", move |writer| {
+            writer.append_messages(&messages)
+        })
+        .await;
+    }
+
+    /// `write` for callers that already hold the session lock.
+    async fn write_locked(
+        &mut self,
+        what: &str,
+        f: impl FnOnce(&mut store::TranscriptWriter) -> Result<()> + Send + 'static,
+    ) {
         let Some(mut writer) = self.writer.take() else {
             tracing::warn!("transcript writer unavailable; {what} not saved");
             return;
@@ -2029,6 +2165,7 @@ async fn forward_agent_event(
             tokens_input,
             tokens_output,
         }) => {
+            save_ctx.flush_pending_notes(state, run_id).await;
             save_ctx.record_run_end(tokens_input, tokens_output).await;
             record_run_event(
                 state,
@@ -2047,6 +2184,7 @@ async fn forward_agent_event(
             tokens_input,
             tokens_output,
         }) => {
+            save_ctx.flush_pending_notes(state, run_id).await;
             save_ctx.record_run_end(tokens_input, tokens_output).await;
             record_run_event(
                 state,
@@ -2065,6 +2203,7 @@ async fn forward_agent_event(
             tokens_input,
             tokens_output,
         }) => {
+            save_ctx.flush_pending_notes(state, run_id).await;
             save_ctx.record_run_end(tokens_input, tokens_output).await;
             record_run_event(
                 state,
@@ -2095,6 +2234,10 @@ async fn forward_agent_event(
                     tool_name: name,
                     entries: rollback_entries,
                     display_changes: changes.clone(),
+                    transcript: save_ctx
+                        .writer
+                        .as_ref()
+                        .map(|writer| writer.path().to_path_buf()),
                 });
             }
             record_run_event(
@@ -2128,6 +2271,10 @@ async fn forward_agent_event(
                     tool_name,
                     entries: rollback_entries,
                     display_changes: changes.clone(),
+                    transcript: save_ctx
+                        .writer
+                        .as_ref()
+                        .map(|writer| writer.path().to_path_buf()),
                 });
             }
             record_run_event(
@@ -2158,6 +2305,7 @@ async fn forward_agent_event(
             tokens_output,
         }) => {
             // The work done so far was already committed step by step.
+            save_ctx.flush_pending_notes(state, run_id).await;
             save_ctx.record_run_end(tokens_input, tokens_output).await;
             tracing::error!(
                 run_id = %run_id,
@@ -2175,6 +2323,7 @@ async fn forward_agent_event(
             true
         }
         Err(e) => {
+            save_ctx.flush_pending_notes(state, run_id).await;
             tracing::error!(
                 run_id = %run_id,
                 error_kind = "agent_stream_error",
@@ -2236,6 +2385,7 @@ async fn forward_agent_events(
         }
     }
 
+    save_ctx.flush_pending_notes(&state, &run_id).await;
     let message = match join_result {
         Ok(()) => "agent run ended without a final result".to_string(),
         Err(e) if e.is_panic() => format!(
@@ -2375,10 +2525,10 @@ async fn stream_run_to_socket(
         run_id: run_id.to_string(),
     };
     for event in pending.into_iter().chain(std::iter::once(attached)) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            if socket.send(Message::Text(json.into())).await.is_err() {
-                return;
-            }
+        if let Ok(json) = serde_json::to_string(&event)
+            && socket.send(Message::Text(json.into())).await.is_err()
+        {
+            return;
         }
     }
 
@@ -2463,14 +2613,15 @@ async fn handle_client_event_for_run(
                         .map(|pending| pending.tool_name),
                 )
             };
-            if remember && allowed {
-                if let Some(tool_name) = remembered_tool {
-                    let mut sessions = state.runtime_states.lock().await;
-                    let sess = sessions
-                        .entry(runtime_session_key.to_string())
-                        .or_default();
-                    sess.remember_allow_tools.insert(tool_name);
-                }
+            if remember
+                && allowed
+                && let Some(tool_name) = remembered_tool
+            {
+                let mut sessions = state.runtime_states.lock().await;
+                let sess = sessions
+                    .entry(runtime_session_key.to_string())
+                    .or_default();
+                sess.remember_allow_tools.insert(tool_name);
             }
             if !permission_broker.resolve(&id, allowed) {
                 debug!("Permission response for {id} had no waiting request");
@@ -2775,18 +2926,17 @@ async fn apply_rollback_last(
     for entry in &cs.entries {
         match entry.kind {
             llm::RollbackKind::Modified => {
-                if let Some(before) = &entry.before_content {
-                    if let Err(e) = tokio::fs::write(&entry.path, before).await
-                    {
-                        return marshaling_protocol::RollbackResultPayload {
-                            success: false,
-                            message: format!(
-                                "Rollback failed writing {}: {e}",
-                                entry.path.display()
-                            ),
-                            changes: Vec::new(),
-                        };
-                    }
+                if let Some(before) = &entry.before_content
+                    && let Err(e) = tokio::fs::write(&entry.path, before).await
+                {
+                    return marshaling_protocol::RollbackResultPayload {
+                        success: false,
+                        message: format!(
+                            "Rollback failed writing {}: {e}",
+                            entry.path.display()
+                        ),
+                        changes: Vec::new(),
+                    };
                 }
             }
             llm::RollbackKind::Added => {
@@ -2803,15 +2953,17 @@ async fn apply_rollback_last(
             }
             llm::RollbackKind::Removed => {
                 if let Some(before) = &entry.before_content {
-                    if let Some(parent) = entry.path.parent() {
-                        if let Err(e) = tokio::fs::create_dir_all(parent).await
-                        {
-                            return marshaling_protocol::RollbackResultPayload {
-                                success: false,
-                                message: format!("Rollback failed creating {}: {e}", parent.display()),
-                                changes: Vec::new(),
-                            };
-                        }
+                    if let Some(parent) = entry.path.parent()
+                        && let Err(e) = tokio::fs::create_dir_all(parent).await
+                    {
+                        return marshaling_protocol::RollbackResultPayload {
+                            success: false,
+                            message: format!(
+                                "Rollback failed creating {}: {e}",
+                                parent.display()
+                            ),
+                            changes: Vec::new(),
+                        };
                     }
                     if let Err(e) = tokio::fs::write(&entry.path, before).await
                     {
@@ -2835,11 +2987,78 @@ async fn apply_rollback_last(
             session.rollback_journal.pop();
         }
     }
+    note_rollback_in_transcript(state, &cs).await;
 
     marshaling_protocol::RollbackResultPayload {
         success: true,
         message: format!("Rolled back {} ({})", cs.id, cs.tool_name),
         changes: cs.display_changes,
+    }
+}
+
+/// Tell the model that the user undid an edit: otherwise the stored tool
+/// results still claim it happened. If a run is active on the session the
+/// note goes into that run (before its next step); otherwise it is appended
+/// to the transcript. Deciding under the session lock closes the race with
+/// a run that is just starting: a run claims its slot before it takes the
+/// lock to open the transcript, so it is either seen here as running or
+/// opens the transcript after the note was written.
+async fn note_rollback_in_transcript(
+    state: &Arc<AppState>,
+    cs: &RollbackChangeSet,
+) {
+    let Some(path) = cs.transcript.clone() else {
+        return;
+    };
+    let files: Vec<String> = cs
+        .entries
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect();
+    let note = format!(
+        "[mote] The user rolled back the changes made by the '{}' tool call ({}) to: {}. Those edits are no longer in the workspace; re-read the files before relying on them.",
+        cs.tool_name,
+        cs.id,
+        files.join(", ")
+    );
+    let lock = state.session_lock(&path).await;
+    let _guard = lock.lock().await;
+    let delivered = {
+        let mut runs = state.runs.lock().await;
+        match runs.values_mut().find(|run| {
+            !run.finished
+                && run.accepting_notes
+                && run.session_path.as_deref() == Some(path.as_path())
+        }) {
+            Some(run) => {
+                // The loop may already have stopped taking notes; then the
+                // forwarder writes this one when the run ends.
+                if let Err(unsent) = run.notes_tx.send(note.clone()) {
+                    run.pending_notes.push(unsent.0);
+                }
+                true
+            }
+            None => false,
+        }
+    };
+    if delivered {
+        return;
+    }
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let transcript = store::load(&path)?;
+        store::TranscriptWriter::resume(path, &transcript)
+            .append_messages(&[llm::ChatMessage::internal_note(note)])
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("Failed to note rollback in transcript: {e:#}")
+        }
+        Err(e) => tracing::warn!("Rollback note task failed: {e}"),
     }
 }
 
@@ -2969,24 +3188,12 @@ async fn main() -> Result<()> {
         runs: tokio::sync::Mutex::new(HashMap::new()),
         completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
         session_locks: tokio::sync::Mutex::new(HashMap::new()),
+        session_info_cache: Arc::default(),
     });
 
     let configured_port = state.config.server.port;
 
-    // Build router
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/config", get(get_config))
-        .route("/sessions", get(list_sessions))
-        .route("/sessions/{id}", get(load_session).delete(delete_session))
-        .route("/models", get(list_models_handler))
-        .route("/compact", post(compact_handler))
-        .route("/audio/transcribe", get(audio_transcribe_handler))
-        .route("/rollback/last", post(rollback_last_handler))
-        .route("/chat", get(ws_handler))
-        .route("/auth/save", post(auth_save))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = build_router(state);
 
     let (listener, port) = bind_available_listener(configured_port).await?;
     if port != configured_port {
@@ -3000,6 +3207,23 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// All HTTP and WebSocket routes of the server.
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/config", get(get_config))
+        .route("/sessions", get(list_sessions))
+        .route("/sessions/{id}", get(load_session).delete(delete_session))
+        .route("/models", get(list_models_handler))
+        .route("/compact", post(compact_handler))
+        .route("/audio/transcribe", get(audio_transcribe_handler))
+        .route("/rollback/last", post(rollback_last_handler))
+        .route("/chat", get(ws_handler))
+        .route("/auth/save", post(auth_save))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 fn server_port_override() -> Result<Option<u16>> {
@@ -3118,6 +3342,7 @@ read = "allow"
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
             session_locks: tokio::sync::Mutex::new(HashMap::new()),
+            session_info_cache: Arc::default(),
         })
     }
 
@@ -3151,6 +3376,7 @@ read = "allow"
                 None,
                 cancel_tx,
                 agent::PermissionBroker::default(),
+                mpsc::unbounded_channel().0,
             ),
             cancel_rx,
         )
@@ -3225,7 +3451,9 @@ read = "allow"
     fn test_open_run_session_new_starts_empty_and_writes_lazily() {
         let dir = tempfile::tempdir().unwrap();
         let path = store::transcript_path(dir.path(), "chat-new");
-        let (writer, history) = open_run_session(
+        let OpenedSession {
+            writer, history, ..
+        } = open_run_session(
             dir.path().to_path_buf(),
             "chat-new".into(),
             path.clone(),
@@ -3260,7 +3488,7 @@ read = "allow"
         let dir = tempfile::tempdir().unwrap();
         let md = dir.path().join("chat-old.md");
         std::fs::write(&md, LEGACY_MD).unwrap();
-        let (_writer, history) = open_run_session(
+        let OpenedSession { history, .. } = open_run_session(
             dir.path().to_path_buf(),
             "chat-old".into(),
             store::transcript_path(dir.path(), "chat-old"),
@@ -3279,7 +3507,7 @@ read = "allow"
         assert_eq!(transcript.messages.len(), 2);
         assert_eq!(transcript.tokens_input, 10);
         // The session is listed once, from the transcript.
-        let infos = session_infos(dir.path());
+        let infos = session_infos(dir.path(), &Default::default());
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, "chat-old");
         assert_eq!(infos[0].message_count, 2);
@@ -3309,10 +3537,11 @@ read = "allow"
                 llm::ChatMessage::assistant_text("Added."),
             ],
         );
-        let mut ids: Vec<String> = session_infos(dir.path())
-            .into_iter()
-            .map(|i| i.id)
-            .collect();
+        let mut ids: Vec<String> =
+            session_infos(dir.path(), &Default::default())
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
         ids.sort();
         assert_eq!(ids, ["chat-new", "chat-old"]);
 
@@ -3328,6 +3557,42 @@ read = "allow"
         let legacy = load_session_data(dir.path(), "chat-old").unwrap();
         assert_eq!(legacy.messages.len(), 2);
         assert!(load_session_data(dir.path(), "chat-none").is_none());
+    }
+
+    #[test]
+    fn test_session_list_cache_follows_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Mutex::new(SessionInfoCache::new());
+        write_transcript(
+            dir.path(),
+            "chat-1",
+            &[llm::ChatMessage::user("one")],
+        );
+        assert_eq!(session_infos(dir.path(), &cache)[0].message_count, 1);
+        assert_eq!(cache.lock().unwrap().len(), 1);
+
+        // An unchanged file is served from the cache.
+        let path = store::transcript_path(dir.path(), "chat-1");
+        cache.lock().unwrap().get_mut(&path).unwrap().2.summary =
+            Some("from cache".into());
+        assert_eq!(
+            session_infos(dir.path(), &cache)[0].summary.as_deref(),
+            Some("from cache")
+        );
+
+        // A changed file is parsed again.
+        let transcript = store::load(&path).unwrap();
+        store::TranscriptWriter::resume(path.clone(), &transcript)
+            .append_messages(&[llm::ChatMessage::assistant_text("two")])
+            .unwrap();
+        let infos = session_infos(dir.path(), &cache);
+        assert_eq!(infos[0].message_count, 2);
+        assert_eq!(infos[0].summary.as_deref(), Some("one"));
+
+        // A deleted file is forgotten.
+        std::fs::remove_file(&path).unwrap();
+        assert!(session_infos(dir.path(), &cache).is_empty());
+        assert!(cache.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3357,7 +3622,7 @@ read = "allow"
         )
         .unwrap();
         let transcript = store::load(&path).unwrap();
-        let history = model_history(&transcript);
+        let history = model_history(&transcript, None);
         assert_eq!(history.len(), 3);
         let summary = history[0].content.as_deref().unwrap();
         assert!(summary.starts_with(COMPACTION_CONTEXT_MARKER));
@@ -3395,7 +3660,7 @@ read = "allow"
         );
         let transcript =
             store::load(&store::transcript_path(dir.path(), "chat-1")).unwrap();
-        let history = model_history(&transcript);
+        let history = model_history(&transcript, None);
         assert_eq!(history.len(), 3);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("c1"));
     }
@@ -3481,7 +3746,7 @@ read = "allow"
         )
         .unwrap();
         // The next run sees only the summary: no orphaned tool result.
-        let (_writer, history) = open_run_session(
+        let OpenedSession { history, .. } = open_run_session(
             dir.path().to_path_buf(),
             "chat-1".into(),
             store::transcript_path(dir.path(), "chat-1"),
@@ -3529,7 +3794,11 @@ read = "allow"
             ],
         );
         let path = store::transcript_path(dir.path(), "chat-1");
-        let (mut writer, history) = open_run_session(
+        let OpenedSession {
+            mut writer,
+            history,
+            ..
+        } = open_run_session(
             dir.path().to_path_buf(),
             "chat-1".into(),
             path.clone(),
@@ -3580,6 +3849,26 @@ read = "allow"
     }
 
     #[test]
+    fn test_model_history_drops_reasoning_after_a_provider_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut thinking = llm::ChatMessage::assistant_text("answer");
+        thinking.reasoning_content = Some("provider-specific thoughts".into());
+        write_transcript(
+            dir.path(),
+            "chat-1",
+            &[llm::ChatMessage::user("q"), thinking],
+        );
+        let transcript =
+            store::load(&store::transcript_path(dir.path(), "chat-1")).unwrap();
+        // `write_transcript` records provider "p".
+        let same = model_history(&transcript, Some("p"));
+        assert!(same[1].reasoning_content.is_some());
+        let switched = model_history(&transcript, Some("other"));
+        assert!(switched[1].reasoning_content.is_none());
+        assert_eq!(switched[1].content.as_deref(), Some("answer"));
+    }
+
+    #[test]
     fn test_compact_transcript_text_includes_tool_activity() {
         let long_result = "x".repeat(COMPACT_TOOL_RESULT_CHARS + 100);
         let messages = [
@@ -3609,7 +3898,7 @@ read = "allow"
         );
         assert!(text.contains("TOOL RESULT:\n"));
         assert!(!text.contains(&long_result), "tool results are excerpted");
-        assert!(text.contains("ROLE HANDOFF:\nreview it"));
+        assert!(text.contains("INTERNAL NOTE:\nreview it"));
     }
 
     #[test]
@@ -3675,6 +3964,7 @@ read = "allow"
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
             session_locks: tokio::sync::Mutex::new(HashMap::new()),
+            session_info_cache: Arc::default(),
         });
         let mut cancel_rx = insert_test_run(&state, "run_1").await;
         record_run_event(
@@ -3854,6 +4144,48 @@ read = "allow"
     }
 
     #[tokio::test]
+    async fn test_late_rollback_note_is_parked_then_written_by_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_test_state(dir.path());
+        let mut save_ctx = test_save_ctx(dir.path());
+        let path = save_ctx.writer.as_ref().unwrap().path().to_path_buf();
+        // A run on this session whose loop no longer takes notes (the
+        // receiver is gone, as after `finish()`).
+        let (mut run, _cancel_rx) = test_run(None);
+        run.session_path = Some(path.clone());
+        state.runs.lock().await.insert("run_1".into(), run);
+        let change = RollbackChangeSet {
+            id: "call_1".into(),
+            tool_name: "edit".into(),
+            entries: vec![llm::RollbackEntry {
+                path: dir.path().join("a.txt"),
+                kind: llm::RollbackKind::Modified,
+                before_content: None,
+                expected_after_hash: None,
+            }],
+            display_changes: Vec::new(),
+            transcript: Some(path.clone()),
+        };
+
+        note_rollback_in_transcript(&state, &change).await;
+        assert_eq!(state.runs.lock().await["run_1"].pending_notes.len(), 1);
+
+        // The run ends: the forwarder writes the parked note itself.
+        save_ctx.flush_pending_notes(&state, "run_1").await;
+        let transcript = store::load(&path).unwrap();
+        assert_eq!(transcript.messages.len(), 1);
+        assert!(transcript.messages[0].message.internal_role_task);
+        assert!(!state.runs.lock().await["run_1"].accepting_notes);
+
+        // Later notes go straight to the transcript, with the next seq.
+        note_rollback_in_transcript(&state, &change).await;
+        let transcript = store::load(&path).unwrap();
+        let seqs: Vec<u64> =
+            transcript.messages.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, [0, 1]);
+    }
+
+    #[tokio::test]
     async fn test_permission_resolved_clears_pending_and_is_not_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let state = empty_test_state(dir.path());
@@ -3926,6 +4258,7 @@ read = "allow"
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
             session_locks: tokio::sync::Mutex::new(HashMap::new()),
+            session_info_cache: Arc::default(),
         });
         let cancel_rx = insert_test_run(&state, "run_1").await;
         {
@@ -4051,6 +4384,7 @@ read = "allow"
                             expected_after_hash: Some(hash64("after")),
                         }],
                         display_changes: Vec::new(),
+                        transcript: None,
                     }],
                     remember_allow_tools: HashSet::new(),
                 },
@@ -4058,6 +4392,7 @@ read = "allow"
             runs: tokio::sync::Mutex::new(HashMap::new()),
             completed_run_ids: tokio::sync::Mutex::new(VecDeque::new()),
             session_locks: tokio::sync::Mutex::new(HashMap::new()),
+            session_info_cache: Arc::default(),
         });
 
         let result = apply_rollback_last(&state, "sess").await;

@@ -35,15 +35,14 @@ fn ollama_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
                 for call in calls {
                     if let Some(arguments) =
                         call.pointer_mut("/function/arguments")
+                        && let Some(text) = arguments.as_str()
                     {
-                        if let Some(text) = arguments.as_str() {
-                            // Ollama requires an object; anything else
-                            // (invalid JSON, null, arrays) becomes `{}`.
-                            *arguments = serde_json::from_str(text)
-                                .ok()
-                                .filter(serde_json::Value::is_object)
-                                .unwrap_or_else(|| serde_json::json!({}));
-                        }
+                        // Ollama requires an object; anything else
+                        // (invalid JSON, null, arrays) becomes `{}`.
+                        *arguments = serde_json::from_str(text)
+                            .ok()
+                            .filter(serde_json::Value::is_object)
+                            .unwrap_or_else(|| serde_json::json!({}));
                     }
                 }
             }
@@ -304,101 +303,90 @@ impl LlmProvider for OllamaProvider {
             };
             buf.extend_from_slice(&chunk);
 
-            loop {
-                match buf.iter().position(|&b| b == b'\n') {
-                    Some(nl_pos) => {
-                        let line_bytes: Vec<u8> = buf.drain(..nl_pos).collect();
-                        buf.drain(..1);
-                        let line = match std::str::from_utf8(&line_bytes) {
-                            Ok(s) => s.trim(),
-                            Err(error) => {
-                                return fail(ProviderError::fatal(format!(
-                                    "Invalid UTF-8 in Ollama stream record: {error}"
-                                )));
-                            }
-                        };
-                        if line.is_empty() {
-                            continue;
-                        }
+            while let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..nl_pos).collect();
+                buf.drain(..1);
+                let line = match std::str::from_utf8(&line_bytes) {
+                    Ok(s) => s.trim(),
+                    Err(error) => {
+                        return fail(ProviderError::fatal(format!(
+                            "Invalid UTF-8 in Ollama stream record: {error}"
+                        )));
+                    }
+                };
+                if line.is_empty() {
+                    continue;
+                }
 
-                        match serde_json::from_str::<OllamaStreamChunk>(line) {
-                            Ok(chunk) => {
-                                if let Some(msg) = chunk.message {
-                                    if let Some(content) = msg.content {
-                                        if !content.is_empty() {
-                                            text_content.push_str(&content);
-                                            let _ = sender.send(Ok(
-                                                StreamEvent::Chunk(content),
-                                            ));
-                                        }
-                                    }
-                                    if let Some(tcs) = msg.tool_calls {
-                                        for tc in tcs {
-                                            tool_calls.push(ToolCall {
-                                                id: format!(
-                                                    "ollama_{}_{}",
-                                                    tc.function.name,
-                                                    OLLAMA_CALL_ID.fetch_add(
-                                                        1,
-                                                        Ordering::Relaxed
-                                                    )
-                                                ),
-                                                call_type: "function".into(),
-                                                function: ToolFunction {
-                                                    name: tc.function.name,
-                                                    arguments:
-                                                        serde_json::to_string(
-                                                            &tc.function
-                                                                .arguments,
-                                                        )
-                                                        .unwrap_or_default(),
-                                                },
-                                            });
-                                        }
-                                    }
-                                }
-                                if chunk.done {
-                                    let usage = Usage {
-                                        prompt_tokens: chunk
-                                            .prompt_eval_count
-                                            .unwrap_or(0),
-                                        completion_tokens: chunk
-                                            .eval_count
-                                            .unwrap_or(0),
-                                        total_tokens: 0,
-                                    };
-                                    let result = finalize_ollama(
-                                        &mut text_content,
-                                        &mut tool_calls,
-                                        usage,
-                                    );
-                                    let _ = sender
-                                        .send(Ok(StreamEvent::Done(result)));
-                                    return;
-                                }
+                match serde_json::from_str::<OllamaStreamChunk>(line) {
+                    Ok(chunk) => {
+                        if let Some(msg) = chunk.message {
+                            if let Some(content) = msg.content
+                                && !content.is_empty()
+                            {
+                                text_content.push_str(&content);
+                                let _ = sender
+                                    .send(Ok(StreamEvent::Chunk(content)));
                             }
-                            Err(error) => {
-                                // Ollama reports runner failures in-stream
-                                // as `{"error": "..."}`.
-                                let payload_error =
-                                    serde_json::from_str::<serde_json::Value>(
-                                        line,
-                                    )
-                                    .ok()
-                                    .and_then(|payload| {
-                                        ProviderError::from_stream_payload(
-                                            "Ollama", &payload,
-                                        )
+                            if let Some(tcs) = msg.tool_calls {
+                                for tc in tcs {
+                                    tool_calls.push(ToolCall {
+                                        id: format!(
+                                            "ollama_{}_{}",
+                                            tc.function.name,
+                                            OLLAMA_CALL_ID.fetch_add(
+                                                1,
+                                                Ordering::Relaxed
+                                            )
+                                        ),
+                                        call_type: "function".into(),
+                                        function: ToolFunction {
+                                            name: tc.function.name,
+                                            arguments: serde_json::to_string(
+                                                &tc.function.arguments,
+                                            )
+                                            .unwrap_or_default(),
+                                        },
                                     });
-                                return fail(payload_error.unwrap_or_else(|| {
-                                    ProviderError::fatal(format!(
-                                        "Failed to parse Ollama stream record: {error}"
-                                    ))
-                                }));
+                                }
                             }
+                        }
+                        if chunk.done {
+                            let usage = Usage {
+                                prompt_tokens: chunk
+                                    .prompt_eval_count
+                                    .unwrap_or(0),
+                                completion_tokens: chunk
+                                    .eval_count
+                                    .unwrap_or(0),
+                                total_tokens: 0,
+                            };
+                            let result = finalize_ollama(
+                                &mut text_content,
+                                &mut tool_calls,
+                                usage,
+                            );
+                            let _ = sender.send(Ok(StreamEvent::Done(result)));
+                            return;
                         }
                     }
-                    None => break,
+                    Err(error) => {
+                        // Ollama reports runner failures in-stream
+                        // as `{"error": "..."}`.
+                        let payload_error =
+                            serde_json::from_str::<serde_json::Value>(line)
+                                .ok()
+                                .and_then(|payload| {
+                                    ProviderError::from_stream_payload(
+                                        "Ollama", &payload,
+                                    )
+                                });
+                        return fail(payload_error.unwrap_or_else(|| {
+                            ProviderError::fatal(format!(
+                                "Failed to parse Ollama stream record: {error}"
+                            ))
+                        }));
+                    }
                 }
             }
         }
@@ -437,13 +425,12 @@ fn finalize_ollama(
     let calls = std::mem::take(tool_calls);
     // Keep text content even when tool calls exist — Ollama may stream text before tool calls
     let content = Some(std::mem::take(text));
-    let content = if content.as_ref().map_or(true, |s| s.is_empty())
-        && !calls.is_empty()
-    {
-        None
-    } else {
-        content
-    };
+    let content =
+        if content.as_ref().is_none_or(|s| s.is_empty()) && !calls.is_empty() {
+            None
+        } else {
+            content
+        };
     ChatResult {
         content,
         finish_reason: Some(if calls.is_empty() {

@@ -711,7 +711,7 @@ impl App {
     fn remember_input(&mut self, text: &str) {
         // Save to history first (including slash commands), dedup against last entry
         if !text.is_empty()
-            && self.input_history.last().map_or(true, |last| last != text)
+            && self.input_history.last().is_none_or(|last| last != text)
         {
             self.input_history.push(text.to_string());
         }
@@ -2292,8 +2292,8 @@ impl App {
         self.suggestions.clear();
         self.suggestion_index = 0;
         let input = self.input.trim_start();
-        if input.starts_with('@') {
-            let after = input[1..].trim_start();
+        if let Some(rest) = input.strip_prefix('@') {
+            let after = rest.trim_start();
             for name in &self.subagent_names {
                 if name.starts_with(after) {
                     self.suggestions.push(format!("@{}", name));
@@ -2428,14 +2428,15 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 fn parse_ui_color(name: &str) -> Color {
     let s = name.trim();
     // Support hex colors: #RRGGBB
-    if s.starts_with('#') && s.len() == 7 {
-        if let (Ok(r), Ok(g), Ok(b)) = (
+    if s.starts_with('#')
+        && s.len() == 7
+        && let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&s[1..3], 16),
             u8::from_str_radix(&s[3..5], 16),
             u8::from_str_radix(&s[5..7], 16),
-        ) {
-            return Color::Rgb(r, g, b);
-        }
+        )
+    {
+        return Color::Rgb(r, g, b);
     }
     match s.to_lowercase().as_str() {
         "cyan" => Color::Cyan,

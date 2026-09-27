@@ -152,6 +152,12 @@ impl ChatMessage {
         message.internal_role_task = true;
         message
     }
+
+    /// A user-role message written by mote itself (e.g. "the user rolled
+    /// back these edits"): sent to the model, hidden from the chat view.
+    pub fn internal_note(content: impl Into<String>) -> Self {
+        Self::role_task(content)
+    }
 }
 
 // ── Usage ─────────────────────────────────────────────────

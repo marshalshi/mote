@@ -852,7 +852,7 @@ impl Tool for BashTool {
             def_type: "function".into(),
             function: ToolFunctionDef {
                 name: "bash".into(),
-                description: "Execute a shell command. Output keeps the start and end of very long results. Background processes started by the command are terminated when it finishes; the timeout is capped at 600 seconds."
+                description: "Execute a shell command. Output keeps the start and end of very long results. Processes the command leaves running are terminated when it finishes, and the timeout is capped at 600 seconds; for long-running processes (dev servers, watchers) set background: true instead."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -870,6 +870,11 @@ impl Tool for BashTool {
                             "type": "integer",
                             "description": "Timeout in seconds (default: 120, max: 600)",
                             "default": 120
+                        },
+                        "background": {
+                            "type": "boolean",
+                            "description": "Start the command and return immediately; it keeps running, its output goes to a log file, and the result says how to read the log and stop it (default: false)",
+                            "default": false
                         }
                     },
                     "required": ["command"]
@@ -883,6 +888,13 @@ impl Tool for BashTool {
             .get("command")
             .and_then(|v| v.as_str())
             .context("Missing command")?;
+        if args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return start_background(cmd, &self.ctx.workspace).await;
+        }
         let timeout_secs = args
             .get("timeout")
             .and_then(|v| v.as_u64())
@@ -987,6 +999,57 @@ impl Tool for BashTool {
         // Output size is limited centrally by `ToolRegistry::execute`.
         Ok(result_no_changes(result))
     }
+}
+
+/// Start `cmd` detached from the tool call: in its own process group (so the
+/// usual kill-on-exit does not apply), output appended to a log file. The
+/// child is reaped in the background when it exits.
+async fn start_background(
+    cmd: &str,
+    workspace: &std::path::Path,
+) -> Result<ToolExecutionResult> {
+    let log_path = std::env::temp_dir().join(format!(
+        "mote-bg-{}.log",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S%6f")
+    ));
+    // Readable by the owner only: the temp dir may be shared, and command
+    // output can contain secrets.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let log = options
+        .open(&log_path)
+        .with_context(|| format!("Failed to create {}", log_path.display()))?;
+    let log_err = log.try_clone().context("Failed to open the log file")?;
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .context("Failed to start background command")?;
+    let Some(pid) = child.id() else {
+        anyhow::bail!("Background command exited before it could be tracked");
+    };
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    let stop = if cfg!(unix) {
+        format!("kill -- -{pid}")
+    } else {
+        format!("kill {pid}")
+    };
+    Ok(result_no_changes(format!(
+        "Started in the background (pid {pid}). Output is written to {log}.\nRead it with: tail -n 50 {log}\nStop it with: {stop}",
+        log = log_path.display()
+    )))
 }
 
 /// Default and maximum run time for one bash command.
@@ -1274,7 +1337,7 @@ pub trait SubagentRunner: Send + Sync {
         &self,
         agent_name: &str,
         task: &str,
-        workspace: &PathBuf,
+        workspace: &std::path::Path,
     ) -> Result<String>;
 }
 
@@ -1367,7 +1430,7 @@ impl SubagentRunner for AgentSubagentRunner {
         &self,
         agent_name: &str,
         task: &str,
-        workspace: &PathBuf,
+        workspace: &std::path::Path,
     ) -> Result<String> {
         if self.depth >= self.max_depth {
             anyhow::bail!(
@@ -1387,7 +1450,7 @@ impl SubagentRunner for AgentSubagentRunner {
             anyhow::bail!("Unknown sub-agent: '{}'", agent_name);
         }
         let req_ctx = crate::RequestContext {
-            workspace: workspace.clone(),
+            workspace: workspace.to_path_buf(),
             workspace_display: workspace.display().to_string(),
             runtime_session_key: "subagent".into(),
             repo_agents_md: self.repo_agents_md.clone(),
@@ -1415,10 +1478,10 @@ impl SubagentRunner for AgentSubagentRunner {
         let mut perms =
             crate::build_permission_map(&self.config, agent_cfg, &tool_names);
         for tool in &self.remembered_allow_tools {
-            if let Some(perm) = perms.get_mut(tool) {
-                if *perm == crate::config::Permission::Ask {
-                    *perm = crate::config::Permission::Allow;
-                }
+            if let Some(perm) = perms.get_mut(tool)
+                && *perm == crate::config::Permission::Ask
+            {
+                *perm = crate::config::Permission::Allow;
             }
         }
 
@@ -1476,6 +1539,7 @@ impl SubagentRunner for AgentSubagentRunner {
                     events_tx: agent_tx,
                     cancel_rx: sub_cancel_rx,
                     permission_broker,
+                    notes_rx: None,
                 },
                 user_msg,
                 history,
@@ -1725,10 +1789,29 @@ impl SubagentRunner for AgentSubagentRunner {
     }
 }
 
+// Mock runner for SubagentTool tests
+#[cfg(test)]
+struct MockSubagentRunner;
+
+#[cfg(test)]
+#[async_trait]
+impl SubagentRunner for MockSubagentRunner {
+    async fn run(
+        &self,
+        agent_name: &str,
+        task: &str,
+        _workspace: &std::path::Path,
+    ) -> Result<String> {
+        Ok(format!(
+            "mock result for agent={}, task={}",
+            agent_name, task
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio;
 
     fn tmp_workspace() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -2015,6 +2098,64 @@ mod tests {
             }
             assert!(!alive, "background job should be terminated");
         }
+    }
+
+    #[tokio::test]
+    async fn test_bash_background_command_keeps_running_and_logs() {
+        let (_d, ws) = tmp_workspace();
+        let tool = BashTool::new(ws.clone());
+        let started = std::time::Instant::now();
+        let r = tool
+            .execute(serde_json::json!({
+                "command": "echo ready; echo $$ > bg.pid; sleep 30",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            r.output.contains("Started in the background"),
+            "{}",
+            r.output
+        );
+        let log = r
+            .output
+            .split("Output is written to ")
+            .nth(1)
+            .and_then(|rest| rest.split(".\n").next())
+            .unwrap()
+            .to_string();
+        let mut logged = String::new();
+        for _ in 0..50 {
+            logged = std::fs::read_to_string(&log).unwrap_or_default();
+            if logged.contains("ready") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(logged.contains("ready"), "{logged}");
+        #[cfg(unix)]
+        {
+            let pid: libc::pid_t = std::fs::read_to_string(ws.join("bg.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // Still running after the call returned.
+            // SAFETY: signal 0 only checks that the process exists.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+            // SAFETY: cleans up the test's own process group.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "log readable by the owner only");
+        }
+        let _ = std::fs::remove_file(log);
     }
 
     #[tokio::test]
@@ -2373,25 +2514,5 @@ Actual skill content here."#,
             out,
             format!("{}\n{}", DEFAULT_READ_LINES + 4, DEFAULT_READ_LINES + 5)
         );
-    }
-}
-
-// Mock runner for SubagentTool tests
-#[cfg(test)]
-struct MockSubagentRunner;
-
-#[cfg(test)]
-#[async_trait]
-impl SubagentRunner for MockSubagentRunner {
-    async fn run(
-        &self,
-        agent_name: &str,
-        task: &str,
-        _workspace: &PathBuf,
-    ) -> Result<String> {
-        Ok(format!(
-            "mock result for agent={}, task={}",
-            agent_name, task
-        ))
     }
 }

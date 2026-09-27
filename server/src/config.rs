@@ -480,15 +480,15 @@ impl Config {
         let raw = std::fs::read_to_string(path).with_context(|| {
             format!("Failed to read config: {}", path.display())
         })?;
-        Ok(toml::from_str(&raw)
-            .context("Failed to parse config.toml — check the format")?)
+        toml::from_str(&raw)
+            .context("Failed to parse config.toml — check the format")
     }
 
     pub fn effective_provider(&self, agent_override: Option<&str>) -> String {
-        if let Some(model_str) = agent_override {
-            if let Some((provider, _)) = model_str.split_once('/') {
-                return provider.to_string();
-            }
+        if let Some(model_str) = agent_override
+            && let Some((provider, _)) = model_str.split_once('/')
+        {
+            return provider.to_string();
         }
         self.model.provider.clone()
     }
@@ -862,10 +862,10 @@ impl Config {
         tool_name: &str,
     ) -> Permission {
         // 1. Agent-specific permission
-        if let Some(agent) = self.agents.get(agent_name) {
-            if let Some(perm) = agent.permissions.get(tool_name) {
-                return *perm;
-            }
+        if let Some(agent) = self.agents.get(agent_name)
+            && let Some(perm) = agent.permissions.get(tool_name)
+        {
+            return *perm;
         }
         // 2. Global tool permission
         if let Some(perm) = self.permissions.tools.get(tool_name) {
@@ -903,42 +903,41 @@ fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "md") {
-                    if let Some(stem) =
+                if path.extension().is_some_and(|e| e == "md")
+                    && let Some(stem) =
                         path.file_stem().and_then(|s| s.to_str())
-                    {
-                        match std::fs::read_to_string(&path) {
-                            Ok(content) => {
-                                match parse_agent_markdown(&content) {
-                                    Ok(mut cfg) => {
-                                        // Validate mode
-                                        let mode = cfg.mode.clone();
-                                        if !["primary", "subagent", "all"]
-                                            .contains(&mode.as_str())
-                                        {
-                                            tracing::warn!(
-                                                "Agent '{}' has unknown mode '{}', defaulting to 'primary'",
-                                                stem,
-                                                mode
-                                            );
-                                            cfg.mode = "primary".into();
-                                        }
-                                        agents.insert(stem.to_string(), cfg);
-                                    }
-                                    Err(e) => {
+                {
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            match parse_agent_markdown(&content) {
+                                Ok(mut cfg) => {
+                                    // Validate mode
+                                    let mode = cfg.mode.clone();
+                                    if !["primary", "subagent", "all"]
+                                        .contains(&mode.as_str())
+                                    {
                                         tracing::warn!(
-                                            "Failed to parse agent file '{}': {e}",
-                                            path.display()
+                                            "Agent '{}' has unknown mode '{}', defaulting to 'primary'",
+                                            stem,
+                                            mode
                                         );
+                                        cfg.mode = "primary".into();
                                     }
+                                    agents.insert(stem.to_string(), cfg);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to parse agent file '{}': {e}",
+                                        path.display()
+                                    );
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to read agent file '{}': {e}",
-                                    path.display()
-                                );
-                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to read agent file '{}': {e}",
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -953,7 +952,7 @@ fn load_agents_from_dir(dir: &Path, agents: &mut HashMap<String, AgentConfig>) {
     }
 }
 
-fn parse_agent_markdown(content: &str) -> Result<AgentConfig> {
+pub(crate) fn parse_agent_markdown(content: &str) -> Result<AgentConfig> {
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let trimmed = normalized.trim();
 
@@ -1422,7 +1421,7 @@ Plan instructions.
         // If markdown agent files exist, ensure at least some are loaded.
         let agent_dir = dirs::home_dir()
             .map(|h| h.join(".config").join("mote").join("agents"));
-        let has_markdown_agents = agent_dir.as_ref().map_or(false, |d| {
+        let has_markdown_agents = agent_dir.as_ref().is_some_and(|d| {
             d.is_dir()
                 && std::fs::read_dir(d)
                     .ok()
@@ -1430,10 +1429,7 @@ Plan instructions.
                     .flatten()
                     .flatten()
                     .any(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .map_or(false, |ext| ext == "md")
+                        entry.path().extension().is_some_and(|ext| ext == "md")
                     })
         });
         if has_markdown_agents {
@@ -1494,7 +1490,7 @@ subagent = "deny"
             Some(Permission::Deny)
         );
         // Unknown keys are ignored
-        assert!(cfg.permissions.get("nonexistent").is_none());
+        assert!(!cfg.permissions.contains_key("nonexistent"));
     }
 
     #[test]

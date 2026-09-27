@@ -300,10 +300,8 @@ pub fn append(path: &Path, records: &[Record], create: bool) -> Result<()> {
         buf.push_str(&serde_json::to_string(record)?);
         buf.push('\n');
     }
-    if create {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
+    if create && let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
     let mut file = std::fs::OpenOptions::new()
         .read(true)

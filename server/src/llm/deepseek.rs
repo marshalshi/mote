@@ -48,6 +48,7 @@ impl DeepSeekProvider {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // one flag per provider quirk
     fn new_api_key_provider(
         config: &crate::config::Config,
         auth: &crate::auth::Auth,
@@ -58,6 +59,7 @@ impl DeepSeekProvider {
         max_tokens_field: MaxTokensField,
         temperature_decimals: Option<u32>,
         reasoning_split: bool,
+        include_stream_usage: bool,
     ) -> Result<Self> {
         Ok(Self {
             provider_name: display_name,
@@ -68,7 +70,7 @@ impl DeepSeekProvider {
             max_tokens_field,
             temperature_decimals,
             reasoning_split,
-            include_stream_usage: false,
+            include_stream_usage,
             timeouts: ProviderTimeouts::from_config(config),
             client: provider_http_client()?,
         })
@@ -88,6 +90,7 @@ impl DeepSeekProvider {
             MaxTokensField::MaxTokens,
             Some(2),
             false,
+            false,
         )
     }
 
@@ -105,6 +108,7 @@ impl DeepSeekProvider {
             MaxTokensField::MaxCompletionTokens,
             None,
             false,
+            false,
         )
     }
 
@@ -121,6 +125,9 @@ impl DeepSeekProvider {
             "/v1/models",
             MaxTokensField::MaxCompletionTokens,
             None,
+            true,
+            // Verified against the live API: MiniMax accepts
+            // `stream_options.include_usage` and reports token counts.
             true,
         )
     }
@@ -740,10 +747,10 @@ fn extract_model_ids_recursive(value: &Value) -> Vec<String> {
         Value::Object(map) => {
             let mut models = Vec::new();
             for (key, val) in map {
-                if is_model_id_key(key) {
-                    if let Some(model) = val.as_str() {
-                        models.push(model.to_string());
-                    }
+                if is_model_id_key(key)
+                    && let Some(model) = val.as_str()
+                {
+                    models.push(model.to_string());
                 }
                 models.extend(extract_model_ids_recursive(val));
             }
@@ -877,6 +884,81 @@ fn test_extract_model_ids_ignores_blank_ids() {
         extract_model_ids(&value),
         vec!["kimi-k2.6".to_string(), "kimi-k2.7".to_string()]
     );
+}
+
+/// Source of ids for streamed tool calls that arrive without one.
+static GENERATED_CALL_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-process prefix for generated ids, so ids from a previous server run
+/// (still in a resumed session's history) cannot collide with new ones.
+static GENERATED_CALL_ID_PREFIX: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!("{:x}", chrono::Utc::now().timestamp_millis())
+    });
+
+/// Name given to a streamed tool call that arrived without a function name.
+const MISSING_TOOL_NAME: &str = "missing_tool_name";
+
+fn finalize(
+    text: &mut String,
+    acc: &mut HashMap<usize, PendingToolCall>,
+    usage: Usage,
+    finish_reason: Option<String>,
+    reasoning: &mut Option<String>,
+) -> ChatResult {
+    // Never drop a streamed tool call: some OpenAI-compatible gateways omit
+    // the id, and a silently dropped call leaves a "tool_calls" turn with
+    // nothing to run, so the model repeats itself until max steps. A missing
+    // id is generated; a missing name becomes a placeholder the loop reports
+    // back to the model as an unknown tool.
+    let mut tool_calls: Vec<(usize, ToolCall)> = acc
+        .drain()
+        .map(|(idx, ptc)| {
+            let id = ptc.id.filter(|id| !id.is_empty()).unwrap_or_else(|| {
+                format!(
+                    "call_mote_{}_{}",
+                    *GENERATED_CALL_ID_PREFIX,
+                    GENERATED_CALL_ID
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            });
+            let name = ptc
+                .name
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| MISSING_TOOL_NAME.to_string());
+            (
+                idx,
+                ToolCall {
+                    id,
+                    call_type: "function".into(),
+                    function: ToolFunction {
+                        name,
+                        arguments: ptc.arguments,
+                    },
+                },
+            )
+        })
+        .collect();
+    tool_calls.sort_by_key(|(idx, _)| *idx);
+
+    // Keep text content even when tool calls exist — DeepSeek may stream text before tool calls
+    let content = Some(std::mem::take(text));
+    let content = if content.as_ref().is_none_or(|s| s.is_empty())
+        && !tool_calls.is_empty()
+    {
+        None
+    } else {
+        content
+    };
+    let reasoning_content = std::mem::take(reasoning);
+    ChatResult {
+        content,
+        tool_calls: tool_calls.into_iter().map(|(_, tc)| tc).collect(),
+        usage,
+        finish_reason,
+        reasoning_content,
+    }
 }
 
 #[cfg(test)]
@@ -1074,80 +1156,5 @@ mod tests {
         assert!(finish_reason_signals_completion("content_filter"));
         assert!(finish_reason_signals_completion("tool_calls"));
         assert!(!finish_reason_signals_completion("unknown"));
-    }
-}
-
-/// Source of ids for streamed tool calls that arrive without one.
-static GENERATED_CALL_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Per-process prefix for generated ids, so ids from a previous server run
-/// (still in a resumed session's history) cannot collide with new ones.
-static GENERATED_CALL_ID_PREFIX: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| {
-        format!("{:x}", chrono::Utc::now().timestamp_millis())
-    });
-
-/// Name given to a streamed tool call that arrived without a function name.
-const MISSING_TOOL_NAME: &str = "missing_tool_name";
-
-fn finalize(
-    text: &mut String,
-    acc: &mut HashMap<usize, PendingToolCall>,
-    usage: Usage,
-    finish_reason: Option<String>,
-    reasoning: &mut Option<String>,
-) -> ChatResult {
-    // Never drop a streamed tool call: some OpenAI-compatible gateways omit
-    // the id, and a silently dropped call leaves a "tool_calls" turn with
-    // nothing to run, so the model repeats itself until max steps. A missing
-    // id is generated; a missing name becomes a placeholder the loop reports
-    // back to the model as an unknown tool.
-    let mut tool_calls: Vec<(usize, ToolCall)> = acc
-        .drain()
-        .map(|(idx, ptc)| {
-            let id = ptc.id.filter(|id| !id.is_empty()).unwrap_or_else(|| {
-                format!(
-                    "call_mote_{}_{}",
-                    *GENERATED_CALL_ID_PREFIX,
-                    GENERATED_CALL_ID
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                )
-            });
-            let name = ptc
-                .name
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| MISSING_TOOL_NAME.to_string());
-            (
-                idx,
-                ToolCall {
-                    id,
-                    call_type: "function".into(),
-                    function: ToolFunction {
-                        name,
-                        arguments: ptc.arguments,
-                    },
-                },
-            )
-        })
-        .collect();
-    tool_calls.sort_by_key(|(idx, _)| *idx);
-
-    // Keep text content even when tool calls exist — DeepSeek may stream text before tool calls
-    let content = Some(std::mem::take(text));
-    let content = if content.as_ref().map_or(true, |s| s.is_empty())
-        && !tool_calls.is_empty()
-    {
-        None
-    } else {
-        content
-    };
-    let reasoning_content = std::mem::take(reasoning);
-    ChatResult {
-        content,
-        tool_calls: tool_calls.into_iter().map(|(_, tc)| tc).collect(),
-        usage,
-        finish_reason,
-        reasoning_content,
     }
 }

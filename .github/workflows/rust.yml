@@ -15,7 +15,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned so fmt / clippy -D warnings are not broken by lints added in
+      # newer releases; bump deliberately.
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
 
       - uses: taiki-e/install-action@v2
         with:
@@ -26,6 +30,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --verbose
       - name: Run tests

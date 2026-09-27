@@ -105,13 +105,12 @@ fn escape_message_line(line: &str) -> String {
 }
 
 fn unescape_message_line(line: &str) -> &str {
-    if let Some(rest) = line.strip_prefix('\\') {
-        if is_conversation_heading_line(rest)
+    if let Some(rest) = line.strip_prefix('\\')
+        && (is_conversation_heading_line(rest)
             || rest.starts_with("\\## User — ")
-            || rest.starts_with("\\## Assistant — ")
-        {
-            return rest;
-        }
+            || rest.starts_with("\\## Assistant — "))
+    {
+        return rest;
     }
     line
 }

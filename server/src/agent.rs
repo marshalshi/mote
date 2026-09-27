@@ -288,12 +288,12 @@ fn reap_stream_task(
                     "agent stream task did not stop within five seconds; aborting it"
                 );
                 stream_handle.abort();
-                if let Err(error) = stream_handle.await {
-                    if !error.is_cancelled() {
-                        tracing::warn!(
-                            "agent stream task ended unexpectedly after abort: {error}"
-                        );
-                    }
+                if let Err(error) = stream_handle.await
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(
+                        "agent stream task ended unexpectedly after abort: {error}"
+                    );
                 }
             }
         }
@@ -479,6 +479,10 @@ pub struct RunChannels {
     pub events_tx: UnboundedSender<Result<AgentEvent>>,
     pub cancel_rx: tokio::sync::watch::Receiver<bool>,
     pub permission_broker: PermissionBroker,
+    /// Notes for the model that arrive while the run is going (e.g. "the
+    /// user rolled back an edit"); added to the conversation before the
+    /// next step.
+    pub notes_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 /// Run the agent loop.
@@ -624,6 +628,91 @@ async fn wait_for_cancel(
     }
 }
 
+/// Replaces old tool output in requests once a run has hit the model's
+/// context limit (the transcript keeps the full output).
+const CLEARED_TOOL_OUTPUT: &str =
+    "[older tool output cleared to fit the context window]";
+/// Tool-call steps whose results are always sent in full.
+const TOOL_STEPS_KEPT_WHEN_PRUNING: usize = 2;
+
+/// Clear the results of all but the last `keep_steps` tool-call steps.
+/// Returns whether anything changed. Call/result pairing is preserved.
+fn prune_old_tool_results(
+    history: &mut [ChatMessage],
+    keep_steps: usize,
+) -> bool {
+    let mut changed = false;
+    for message in prunable_tool_results(history, keep_steps) {
+        message.content = Some(CLEARED_TOOL_OUTPUT.into());
+        changed = true;
+    }
+    changed
+}
+
+/// Tool results older than the last `keep_steps` tool-call steps that are
+/// longer than the placeholder.
+fn prunable_tool_results(
+    history: &mut [ChatMessage],
+    keep_steps: usize,
+) -> impl Iterator<Item = &mut ChatMessage> {
+    let call_steps: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == Role::Assistant
+                && m.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let first_kept = call_steps
+        .len()
+        .checked_sub(keep_steps)
+        .and_then(|n| call_steps.get(n))
+        .copied()
+        .unwrap_or(0);
+    history[..first_kept].iter_mut().filter(|m| {
+        m.role == Role::Tool
+            && m.content
+                .as_deref()
+                .is_some_and(|c| c.len() > CLEARED_TOOL_OUTPUT.len())
+    })
+}
+
+/// Merge runs of plain user messages (no tool result) into one, joined by a
+/// blank line. Internal notes, compaction summaries and the user's message
+/// can end up adjacent, and some providers reject consecutive user turns.
+/// Applied to requests only; the transcript keeps them separate.
+fn merge_consecutive_user_messages(
+    messages: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        let plain_user =
+            |m: &ChatMessage| m.role == Role::User && m.tool_call_id.is_none();
+        if let Some(last) = merged.last_mut().filter(|last| plain_user(last))
+            && plain_user(&message)
+        {
+            let text = message.content.unwrap_or_default();
+            let joined = match last.content.take() {
+                Some(previous) if !previous.is_empty() => {
+                    format!("{previous}\n\n{text}")
+                }
+                _ => text,
+            };
+            last.content = Some(joined);
+            continue;
+        }
+        merged.push(message);
+    }
+    merged
+}
+
+fn is_context_overflow(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProviderError>()
+        .is_some_and(|e| e.kind == ProviderErrorKind::ContextOverflow)
+}
+
 /// Result recorded for a tool call that never ran to completion.
 const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
 
@@ -689,6 +778,7 @@ struct AgentRun {
     events_tx: UnboundedSender<Result<AgentEvent>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     permission_broker: PermissionBroker,
+    notes_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     history: Vec<ChatMessage>,
     total_input: u64,
     total_output: u64,
@@ -701,6 +791,9 @@ struct AgentRun {
     committed_len: usize,
     /// Length of the prior history passed in; later messages are this run's.
     initial_len: usize,
+    /// Set once the model's context limit was hit: requests then carry only
+    /// recent tool output (see `prune_old_tool_results`).
+    prune_tool_output: bool,
     /// The most recent executed registry tool calls as
     /// (`name\0canonical-args`, hash of the result), for detecting a model
     /// stuck repeating itself.
@@ -721,15 +814,36 @@ impl AgentRun {
             events_tx: channels.events_tx,
             cancel_rx: channels.cancel_rx,
             permission_broker: channels.permission_broker,
+            notes_rx: channels.notes_rx,
             committed_len: history.len(),
             initial_len: history.len(),
             recent_calls: std::collections::VecDeque::new(),
+            prune_tool_output: false,
             history,
             total_input: 0,
             total_output: 0,
             cancel_open: true,
             current_role_idx: 0,
         }
+    }
+
+    /// Turn on pruning of old tool output, if not on yet and if it would
+    /// shrink the request at all.
+    fn start_pruning(&mut self) -> bool {
+        if self.prune_tool_output {
+            return false;
+        }
+        if prunable_tool_results(
+            &mut self.history,
+            TOOL_STEPS_KEPT_WHEN_PRUNING,
+        )
+        .next()
+        .is_none()
+        {
+            return false;
+        }
+        self.prune_tool_output = true;
+        true
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -749,10 +863,33 @@ impl AgentRun {
         }
     }
 
+    /// Add notes that arrived since the last step. Called only between
+    /// steps, where the history ends with a complete step.
+    fn take_notes(&mut self) {
+        let Some(rx) = self.notes_rx.as_mut() else {
+            return;
+        };
+        while let Ok(note) = rx.try_recv() {
+            self.history.push(ChatMessage::internal_note(note));
+        }
+    }
+
+    /// Stop accepting notes, then take the ones already sent. After this,
+    /// a sender gets an error (and hands the note to the server instead)
+    /// rather than a note silently lost with the dropped receiver.
+    fn close_notes(&mut self) {
+        if let Some(rx) = self.notes_rx.as_mut() {
+            rx.close();
+        }
+        self.take_notes();
+    }
+
     /// The single exit path: close any tool calls left without a result,
     /// commit the remaining history, and send the terminal event.
     fn finish(mut self, terminal: Terminal) {
         close_unanswered_tool_calls(&mut self.history, self.initial_len);
+        // Notes that arrived too late for another step are still kept.
+        self.close_notes();
         self.commit();
         let tokens_input = self.total_input;
         let tokens_output = self.total_output;
@@ -815,6 +952,7 @@ impl AgentRun {
             if self.cancel_requested() {
                 return self.finish(Terminal::Cancelled);
             }
+            self.take_notes();
             if step > soft_final_step {
                 return self.finish(Terminal::NeedsContinuation(
                     "(max steps reached)".into(),
@@ -825,6 +963,25 @@ impl AgentRun {
             let request = self.build_step_request(step, final_text_only_step);
             let response = match self.stream_step(step, &request).await {
                 Ok(response) => response,
+                // Too long for the model: drop old tool output from the
+                // requests and try the same step again, once.
+                Err(Terminal::Failed(error))
+                    if is_context_overflow(&error) && self.start_pruning() =>
+                {
+                    tracing::warn!(
+                        step,
+                        "context limit hit; pruning old tool output"
+                    );
+                    self.emit(AgentEvent::Retrying {
+                        attempt: 1,
+                        max_attempts: 1,
+                        delay: std::time::Duration::ZERO,
+                        reason: "The conversation is too long for the model; older tool output was cleared from the request. Consider /compact.".into(),
+                        discarded_output: false,
+                    });
+                    step -= 1;
+                    continue;
+                }
                 Err(terminal) => return self.finish(terminal),
             };
             if let Some(terminal) = self
@@ -923,13 +1080,20 @@ impl AgentRun {
             messages.push(ChatMessage::system(&reminder));
         }
 
-        messages.extend(self.history.iter().cloned());
+        if self.prune_tool_output {
+            let mut history = self.history.clone();
+            prune_old_tool_results(&mut history, TOOL_STEPS_KEPT_WHEN_PRUNING);
+            messages.extend(history);
+        } else {
+            messages.extend(self.history.iter().cloned());
+        }
         if final_text_only_step {
             messages.push(ChatMessage::assistant_text(MAX_STEPS_PROMPT));
         }
         if self.cfg.reminder_at_end {
             messages.push(ChatMessage::system(&reminder));
         }
+        let messages = merge_consecutive_user_messages(messages);
 
         let base = &self.cfg.options;
         let (mut options, provider) = match role_config {
@@ -1407,24 +1571,23 @@ impl AgentRun {
         let name = tc.function.name.as_str();
 
         // Emit skill selected event when use_skill is called
-        if name == "use_skill" {
-            if let Some(skill) = serde_json::from_str::<serde_json::Value>(
+        if name == "use_skill"
+            && let Some(skill) = serde_json::from_str::<serde_json::Value>(
                 &tc.function.arguments,
             )
             .ok()
             .as_ref()
             .and_then(|args| args.get("skill_name"))
             .and_then(|v| v.as_str())
-            {
-                self.emit(AgentEvent::SkillSelected {
-                    name: skill.to_string(),
-                });
-                // Also send as reasoning so the TUI shows grey thinking text
-                self.emit(AgentEvent::ReasoningDelta(format!(
-                    "[Skill selected: {}]",
-                    skill
-                )));
-            }
+        {
+            self.emit(AgentEvent::SkillSelected {
+                name: skill.to_string(),
+            });
+            // Also send as reasoning so the TUI shows grey thinking text
+            self.emit(AgentEvent::ReasoningDelta(format!(
+                "[Skill selected: {}]",
+                skill
+            )));
         }
 
         self.emit(AgentEvent::ToolStarted {
@@ -2001,6 +2164,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hello".into(),
             Vec::new(),
@@ -2110,6 +2274,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: PermissionBroker::default(),
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -2163,6 +2328,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: PermissionBroker::default(),
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -2266,6 +2432,7 @@ mod tests {
                     events_tx,
                     cancel_rx,
                     permission_broker: PermissionBroker::default(),
+                    notes_rx: None,
                 },
                 "hi".into(),
                 Vec::new(),
@@ -2665,6 +2832,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -2736,6 +2904,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -2789,6 +2958,7 @@ mod tests {
                     events_tx,
                     cancel_rx,
                     permission_broker: perm_broker,
+                    notes_rx: None,
                 },
                 "hi".into(),
                 Vec::new(),
@@ -2885,6 +3055,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -2972,6 +3143,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3060,6 +3232,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3121,6 +3294,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "go".into(),
             Vec::new(),
@@ -3202,6 +3376,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3290,6 +3465,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3392,6 +3568,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3462,6 +3639,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: perm_broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3554,6 +3732,7 @@ mod tests {
                     events_tx,
                     cancel_rx,
                     permission_broker: perm_broker,
+                    notes_rx: None,
                 },
                 "hi".into(),
                 Vec::new(),
@@ -3672,6 +3851,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: broker,
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3768,6 +3948,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: broker.clone(),
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -3861,6 +4042,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: PermissionBroker::default(),
+                notes_rx: None,
             },
             "hi".into(),
             vec![make_user("earlier"), make_assistant("reply")],
@@ -3988,6 +4170,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: broker.clone(),
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -4244,6 +4427,7 @@ mod tests {
                 events_tx,
                 cancel_rx,
                 permission_broker: broker.clone(),
+                notes_rx: None,
             },
             "hi".into(),
             Vec::new(),
@@ -4387,6 +4571,7 @@ mod tests {
                     events_tx,
                     cancel_rx,
                     permission_broker: PermissionBroker::default(),
+                    notes_rx: None,
                 },
                 "hi".into(),
                 vec![make_user("earlier"), make_assistant("reply")],
@@ -4421,6 +4606,55 @@ mod tests {
         ));
         // Mentions in the middle of output are not failures.
         assert!(tool_result_succeeded("[exit code: 1] appears in docs\nok"));
+    }
+
+    #[test]
+    fn test_prune_old_tool_results_keeps_recent_steps_and_pairing() {
+        let long = "x".repeat(200);
+        let mut history = vec![
+            make_user("go"),
+            make_tool_call_msg(vec![("a", "read")]),
+            make_tool_result("a", &long),
+            make_tool_call_msg(vec![("b", "read")]),
+            make_tool_result("b", &long),
+            make_tool_call_msg(vec![("c", "read")]),
+            make_tool_result("c", &long),
+        ];
+        assert!(prune_old_tool_results(&mut history, 2));
+        assert_eq!(history[2].content.as_deref(), Some(CLEARED_TOOL_OUTPUT));
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(history[4].content.as_deref(), Some(long.as_str()));
+        assert_eq!(history[6].content.as_deref(), Some(long.as_str()));
+        // Nothing older than the kept steps: nothing to prune.
+        assert!(!prune_old_tool_results(&mut history[3..], 2));
+    }
+
+    #[test]
+    fn test_merge_consecutive_user_messages_only_merges_plain_user_turns() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("summary"),
+            ChatMessage::internal_note("note"),
+            ChatMessage::user("question"),
+            make_tool_call_msg(vec![("a", "read")]),
+            make_tool_result("a", "result"),
+            ChatMessage::user("next"),
+        ];
+        let merged = merge_consecutive_user_messages(messages);
+        let shape: Vec<(Role, Option<&str>)> = merged
+            .iter()
+            .map(|m| (m.role.clone(), m.content.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (Role::System, Some("sys")),
+                (Role::User, Some("summary\n\nnote\n\nquestion")),
+                (Role::Assistant, None),
+                (Role::Tool, Some("result")),
+                (Role::User, Some("next")),
+            ]
+        );
     }
 
     #[test]

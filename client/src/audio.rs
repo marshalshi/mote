@@ -122,10 +122,10 @@ fn append_i16_pcm<I>(
     for sample in samples {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
-    if !bytes.is_empty() {
-        if let Ok(mut buffer) = buffer.lock() {
-            buffer.extend_from_slice(&bytes);
-        }
+    if !bytes.is_empty()
+        && let Ok(mut buffer) = buffer.lock()
+    {
+        buffer.extend_from_slice(&bytes);
     }
 }
 

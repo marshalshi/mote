@@ -645,6 +645,7 @@ fn schedule_reattach(
     });
 }
 
+#[allow(clippy::too_many_arguments)] // event-loop state it updates in place
 fn handle_reattach_result(
     client: &MoteClient,
     app: &mut App,
@@ -1362,9 +1363,7 @@ fn handle_key_event(
                     if handle_permission_mouse_click(app, m.column, m.row) {
                         return;
                     }
-                    if handle_picker_mouse_click(app, m.column, m.row) {
-                        return;
-                    }
+                    handle_picker_mouse_click(app, m.column, m.row);
                 }
                 MouseEventKind::ScrollDown => {
                     app.scroll_down(3);
@@ -1577,10 +1576,10 @@ fn handle_action(
                     app.history_up();
                 }
             }
-            Some(Action::HistoryDown) => {
-                if !handle_input_vertical_scroll(app, false) {
-                    app.history_down();
-                }
+            Some(Action::HistoryDown)
+                if !handle_input_vertical_scroll(app, false) =>
+            {
+                app.history_down();
             }
             None => {
                 if let crossterm::event::KeyCode::Char(c) = code {
@@ -1604,10 +1603,10 @@ fn handle_action(
                     app.history_up();
                 }
             }
-            Some(Action::HistoryDown) => {
-                if !handle_input_vertical_scroll(app, false) {
-                    app.history_down();
-                }
+            Some(Action::HistoryDown)
+                if !handle_input_vertical_scroll(app, false) =>
+            {
+                app.history_down();
             }
             _ => {}
         }
@@ -1721,10 +1720,8 @@ fn normal_action(
                 app.update_suggestions();
             }
         }
-        Some(Action::Complete) => {
-            if app.state == AppState::Idle {
-                app.cycle_agent();
-            }
+        Some(Action::Complete) if app.state == AppState::Idle => {
+            app.cycle_agent();
         }
         None => {
             if let crossterm::event::KeyCode::Char(c) = code {
@@ -1828,8 +1825,8 @@ fn login_picker_index_at(app: &App, column: u16, row: u16) -> Option<usize> {
     let area = Rect::new(0, 0, term_width, term_height);
     let rect = centered_rect_local(
         area,
-        area.width.min(92).max(44),
-        area.height.min(22).max(9),
+        area.width.clamp(44, 92),
+        area.height.clamp(9, 22),
     );
     let inner = inset_local(rect, 2, 1);
     let available_rows = inner.height.saturating_sub(4) as usize;
@@ -1879,10 +1876,9 @@ fn permission_popup_action_at(
     let area = Rect::new(0, 0, term_width, term_height);
     let rect = centered_rect_local(
         area,
-        area.width.min(88).max(46),
+        area.width.clamp(46, 88),
         area.height
-            .min(if perm.confirming_always { 18 } else { 20 })
-            .max(10),
+            .clamp(10, if perm.confirming_always { 18 } else { 20 }),
     );
     let inner = inset_local(rect, 3, 1);
     let content_width = inner.width.saturating_sub(2) as usize;
